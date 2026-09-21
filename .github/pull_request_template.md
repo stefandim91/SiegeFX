@@ -2,7 +2,8 @@
      Write it as the commit message you want to read in `git log` a year from now,
      and delete these comments before merging.
 
-     Syncing from upstream/main? Use "Create a merge commit", not squash. See CONTRIBUTING.md. -->
+     Syncing from upstream/main? That does NOT go through a PR — it is merged locally and
+     pushed to main, so the merge base survives. See CONTRIBUTING.md. -->
 
 ## What
 
