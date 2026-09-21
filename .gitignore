@@ -488,8 +488,12 @@ _ds1refs/
 run-goblin-anim.bat
 anim-diag.log
 
-# Claude Code project-local permissions (per-user, not shared)
+# Agent harness configuration (per-user, not shared). The project's delegated-role
+# contracts live in AGENTS.md; how each contributor binds them to models is their own
+# choice and stays out of the repository.
 .claude/
+.codex/
+.cursor/
 
 goldens/sfx-filmstrips/
 goldens/frontend-shots/
