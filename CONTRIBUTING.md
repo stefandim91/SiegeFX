@@ -33,7 +33,10 @@ For our own branches squash is the default: one reviewable commit per change on 
 revert, clean `git bisect`, and the work-in-progress noise stays in the PR.
 
 Squash commit messages are generated from the **PR title and body**, not from the branch's
-individual commits — so write the PR description as the commit message you want on `main`.
+individual commits — so the PR description *is* the commit message on `main`. Write it that
+way: short, explaining what changed and why, with no checklists or review chatter that you
+would not want to read in `git log` a year from now. `.github/pull_request_template.md` is
+shaped for this; delete its comments before merging.
 
 ## Syncing from upstream
 
