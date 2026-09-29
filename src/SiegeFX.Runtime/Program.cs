@@ -255,6 +255,10 @@ else if (args.Length >= 1 && args[0] == "--selftest-dialogue")
     // up choice=more / quest_dialog / no-order-tail correctly.
     return SiegeFX.Runtime.DialogueSelfTest.Run() ? 0 : 1;
 }
+else if (args.Length >= 1 && args[0] == "--selftest-elevator-interaction")
+{
+    return SiegeFX.Runtime.ElevatorInteractionSelfTest.Run() ? 0 : 1;
+}
 else if (args.Length >= 1 && args[0] == "--skrit-anim")
 {
     // Phase 9a. Rigged ASP + skrit that decides which clip plays. Optional trailing

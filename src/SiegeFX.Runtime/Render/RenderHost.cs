@@ -492,6 +492,7 @@ public sealed class RenderHost : IDisposable
         public float T;                // ride progress 0..1
         public int CarInstanceIdx = -1;
         public Vector3 PrevCarPos;
+        public Vector3 DepartedCarMin, DepartedCarMax;
         public readonly List<ActorRenderState> Riders = new();
     }
     // Delayed fade tuples from movingN_actioninfo's optional 6th field
@@ -4442,10 +4443,27 @@ public sealed class RenderHost : IDisposable
         return _fadedSnodeCounts.ContainsKey(_navMesh.SourceSnodeGuid[tri]);
     }
 
+    private bool IsActorInFadedSnode(ActorRenderState actor)
+    {
+        if (_fadedSnodeCounts.Count == 0) return false;
+        foreach (var elevator in _elevators)
+            if (elevator.Moving && elevator.Riders.Contains(actor))
+                return _fadedSnodeCounts.ContainsKey(elevator.Def.CarNodeGuid);
+        return IsPosInFadedSnode(actor.CurrentTransform.Translation);
+    }
+
     private bool TryGetPlayerSnodeGuid(out uint snodeGuid)
     {
         snodeGuid = 0;
         if (_playerFollower is null || _navMesh is null) return false;
+        // The baked departure floor is unavailable during a ride, but the
+        // carried player still physically occupies the moving car node.
+        foreach (var elevator in _elevators)
+            if (elevator.Moving && _player is not null && elevator.Riders.Contains(_player))
+            {
+                snodeGuid = elevator.Def.CarNodeGuid;
+                return true;
+            }
         int tri = _playerFollower.CurrentTriangle;
         if (tri < 0 && !_navMesh.TryFindTriangle(_playerFollower.Position, out tri)) return false;
         if (tri < 0 || tri >= _navMesh.SourceSnodeGuid.Length) return false;
@@ -14824,6 +14842,7 @@ void main()
             // after the next click resolved against a meshless gap — reversing.
             var pendingTarget = !_playerFollower.ReachedGoal && !_playerFollower.PathBlocked
                 ? _playerFollower.Target : (Vector3?)null;
+            bool wasSuspended = _playerFollower.MovementSuspended;
             _playerFollower = new SiegeFX.Core.Nav.NavFollower(newNav, pos, speed)
             {
                 // Phase 24-NAV-LOGICAL-FLAGS — player respects the
@@ -14832,6 +14851,7 @@ void main()
                 Traversal = SiegeFX.Core.Nav.NavTraversal.Player,
                 DiagnosticLogging = true,
             };
+            if (wasSuspended) _playerFollower.SetMovementSuspended(true);
             if (pendingTarget is { } tgt) _playerFollower.SetTarget(tgt);
         }
 
@@ -19825,39 +19845,89 @@ void main()
     /// vertical re-bind gate refuses it, and every click is then rejected
     /// from a permanently off-mesh start. A ring search snaps them to the
     /// nearest real floor instead (the landing edge, in practice ≤1u away).</summary>
-    private void RescueOffMeshAfterRebuild(SiegeFX.Core.Nav.NavMesh nav)
+    private void RescueOffMeshAfterRebuild(SiegeFX.Core.Nav.NavMesh nav, ElevatorRuntime? departedElevator = null)
     {
+        bool IsRidingAnotherMovingPlatform(ActorRenderState actor)
+        {
+            foreach (var elevator in _elevators)
+                if (elevator.Moving && elevator.Riders.Contains(actor)) return true;
+            foreach (var stairwell in _stairwells)
+                if (stairwell.Moving)
+                    foreach (var segment in stairwell.Segments)
+                        if (segment.Riders.Contains(actor)) return true;
+            return false;
+        }
+        uint landingGuid = departedElevator is null ? 0
+            : departedElevator.AtStop == 1 ? departedElevator.Def.Connect2Guid : departedElevator.Def.Connect1Guid;
+        bool TryDepartedLanding(Vector3 pos, out Vector3 dest)
+        {
+            dest = default;
+            if (departedElevator is null || landingGuid == 0) return false;
+            var lo = departedElevator.DepartedCarMin;
+            var hi = departedElevator.DepartedCarMax;
+            if (pos.X < lo.X - 1f || pos.X > hi.X + 1f ||
+                pos.Z < lo.Z - 1f || pos.Z > hi.Z + 1f ||
+                pos.Y < lo.Y - 2f || pos.Y > hi.Y + 2f) return false;
+            float width = hi.X - lo.X, depth = hi.Z - lo.Z;
+            float maxLandingDistance = MathF.Max(8f, MathF.Sqrt(width * width + depth * depth) + 3f);
+            float best = float.PositiveInfinity;
+            for (int tri = 0; tri < nav.TriangleCount; tri++)
+            {
+                if (nav.SourceSnodeGuid[tri] != landingGuid || nav.IsBlocked(tri) ||
+                    nav.IsUnavailable(tri) || nav.IsFadeHidden(tri) ||
+                    !SiegeFX.Core.Nav.NavTraversal.Player.CanEnter(nav.Kinds[tri])) continue;
+                if (nav.Flags is not null && !nav.Flags.CanEnter(
+                    nav.SourceSnodeGuid[tri], (byte)nav.SourceLnodeIndex[tri],
+                    SiegeFX.Core.Nav.NavTraversal.Player.Actor)) continue;
+                var candidate = nav.NearestPointInTriangleXZ(tri, pos);
+                if (MathF.Abs(candidate.Y - pos.Y) > 3f) continue;
+                float dx = candidate.X - pos.X, dz = candidate.Z - pos.Z;
+                float d2 = dx * dx + dz * dz;
+                if (d2 >= best || d2 > maxLandingDistance * maxLandingDistance) continue;
+                best = d2;
+                dest = candidate;
+            }
+            return best < float.PositiveInfinity;
+        }
         bool StandableAt(Vector3 p, out float y)
         {
             y = p.Y;
             if (!nav.TryFindTriangle(p, out var tri, includeFadeHidden: true)) return false;
+            if (nav.IsUnavailable(tri)) return false;
             y = nav.SampleYOnTriangle(tri, p);
             return MathF.Abs(y - p.Y) <= 2.0f;
         }
         void Rescue(ActorRenderState s, SiegeFX.Core.Nav.NavFollower? follower)
         {
+            if (IsRidingAnotherMovingPlatform(s)) return;
             var pos = s.CurrentTransform.Translation;
             if (StandableAt(pos, out _)) return;
-            for (float r = 0.5f; r <= 3.01f; r += 0.5f)
+            Vector3? rescue = null;
+            for (float r = 0.5f; r <= 3.01f && rescue is null; r += 0.5f)
             {
                 for (int i = 0; i < 16; i++)
                 {
                     float a = i * MathF.PI * 2f / 16f;
                     var probe = new Vector3(pos.X + MathF.Cos(a) * r, pos.Y, pos.Z + MathF.Sin(a) * r);
                     if (!StandableAt(probe, out float y)) continue;
-                    var dest = probe with { Y = y };
-                    var t = s.CurrentTransform;
-                    t.Translation = dest;
-                    s.CurrentTransform = t;
-                    follower?.Teleport(dest);
-                    if (ReferenceEquals(s, _player)) _playerRenderInit = false;
-                    else s.PartyRenderInit = false;
-                    Console.WriteLine($"[nav-rescue] {(ReferenceEquals(s, _player) ? "player" : s.Actor.Template)} " +
-                        $"off-floor at ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) -> ({dest.X:F1},{dest.Y:F1},{dest.Z:F1})");
-                    return;
+                    rescue = probe with { Y = y };
+                    break;
                 }
             }
-            Console.WriteLine($"[nav-rescue] no floor within 3u of ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) — actor left in place");
+            if (rescue is null && TryDepartedLanding(pos, out var landing)) rescue = landing;
+            if (rescue is not { } dest)
+            {
+                Console.WriteLine($"[nav-rescue] no safe floor near ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) — actor left in place");
+                return;
+            }
+            var t = s.CurrentTransform;
+            t.Translation = dest;
+            s.CurrentTransform = t;
+            follower?.Teleport(dest);
+            if (ReferenceEquals(s, _player)) _playerRenderInit = false;
+            else s.PartyRenderInit = false;
+            Console.WriteLine($"[nav-rescue] {(ReferenceEquals(s, _player) ? "player" : s.Actor.Template)} " +
+                $"off-floor at ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) -> ({dest.X:F1},{dest.Y:F1},{dest.Z:F1})");
         }
         if (_player is not null && !_player.IsDead) Rescue(_player, _playerFollower);
         foreach (var m in _party)
@@ -20205,15 +20275,36 @@ void main()
         el.T = 0f;
         el.PrevCarPos = (el.AtStop == 1 ? el.Stop1 : el.Stop2).Translation;
         CaptureElevatorRiders(el);
+        SetElevatorRiderMovementSuspended(el, true);
+        if (el.CarInstanceIdx >= 0 && el.CarInstanceIdx < _regionInstances.Count)
+        {
+            var car = _regionInstances[el.CarInstanceIdx];
+            el.DepartedCarMin = car.WorldAabbMin;
+            el.DepartedCarMax = car.WorldAabbMax;
+        }
+        _navMesh?.SetUnavailableForSnode(el.Def.CarNodeGuid, true);
         var def = el.Def;
         bool departing1 = el.AtStop == 1;
         var info = departing1 ? def.Moving1ActionInfo : def.Moving2ActionInfo;
         var msg = departing1 ? def.Moving1Message : def.Moving2Message;
         var msgScid = departing1 ? def.Moving1Scid : def.Moving2Scid;
-        if (info.Length > 0) ApplyElevatorActionInfo(info);
+        // The authored fades describe the rider's view during travel. A
+        // remotely called empty car leaves the player on a visible landing.
+        if (info.Length > 0 && _player is not null && el.Riders.Contains(_player))
+            ApplyElevatorActionInfo(info);
         if (msgScid != 0 && msgScid != def.Scid) PostTriggerWorldMessage(msg, def.Scid, msgScid);
         Console.WriteLine($"[elevator] 0x{def.Scid:X8} departing stop{el.AtStop} -> stop{el.TargetStop} " +
             $"({def.DurationSeconds:F1}s, {el.Riders.Count} rider(s))");
+    }
+
+    private void SetElevatorRiderMovementSuspended(ElevatorRuntime el, bool suspended)
+    {
+        foreach (var rider in el.Riders)
+        {
+            var follower = ReferenceEquals(rider, _player)
+                ? _playerFollower : rider.Brain?.Wander?.Follower;
+            follower?.SetMovementSuspended(suspended);
+        }
     }
 
     /// <summary>movingN_actioninfo — semicolon-joined fade_nodes tuples
@@ -21210,6 +21301,7 @@ void main()
 
             if (el.T >= 1f)
             {
+                SetElevatorRiderMovementSuspended(el, false);
                 el.Moving = false;
                 el.AtStop = el.TargetStop;
                 var final = el.AtStop == 1 ? el.Stop1 : el.Stop2;
@@ -21227,11 +21319,13 @@ void main()
                     {
                         var pos = _player.CurrentTransform.Translation;
                         var speed = _playerFollower.Speed;
+                        bool wasSuspended = _playerFollower.MovementSuspended;
                         _playerFollower = new SiegeFX.Core.Nav.NavFollower(nav, pos, speed)
                         {
                             Traversal = SiegeFX.Core.Nav.NavTraversal.Player,
                             DiagnosticLogging = true,
                         };
+                        if (wasSuspended) _playerFollower.SetMovementSuspended(true);
                     }
                     // Party riders get a fresh follower on the new mesh at
                     // their ridden position (their old follower still holds
@@ -21250,7 +21344,7 @@ void main()
                     // this the follower's vertical re-bind gate correctly
                     // refuses the shaft bottom 12u below — and the player
                     // freezes over the hole with every click refused.
-                    RescueOffMeshAfterRebuild(nav);
+                    RescueOffMeshAfterRebuild(nav, el);
                 }
                 el.Riders.Clear();
                 Console.WriteLine($"[elevator] 0x{el.Def.Scid:X8} arrived at stop{el.AtStop}");
@@ -21310,11 +21404,13 @@ void main()
                     {
                         var pos = _player.CurrentTransform.Translation;
                         var speed = _playerFollower.Speed;
+                        bool wasSuspended = _playerFollower.MovementSuspended;
                         _playerFollower = new SiegeFX.Core.Nav.NavFollower(nav, pos, speed)
                         {
                             Traversal = SiegeFX.Core.Nav.NavTraversal.Player,
                             DiagnosticLogging = true,
                         };
+                        if (wasSuspended) _playerFollower.SetMovementSuspended(true);
                     }
                     foreach (var seg in sw.Segments)
                     foreach (var r in seg.Riders)
@@ -21380,8 +21476,7 @@ void main()
     /// the click ray must pass within a hand's width of the lever PROP —
     /// clicking the floor near a lever is just a move (the old floor-point
     /// radius turned ordinary walk clicks by the farm winch into "send the
-    /// elevator away", stranding the player topside). Floor-mounted levers
-    /// keep a tight floor-hit fallback for clicks at their base. The pull
+    /// elevator away", stranding the player topside). The pull
     /// fires from TickElevators once the player reaches the lever's authored
     /// use point (or plain use range when none authored).</summary>
     private void RequestLeverUseNear(Vector3 rayOrigin, Vector3 rayDir, Vector3 floorHit)
@@ -21389,7 +21484,9 @@ void main()
         if (_leverProps.Count == 0) return;
         var dir = rayDir;
         float dlen = dir.Length();
-        if (dlen > 1e-6f) dir /= dlen;
+        if (dlen <= 1e-6f) { _pendingLeverUse = null; return; }
+        dir /= dlen;
+        float floorDistance = Vector3.Dot(floorHit - rayOrigin, dir);
         StaticPropInstance? best = null;
         float bestScore = float.MaxValue;
         foreach (var l in _leverProps)
@@ -21399,20 +21496,24 @@ void main()
             // Primary: click ray passes close to the lever prop itself
             // (covers wall/ceiling mounts like the winch — the nav-mesh hit
             // under them is meaningless for selection).
-            var toL = lp - rayOrigin;
-            float t = Vector3.Dot(toL, dir);
-            if (t > 0f && t < 120f)
-            {
-                float rd = Vector3.Distance(rayOrigin + dir * t, lp);
-                if (rd <= 0.9f && rd < bestScore) { bestScore = rd; best = l; continue; }
-            }
-            // Fallback: floor-mounted levers whose origin sits at the hit.
-            float dx = lp.X - floorHit.X, dz = lp.Z - floorHit.Z;
-            float dxz = MathF.Sqrt(dx * dx + dz * dz);
-            if (dxz <= 1.0f && MathF.Abs(lp.Y - floorHit.Y) <= 2.0f && dxz < bestScore)
-            { bestScore = dxz; best = l; }
+            if (LeverRayHitBeforeFloor(rayOrigin, dir, floorDistance, lp, out float rd)
+                && rd < bestScore) { bestScore = rd; best = l; }
         }
         _pendingLeverUse = best;
+    }
+
+    internal static bool LeverRayHitBeforeFloor(Vector3 origin, Vector3 unitDir,
+        float floorDistance, Vector3 lever, out float rayDistance)
+    {
+        float t = Vector3.Dot(lever - origin, unitDir);
+        rayDistance = Vector3.Distance(origin + unitDir * t, lever);
+        const float pickRadius = 0.9f;
+        if (t <= 0f || t >= 120f || rayDistance > pickRadius) return false;
+        // Compare the FIRST intersection with the lever's pick volume, not
+        // its origin: an oblique click can hit the upper part of a floor
+        // lever before the floor while its origin lies slightly beyond it.
+        float entry = t - MathF.Sqrt(pickRadius * pickRadius - rayDistance * rayDistance);
+        return entry <= floorDistance + 0.05f;
     }
 
     private void PullLever(StaticPropInstance lever)
@@ -21923,8 +22024,10 @@ void main()
             {
                 var pos = _playerFollower.Position;
                 var speed = _playerFollower.Speed;
+                bool wasSuspended = _playerFollower.MovementSuspended;
                 _playerFollower = new SiegeFX.Core.Nav.NavFollower(nav, pos, speed)
                 { Traversal = SiegeFX.Core.Nav.NavTraversal.Player, DiagnosticLogging = true };
+                if (wasSuspended) _playerFollower.SetMovementSuspended(true);
             }
         }
     }
@@ -23205,6 +23308,10 @@ void main()
             // and TryFindTriangle re-glues actors to them. All fade writers
             // are whole-snode, so the snode ref-count map is the full truth.
             nav.SetFadeHiddenForSnodes(new HashSet<uint>(_fadedSnodeCounts.Keys), true);
+            // A rebuild during travel must not resurrect the departing car's
+            // baked floor before the arrival pose is committed.
+            foreach (var moving in _elevators)
+                if (moving.Moving) nav.SetUnavailableForSnode(moving.Def.CarNodeGuid, true);
             Console.WriteLine($"  nav mesh rebuild: {nav.TriangleCount} tri(s), " +
                               $"{nav.Vertices.Length} welded vert(s), " +
                               $"{nav.SourceSnodeCount} snode(s), " +
@@ -25846,7 +25953,7 @@ void main()
         if (_player is not null
             && MathF.Abs(p.Y - _player.CurrentTransform.Translation.Y) > PickSameFloorYBand)
             return false;
-        return !IsPosInFadedSnode(p);
+        return !IsActorInFadedSnode(s);
     }
 
     /// <summary>SC-SCREEN-PICK — pick the actor whose SCREEN body the
@@ -38462,7 +38569,7 @@ void main()
                 // a moving actor points at wherever it spawned (the player's
                 // spawn is on the surface → body culled with the surface
                 // while the separately-drawn boots + dagger kept walking).
-                if (!s.IsPlayer && IsPosInFadedSnode(s.CurrentTransform.Translation)) continue;
+                if (!s.IsPlayer && IsActorInFadedSnode(s)) continue;
                 // Intro NIS gizmos (narrator voice-over; spent sleeping dog) stay in
                 // _actors for scripting but never draw as visible NPCs.
                 if (s.IsPlayer && s.Hidden)
@@ -38605,7 +38712,7 @@ void main()
                     var appos = s.CurrentTransform.Translation;
                     float apdx = appos.X - apCam.X, apdz = appos.Z - apCam.Z;
                     if (apdx * apdx + apdz * apdz > 80f * 80f) continue;
-                    if (IsPosInFadedSnode(appos)) continue;
+                    if (IsActorInFadedSnode(s)) continue;
                     var apClips = s.Actor.Clips;
                     if (apClips.Length == 0) continue;
                     var apClip = apClips[Math.Min(s.Actor.CurrentClipIndex, apClips.Length - 1)];
@@ -38903,7 +39010,7 @@ void main()
                 if (s.WeaponMesh is null && s.ShieldMesh is null) continue;
                 // SC-REGION-LAYER-HIDE-ACTORS (follow-up) — no region stamp on
                 // actors yet; gear hides with the faded-snode gate below.
-                if (IsPosInFadedSnode(s.CurrentTransform.Translation)) continue;
+                if (IsActorInFadedSnode(s)) continue;
                 var npcClips = s.Actor.Clips;
                 int npcBones = s.Actor.Mesh.BoneCount;
                 if (_boneWorldsScratch.Length < npcBones)
@@ -42452,7 +42559,13 @@ void main()
             if (structural)
             {
                 var nav = RebuildNavMesh();
-                if (nav is not null) { _navMesh = nav; MarkAllObstacles(); RehomeAllFollowers(nav); }
+                if (nav is not null)
+                {
+                    _navMesh = nav;
+                    MarkAllObstacles();
+                    RehomeAllFollowers(nav);
+                    _playerFollower?.Rehome(nav);
+                }
             }
             Console.WriteLine($"  load: world state — {ws.Bools.Count} bool(s), {ws.Accumulators.Count} accum, " +
                               $"{ws.OpenedChests.Count} chest(s), {ws.UnlockedUsables.Count} unlock(s), " +
@@ -42478,7 +42591,13 @@ void main()
         bool ApplyElevatorSnapshot(SiegeFX.Core.Save.ElevatorStopSnapshot es)
         {
             if (!_elevatorsByScid.TryGetValue(es.Scid, out var el)) return false;
-            if (el.AtStop == es.AtStop) return false;
+            bool wasMoving = el.Moving;
+            if (el.AtStop == es.AtStop && !wasMoving) return false;
+            // Save rows record parked stops, not an in-flight rider/car pose.
+            // Cancel transient carry even when the saved stop equals the
+            // departure stop, then rebuild the masked navigation floor.
+            if (wasMoving) SetElevatorRiderMovementSuspended(el, false);
+            el.Riders.Clear();
             el.AtStop = es.AtStop;
             el.Moving = false;
             el.T = 0f;
