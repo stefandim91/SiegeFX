@@ -1283,7 +1283,16 @@ public sealed class SfxRuntime
     {
         var fwd = ctx.TargetPos - ctx.SourcePos;
         fwd.Y = 0f;
-        fwd = fwd.LengthSquared() > 0.0001f ? Vector3.Normalize(fwd) : Vector3.UnitZ;
+        if (fwd.LengthSquared() > 0.0001f)
+            fwd = Vector3.Normalize(fwd);
+        else if (ctx.SourceOrientation.HasValue)
+        {
+            fwd = Vector3.Transform(Vector3.UnitZ, ctx.SourceOrientation.Value);
+            fwd.Y = 0f;
+            fwd = fwd.LengthSquared() > 0.0001f ? Vector3.Normalize(fwd) : Vector3.UnitZ;
+        }
+        else
+            fwd = Vector3.UnitZ;
         var right = Vector3.Normalize(Vector3.Cross(Vector3.UnitY, fwd));
         return right * off.X + Vector3.UnitY * off.Y + fwd * off.Z;
     }
@@ -2806,6 +2815,8 @@ public sealed class SfxRuntime
                 return ctx.SourcePos;
             return ctx.SourcePos;
         }
+        if (t.Equals("target", StringComparison.OrdinalIgnoreCase))
+            return ctx.TargetObjectAnchor ?? ctx.TargetPos;
         if (t.StartsWith("target", StringComparison.OrdinalIgnoreCase))
             return ctx.TargetPos;
         return ctx.TargetPos;

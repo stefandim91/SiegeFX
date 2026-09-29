@@ -66,24 +66,29 @@ public sealed class Actor
     /// code mutates via <see cref="ActorCombatState.ApplyDamage"/>.</summary>
     public ActorCombatState Combat { get; }
 
-    /// <summary>SC-IDLE-FIDGET — the clip an undirected actor idles on: the
-    /// template's authored <c>initial_chore</c> when it loaded, else clip 0
-    /// (chore_default). DS1 authors <c>initial_chore = chore_fidget</c> on
-    /// actors whose default stance is a STATIC pose — the phrak's default
-    /// <c>dfs</c> is a frozen glide; its fidget <c>dff</c> is the wing-flap
-    /// hover. Falling back to clip 0 left idle flyers frozen mid-air.
+    /// <summary>Clip selected for an undirected actor when its blender is
+    /// playing chore_default. An authored initial_chore or the original
+    /// auto-fidget job may select the moving fidget over a static stance pose.
     /// Public set: the render layer resets the PLAYER's to 0 — the hero's
     /// idle is owned by the slot-0 swap machinery (SetDefaultIdleClip /
     /// stance rebinds), which must stay visible.</summary>
     public int IdleClipIndex { get; set; }
 
-    /// <summary>Current blender-selected clip. Clamped to the legal range so the caller
-    /// can index <see cref="Clips"/> blindly; defaults to <see cref="IdleClipIndex"/>
-    /// before the first dispatch resolves.</summary>
-    public int CurrentClipIndex =>
-        Host.CurrentAnimIndex < 0 || Host.CurrentAnimIndex >= Clips.Length
-            ? (IdleClipIndex >= 0 && IdleClipIndex < Clips.Length ? IdleClipIndex : 0)
-            : Host.CurrentAnimIndex;
+    /// <summary>Current blender-selected clip. Slot zero is the authored
+    /// default stance, often a one-frame pose. The original fidget job requests
+    /// chore_fidget while idle; until that job is modeled as its own chore
+    /// scheduler, use the loaded idle selection whenever the blender returns
+    /// to its default slot. Explicit timed overrides retain priority.</summary>
+    public int CurrentClipIndex
+    {
+        get
+        {
+            int selected = Host.CurrentAnimIndex;
+            int idle = IdleClipIndex >= 0 && IdleClipIndex < Clips.Length ? IdleClipIndex : 0;
+            if (selected < 0 || selected >= Clips.Length) return idle;
+            return selected == 0 && !Host.IsOverrideActive ? idle : selected;
+        }
+    }
 
     internal Actor(
         ActorInstance instance,

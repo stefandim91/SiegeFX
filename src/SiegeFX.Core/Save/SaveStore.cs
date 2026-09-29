@@ -1,4 +1,7 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
+using SiegeFX.Core.Assets;
 
 namespace SiegeFX.Core.Save;
 
@@ -27,24 +30,69 @@ public static class SaveStore
     /// into the join path).</summary>
     public static SaveFile? Deserialize(byte[] bytes)
     {
-        try { return JsonSerializer.Deserialize<SaveFile>(System.Text.Encoding.UTF8.GetString(bytes), Json); }
+        try
+        {
+            var file = JsonSerializer.Deserialize<SaveFile>(Encoding.UTF8.GetString(bytes), Json);
+            if (file is null) return null;
+            return ValidateAndMigrate(file, "network:" + Convert.ToHexString(SHA256.HashData(bytes)));
+        }
         catch { return null; }
     }
 
     public static void Save(string path, SaveFile data)
     {
+        ArgumentNullException.ThrowIfNull(data);
+        path = Path.GetFullPath(path);
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-        // Atomic-ish: write to a sibling .tmp, then replace. On a crash
-        // mid-write the original .save stays intact and the .tmp gets
-        // cleaned up next save. Cross-volume Move would fail, but a save
-        // file always lives in the same directory we're writing to so
-        // they share a volume by construction.
-        var tmp = path + ".tmp";
-        File.WriteAllText(tmp, JsonSerializer.Serialize(data, Json));
-        if (File.Exists(path)) File.Replace(tmp, path, destinationBackupFileName: null);
-        else                    File.Move(tmp, path);
+        // A unique sibling keeps staging on the same volume and prevents one
+        // writer from consuming another writer's incomplete temporary file.
+        var tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            using (var stream = new FileStream(tmp, FileMode.CreateNew,
+                       FileAccess.Write, FileShare.None))
+            {
+                JsonSerializer.Serialize(stream, data, Json);
+                stream.Flush(flushToDisk: true);
+            }
+
+            // Use the loader's JSON/schema checks before touching the active
+            // slot. This does not yet validate gameplay cross-references.
+            _ = Load(tmp);
+            if (File.Exists(path))
+            {
+                // Never replace a known-good backup with malformed current
+                // data. IO failures (including locks) must abort the save;
+                // inability to read a file is not evidence of corruption.
+                bool preserveCurrent = true;
+                try
+                {
+                    using var current = File.OpenRead(path);
+                    using var document = JsonDocument.Parse(current);
+                }
+                catch (JsonException) { preserveCurrent = false; }
+                // Unsupported versions may belong to a newer engine. Refuse
+                // to overwrite them rather than treating them as corrupt.
+                // A newer shape can also throw JsonException during typed
+                // deserialization, even though its JSON syntax is valid.
+                if (preserveCurrent) _ = Load(path);
+                File.Replace(tmp, path, preserveCurrent ? path + ".bak" : null);
+            }
+            else
+            {
+                File.Move(tmp, path);
+            }
+        }
+        finally
+        {
+            // After promotion the staging path is already gone. On failure,
+            // cleanup must not mask the actual serialization/promotion error.
+            try { File.Delete(tmp); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
     }
 
     public static SaveFile Load(string path)
@@ -78,14 +126,86 @@ public static class SaveStore
         //              (Load Game window preview) — all default-friendly.
         //   v12 -> v13: added SaveFile.Party (SC-PARTY-PERSIST companion
         //              roster + bags) — default-friendly empty list.
-        if (file.SchemaVersion is 1 or 2 or 3 or 4 or 5 or 6 or 7 or 8 or 9 or 10 or 11 or 12)
+        //   v13 -> v14: explicit world/save-set/adventure-mode metadata.
+        //              Legacy world identity is accepted only when a known
+        //              authored map root is present in RegionPath.
+        return ValidateAndMigrate(file, Path.GetFullPath(path));
+    }
+
+    private static SaveFile ValidateAndMigrate(SaveFile file, string sourceIdentity)
+    {
+        if (file.SchemaVersion is >= 1 and <= 13)
         {
+            var legacyProfile = WorldProfile.TryFromRegion(file.RegionPath)
+                ?? throw new InvalidDataException(
+                    $"legacy save '{sourceIdentity}' has an unknown world region '{file.RegionPath}'");
+            if (!string.IsNullOrWhiteSpace(file.PlayerRegion)
+                && !legacyProfile.ContainsRegion(file.PlayerRegion))
+                throw new InvalidDataException(
+                    $"legacy save '{sourceIdentity}' player region '{file.PlayerRegion}' " +
+                    $"does not belong to {legacyProfile.Id}");
+
+            file.WorldId = legacyProfile.Id;
+            file.SaveSetId = DeterministicGuid(sourceIdentity).ToString("D");
+            file.AdventureMode = legacyProfile == WorldProfile.KingdomOfEhb
+                ? "OriginalCampaign"
+                : "SoloAdventure";
             file.SchemaVersion = SaveFile.CurrentSchemaVersion;
         }
+
         if (file.SchemaVersion != SaveFile.CurrentSchemaVersion)
             throw new InvalidDataException(
-                $"save '{path}' schema v{file.SchemaVersion} != runtime v{SaveFile.CurrentSchemaVersion}");
+                $"save '{sourceIdentity}' schema v{file.SchemaVersion} != runtime v{SaveFile.CurrentSchemaVersion}");
+
+        WorldProfile profile;
+        try { profile = WorldProfile.Get(file.WorldId); }
+        catch (ArgumentException ex)
+        {
+            throw new InvalidDataException(
+                $"save '{sourceIdentity}' has unknown world id '{file.WorldId}'", ex);
+        }
+
+        if (!Guid.TryParse(file.SaveSetId, out var saveSetId))
+            throw new InvalidDataException(
+                $"save '{sourceIdentity}' has invalid save-set id '{file.SaveSetId}'");
+        file.SaveSetId = saveSetId.ToString("D");
+
+        var expectedMode = profile == WorldProfile.KingdomOfEhb
+            ? "OriginalCampaign"
+            : "SoloAdventure";
+        if (!string.Equals(file.AdventureMode, expectedMode, StringComparison.Ordinal))
+            throw new InvalidDataException(
+                $"save '{sourceIdentity}' mode '{file.AdventureMode}' is invalid for {profile.Id}");
+
+        ValidateRegion(sourceIdentity, profile, nameof(file.RegionPath), file.RegionPath, required: true);
+        ValidateRegion(sourceIdentity, profile, nameof(file.PlayerRegion), file.PlayerRegion, required: false);
         return file;
+    }
+
+    private static void ValidateRegion(
+        string sourceIdentity,
+        WorldProfile profile,
+        string field,
+        string? region,
+        bool required)
+    {
+        if (string.IsNullOrWhiteSpace(region))
+        {
+            if (required)
+                throw new InvalidDataException(
+                    $"save '{sourceIdentity}' is missing required {field}");
+            return;
+        }
+        if (!profile.ContainsRegion(region))
+            throw new InvalidDataException(
+                $"save '{sourceIdentity}' {field} '{region}' does not belong to {profile.Id}");
+    }
+
+    private static Guid DeterministicGuid(string identity)
+    {
+        var normalized = identity.Trim().Replace('\\', '/').ToUpperInvariant();
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(normalized));
+        return new Guid(hash.AsSpan(0, 16));
     }
 
     /// <summary>Default per-user save directory. Uses LocalApplicationData
@@ -100,8 +220,21 @@ public static class SaveStore
     /// <summary>Quicksave path under <see cref="DefaultSaveDirectory"/>.
     /// One slot for now; the F5/F9 wiring in 19c overwrites it on each
     /// save and reads it on each load.</summary>
-    public static string QuicksavePath()
-        => Path.Combine(DefaultSaveDirectory(), "quicksave.save");
+    public static string QuicksavePath(string? saveSetId = null)
+        => Path.Combine(DefaultSaveDirectory(), SlotFileName("quicksave", saveSetId));
+
+    /// <summary>Autosave path under <see cref="DefaultSaveDirectory"/>. Passing
+    /// a save-set id isolates automatic slots belonging to different adventures.</summary>
+    public static string AutoSavePath(string? saveSetId = null)
+        => Path.Combine(DefaultSaveDirectory(), SlotFileName("autosave", saveSetId));
+
+    private static string SlotFileName(string kind, string? saveSetId)
+    {
+        if (saveSetId is null) return kind + ".save";
+        if (!Guid.TryParse(saveSetId, out var id))
+            throw new ArgumentException("Save-set id must be a valid Guid.", nameof(saveSetId));
+        return $"{kind}-{id:D}.save";
+    }
 
     /// <summary>One row in the Save/Load Game window's list. <see cref="Path"/>
     /// is the file to load/delete; <see cref="DisplayName"/> is the player-typed
@@ -171,7 +304,6 @@ public static class SaveStore
     {
         var dir = DefaultSaveDirectory();
         if (!Directory.Exists(dir)) return System.Array.Empty<SaveSlot>();
-        var quickName = Path.GetFileName(QuicksavePath());
         var slots = new List<SaveSlot>();
         foreach (var path in Directory.EnumerateFiles(dir, "*.save"))
         {
@@ -179,7 +311,7 @@ public static class SaveStore
             try { h = JsonSerializer.Deserialize<SaveHeader>(File.ReadAllText(path), Json); }
             catch { /* skip unreadable */ }
             if (h is null) continue;
-            bool isQuick = string.Equals(Path.GetFileName(path), quickName, System.StringComparison.OrdinalIgnoreCase);
+            bool isQuick = IsSaveSetSlot(Path.GetFileName(path), "quicksave");
             var label = !string.IsNullOrWhiteSpace(h.DisplayName)
                 ? h.DisplayName
                 : isQuick ? "Quicksave" : Path.GetFileNameWithoutExtension(path);
@@ -188,6 +320,17 @@ public static class SaveStore
         }
         slots.Sort((a, b) => b.SavedAt.CompareTo(a.SavedAt));
         return slots;
+    }
+
+    private static bool IsSaveSetSlot(string fileName, string kind)
+    {
+        if (string.Equals(fileName, kind + ".save", StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (!fileName.StartsWith(kind + "-", StringComparison.OrdinalIgnoreCase)
+            || !fileName.EndsWith(".save", StringComparison.OrdinalIgnoreCase))
+            return false;
+        var idText = fileName[(kind.Length + 1)..^5];
+        return Guid.TryParseExact(idText, "D", out _);
     }
 
     /// <summary>Delete a save file. Swallows a missing-file race; any other IO

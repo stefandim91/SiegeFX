@@ -91,7 +91,7 @@ public sealed record ActorStats(
     /// template [aspect] values inside its own <c>[t:...,n:...]</c> block
     /// (the same instance-first rule the static-prop path applies to
     /// scale_multiplier). Passing the placement's raw <see cref="GasNode"/>
-    /// makes instance <c>life</c>/<c>max_life</c>/<c>scale_multiplier</c> win
+    /// makes instance <c>life</c>/<c>max_life</c>/<c>scale_base</c>/<c>scale_multiplier</c> win
     /// over the template chain — a placed boss krug can carry 500 life while
     /// its template ships 60.</summary>
     public static ActorStats FromTemplate(TemplateStore store, Template template, GasNode? instance)
@@ -151,7 +151,8 @@ public sealed record ActorStats(
         // this is a no-op for them; the shrink-scaled ones (phrak 0.55, skrubbs
         // 0.3-0.5) render at native size without it. Clamp above 0 so a malformed
         // 0 can't collapse a creature to an invisible point.
-        float scaleBase = ParseFloat(store.GetAttribute(template, "aspect", "scale_base")) ?? 1f;
+        float scaleBase = ParseFloat(InstAspect("scale_base")) ??
+                          ParseFloat(store.GetAttribute(template, "aspect", "scale_base")) ?? 1f;
         // SC-INSTANCE-OVERRIDES: instance scale_multiplier replaces the template's
         // (same replace-not-multiply rule as the static-prop path).
         float scaleMult = ParseFloat(InstAspect("scale_multiplier")) ??

@@ -50,6 +50,16 @@ public readonly record struct SfxContext(
     /// approximation table stays in effect.</summary>
     public BoneResolver? TargetResolver { get; init; }
 
+    /// <summary>The world-space anchor of a target Game Object, when it is
+    /// distinct from its placement position. Actor-owned trigger effects can
+    /// use a posed body anchor for #TARGET while #TARGET_POSITION remains at
+    /// the actor's world position.</summary>
+    public Vector3? TargetObjectAnchor { get; init; }
+
+    /// <summary>Facing of the object that launched the effect. Used for
+    /// model-local offsets when source and target positions coincide.</summary>
+    public Quaternion? SourceOrientation { get; init; }
+
     /// <summary>Resolve a bone on the TARGET: live skeleton when the
     /// resolver is wired, else <see cref="TargetPos"/> + the same
     /// approximation offsets <see cref="ResolveBone"/> uses.</summary>

@@ -48,16 +48,37 @@ public sealed class SaveFile
     ///   v12 -> v13: added <see cref="Party"/> (SC-PARTY-PERSIST — recruited
     ///              companions: roster order, per-companion backpack +
     ///              equipment, vitals) so the party survives save/load.
+    ///   v13 -> v14: added explicit <see cref="WorldId"/>, <see cref="SaveSetId"/>,
+    ///              <see cref="AdventureMode"/>, and <see cref="EngineVersion"/>
+    ///              metadata so a save reopens the authored world it belongs to.
     /// All bumps are deserializer-friendly — missing fields hit their defaults —
-    /// so any v1..v12 file loads as a v13 with the new fields zero-initialized.
+    /// so any v1..v13 file loads as a v14 with new payload fields defaulted and
+    /// its world identity migrated from a recognized map root.
     /// IMPORTANT: bumping CurrentSchemaVersion requires extending the
     /// migration whitelist in SaveStore.Load too; the strict-equality check
     /// downstream throws InvalidDataException on any unmigrated version.</summary>
-    public const int CurrentSchemaVersion = 13;
+    public const int CurrentSchemaVersion = 14;
 
     /// <summary>Schema version of the file as written. Loader rejects when
     /// this doesn't match <see cref="CurrentSchemaVersion"/>.</summary>
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
+
+    /// <summary>v14 — durable id of the authored world represented by this
+    /// snapshot. Resolved through <c>WorldProfile</c>; never inferred for a
+    /// current-format save.</summary>
+    public string WorldId { get; set; } = "";
+
+    /// <summary>v14 — stable identity shared by the manual, quick, and auto
+    /// slots belonging to one playthrough. Stored as a canonical Guid string.</summary>
+    public string SaveSetId { get; set; } = "";
+
+    /// <summary>v14 — launch mode for this playthrough. Current values are
+    /// <c>OriginalCampaign</c> and <c>SoloAdventure</c>.</summary>
+    public string AdventureMode { get; set; } = "";
+
+    /// <summary>v14 — SiegeFX version that wrote this snapshot. Empty is
+    /// permitted so development and migrated saves remain loadable.</summary>
+    public string EngineVersion { get; set; } = "";
 
     /// <summary>Wall-clock time the save was written. Surfaced in save-pick
     /// UI later; today it just helps debug "which save am I looking at".</summary>
@@ -237,6 +258,9 @@ public sealed class WorldStateSnapshot
     /// load kept the current session's door positions instead of the
     /// save's. Absent on older saves = every door restores closed.</summary>
     public List<uint> OpenDoors { get; set; } = new();
+    /// <summary>Opening direction of each open leaf. Missing on older saves;
+    /// those leaves choose a direction from the restored actor position.</summary>
+    public Dictionary<uint, float> DoorSwingSigns { get; set; } = new();
     /// <summary>SC-GEN-PERSIST — per-generator activation + remaining-wave
     /// state. Absent on older saves = generators re-arm from region data
     /// (the old behavior: cleared ambushes respawned on every load).</summary>

@@ -26,8 +26,13 @@ internal static class SaveSelfTest
         var original = new SaveFile
         {
             SchemaVersion = SaveFile.CurrentSchemaVersion,
+            WorldId = "UtraeanPeninsula",
+            SaveSetId = "5a4ad37c-edb9-4974-a7c3-d50f02281a2f",
+            AdventureMode = "SoloAdventure",
+            EngineVersion = "selftest",
             SavedAt    = savedAt,
             RegionPath = "world/maps/multiplayer_world/regions/town_center",
+            PlayerRegion = "/world/maps/multiplayer_world/regions/town_center",
             Player = new PlayerSnapshot
             {
                 Scid          = 0xA1B2C3D4,
@@ -102,6 +107,15 @@ internal static class SaveSelfTest
                     },
                 },
             },
+            World = new WorldStateSnapshot
+            {
+                OpenDoors = new List<uint> { 0x03200BF8, 0x03200BF9 },
+                DoorSwingSigns = new Dictionary<uint, float>
+                {
+                    [0x03200BF8] = 1f,
+                    [0x03200BF9] = -1f,
+                },
+            },
         };
 
         // Write twice to exercise the temp+replace branch (path already exists
@@ -114,8 +128,22 @@ internal static class SaveSelfTest
 
         var failures = new List<string>();
         Check(failures, "SchemaVersion", original.SchemaVersion, loaded.SchemaVersion);
+        Check(failures, "WorldId",       original.WorldId,       loaded.WorldId);
+        Check(failures, "SaveSetId",     original.SaveSetId,     loaded.SaveSetId);
+        Check(failures, "AdventureMode", original.AdventureMode, loaded.AdventureMode);
+        Check(failures, "EngineVersion", original.EngineVersion, loaded.EngineVersion);
         Check(failures, "SavedAt",       original.SavedAt,       loaded.SavedAt);
         Check(failures, "RegionPath",    original.RegionPath,    loaded.RegionPath);
+        Check(failures, "PlayerRegion",  original.PlayerRegion,  loaded.PlayerRegion);
+        if (loaded.World is null) failures.Add("World block was null after round-trip");
+        else
+        {
+            Check(failures, "World.OpenDoors.Count", 2, loaded.World.OpenDoors.Count);
+            Check(failures, "World.DoorSwingSigns.Count", 2, loaded.World.DoorSwingSigns.Count);
+            foreach (var (scid, sign) in original.World!.DoorSwingSigns)
+                if (!loaded.World.DoorSwingSigns.TryGetValue(scid, out var got) || got != sign)
+                    failures.Add($"World.DoorSwingSigns[0x{scid:X8}] did not survive the save");
+        }
         if (loaded.Player is null) failures.Add("Player block was null after round-trip");
         else
         {

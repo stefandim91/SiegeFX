@@ -241,6 +241,38 @@ else if (args.Length >= 1 && args[0] == "--selftest-save")
     // JSON-correctness check, suitable for test-all.bat.
     return SiegeFX.Runtime.SaveSelfTest.Run() ? 0 : 1;
 }
+else if (args.Length >= 1 && args[0] == "--selftest-save-transaction")
+{
+    return SiegeFX.Runtime.SaveTransactionSelfTest.Run() ? 0 : 1;
+}
+else if (args.Length >= 1 && args[0] == "--selftest-world-profile")
+{
+    return SiegeFX.Runtime.WorldProfileSelfTest.Run() ? 0 : 1;
+}
+else if (args.Length >= 1 && args[0] == "--selftest-offline-content")
+{
+    return SiegeFX.Runtime.OfflineContentSelfTest.Run(args.Length > 1 ? args[1] : null) ? 0 : 1;
+}
+else if (args.Length == 2 && args[0] == "--selftest-world-launch")
+{
+    return SiegeFX.Runtime.WorldLaunchSelfTest.Run(args[1]) ? 0 : 1;
+}
+else if (args.Length >= 1 && args[0] == "--selftest-screen-actor-pick")
+{
+    return SiegeFX.Runtime.ScreenActorPickSelfTest.Run() ? 0 : 1;
+}
+else if (args.Length >= 1 && args[0] == "--selftest-door-interaction")
+{
+    return SiegeFX.Runtime.DoorInteractionSelfTest.Run(args.Length > 1 ? args[1] : null) ? 0 : 1;
+}
+else if (args.Length == 2 && args[0] == "--selftest-npc-idle")
+{
+    return SiegeFX.Runtime.NpcIdleAnimationSelfTest.Run(args[1]) ? 0 : 1;
+}
+else if (args.Length == 2 && args[0] == "--selftest-terrain-textures")
+{
+    return SiegeFX.Runtime.TerrainTextureSelfTest.Run(args[1]) ? 0 : 1;
+}
 else if (args.Length >= 1 && args[0] == "--selftest-net")
 {
     // SC-MP-EOS P3 self-test. Host↔client round-trip over the loopback

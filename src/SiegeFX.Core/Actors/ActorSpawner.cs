@@ -286,9 +286,12 @@ public sealed class ActorSpawner
 
         var world = ComposeWorldTransform(inst.Placement);
         // SC-INSTANCE-OVERRIDES — the placement's own [aspect] block (life /
-        // max_life / scale_multiplier) wins over the template chain.
+        // max_life / scale_base / scale_multiplier) wins over the template chain.
         var stats = ActorStats.FromTemplate(_store, template, inst.Node);
         var actor = new Actor(inst, template, world, mesh, clips, skrit, host, stats, walkIdx, clipIndexByName);
+        // Resolve equipment stance before scheduling any initial one-shot;
+        // its duration must match the clip that will actually render.
+        RefreshMotionClips(actor, preferredStance ?? DeriveStanceFromEquipment(template));
         // SC-IDLE-FIDGET — honor the template's authored [body] initial_chore
         // as the idle fallback clip. DS1 starts actors in it; for flyers
         // (phrak) and other static-default creatures that's chore_fidget —
@@ -300,13 +303,33 @@ public sealed class ActorSpawner
         if (!string.IsNullOrEmpty(initialChore)
             && clipIndexByName.TryGetValue(initialChore!, out var idleIdx))
             actor.IdleClipIndex = idleIdx;
-        // Phase 18 — resolve the animation stance from the AUTHORED equipment
-        // when the caller didn't supply one (NPCs): an axe-armed krug idles,
-        // walks, and swings in fs1/fs3 instead of the unarmed fs0 the plain
-        // "first stance that loads" pick landed on. Also populates the
-        // attack-variant set + qffg pad + authored base duration for every
-        // spawned combatant (clip cache makes the second pass cheap).
-        RefreshMotionClips(actor, preferredStance ?? DeriveStanceFromEquipment(template));
+        // The stock job_fidget.skrit requests CHORE_FIDGET on entering its
+        // idle state and again when the animation completes. Its visual
+        // request was previously missing here: the blender kept the static
+        // chore_default pose forever even while the brain was ticking.
+        // Honor both the inherited job and a placement's authored opt-out.
+        var autoFidgets = TemplateStore.GetNodeAttribute(inst.Node, "mind", "actor_auto_fidgets")
+            ?? _store.GetAttribute(template, "mind", "actor_auto_fidgets");
+        var fidgetJob = TemplateStore.GetNodeAttribute(inst.Node, "mind", "jat_fidget")
+            ?? _store.GetAttribute(template, "mind", "jat_fidget");
+        var fidgetSection = TemplateStore.FindChild(dictionary!, "chore_fidget");
+        var fidgetSkrit = fidgetSection is null ? null : TemplateStore.FindAttr(fidgetSection, "skrit");
+        if (!string.Equals(autoFidgets?.Trim(), "false", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(fidgetJob)
+            && clipIndexByName.TryGetValue("chore_fidget", out var fidgetIdx))
+            actor.IdleClipIndex = fidgetIdx;
+        else if (string.Equals(autoFidgets?.Trim(), "false", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(initialChore, "chore_fidget", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(fidgetSkrit, "select_fidget", StringComparison.OrdinalIgnoreCase)
+            && actor.IdleClipIndex > 0)
+        {
+            // select_fidget.skrit is one-shot. An explicit placement opt-out
+            // suppresses repeat requests, but the initial chore still plays
+            // once before the static default stance takes over.
+            int initialIdx = actor.IdleClipIndex;
+            actor.IdleClipIndex = 0;
+            actor.Host.OverrideAnimIndex(initialIdx, actor.Clips[initialIdx].AnimLength);
+        }
         return actor;
     }
 
@@ -561,6 +584,21 @@ public sealed class ActorSpawner
             return null;
         }
 
+        // Some ambient templates (dog_mp, birds, fish) author a complete
+        // stance in chore_prefix, e.g. a_c_na_dg_fs0, and omit
+        // chore_stances. Appending another zero requests fs00_dsf.prs and
+        // leaves the actor with no clip at all. Use that full prefix first;
+        // retain the normal stance-composition fallback for other templates.
+        if (stancesRaw is null && PrefixHasCompleteStance(prefix))
+        {
+            foreach (var attr in animFiles.Attributes)
+            {
+                if (string.IsNullOrWhiteSpace(attr.Value)) continue;
+                var clip = TryLoadFullNameClip(prefix + "_" + attr.Value, inst);
+                if (clip is not null) return clip;
+            }
+        }
+
         var stances = ParseChoreStances(stancesRaw);
         foreach (var attr in animFiles.Attributes)
         {
@@ -570,6 +608,15 @@ public sealed class ActorSpawner
             if (clip is not null) return clip;
         }
         return null;
+    }
+
+    private static bool PrefixHasCompleteStance(string prefix)
+    {
+        int at = prefix.LastIndexOf("_fs", StringComparison.OrdinalIgnoreCase);
+        if (at < 0 || at + 3 >= prefix.Length) return false;
+        for (int i = at + 3; i < prefix.Length; i++)
+            if (!char.IsDigit(prefix[i])) return false;
+        return true;
     }
 
     /// <summary>Phase 10-SC-2 helper — load a PRS by full basename (no stance composition).
