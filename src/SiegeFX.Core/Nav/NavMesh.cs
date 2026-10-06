@@ -96,6 +96,28 @@ public sealed class NavMesh
 
     public bool IsBlocked(int tri) => Blocked is not null && tri >= 0 && tri < Blocked.Length && Blocked[tri];
 
+    /// <summary>A terrain node that has physically left its baked position (for
+    /// example an elevator car in motion). Unlike an obstacle, it cannot be
+    /// used even as a standing-position fallback.</summary>
+    public bool[]? Unavailable { get; private set; }
+    public bool HasUnavailable { get; private set; }
+    public bool IsUnavailable(int tri) => Unavailable is not null && tri >= 0 && tri < Unavailable.Length && Unavailable[tri];
+
+    public int SetUnavailableForSnode(uint snodeGuid, bool unavailable)
+    {
+        if (Unavailable is null && !unavailable) return 0;
+        Unavailable ??= new bool[TriangleCount];
+        int changed = 0;
+        for (int t = 0; t < TriangleCount; t++)
+        {
+            if (SourceSnodeGuid[t] != snodeGuid || Unavailable[t] == unavailable) continue;
+            Unavailable[t] = unavailable;
+            changed++;
+        }
+        if (changed > 0) HasUnavailable = unavailable || Array.IndexOf(Unavailable, true) >= 0;
+        return changed;
+    }
+
     /// <summary>SC-DOORS-BLOCK — reset every obstacle mark so the map can be
     /// re-stamped from live state (door opened, prop destroyed). Cheap:
     /// one Array.Clear; the caller re-marks everything that still blocks.</summary>
@@ -1108,6 +1130,7 @@ public sealed class NavMesh
         for (int i = 0; i < bucket.Length; i++)
         {
             int t = bucket[i];
+            if (IsUnavailable(t)) continue;
             var a = Vertices[Indices[3 * t + 0]];
             var b = Vertices[Indices[3 * t + 1]];
             var c = Vertices[Indices[3 * t + 2]];
@@ -1210,6 +1233,7 @@ public sealed class NavMesh
         {
             int t = bucket[i];
             if (_componentIds![t] != refComp) continue;
+            if (IsUnavailable(t)) continue;
             var a = Vertices[Indices[3 * t + 0]];
             var b = Vertices[Indices[3 * t + 1]];
             var c = Vertices[Indices[3 * t + 2]];
@@ -1263,6 +1287,7 @@ public sealed class NavMesh
         for (int i = 0; i < bucket.Length; i++)
         {
             int t = bucket[i];
+            if (IsUnavailable(t)) continue;
             var a = Vertices[Indices[3 * t + 0]];
             var b = Vertices[Indices[3 * t + 1]];
             var c = Vertices[Indices[3 * t + 2]];
@@ -1324,6 +1349,7 @@ public sealed class NavMesh
             {
                 int t = bucket[i];
                 if (!traversal.CanEnter(Kinds[t])) continue;
+                if (IsUnavailable(t)) continue;
                 if (Blocked is not null && t < Blocked.Length && Blocked[t]) continue;
                 if (FadeHidden is not null && t < FadeHidden.Length && FadeHidden[t]) continue;
                 var a = Vertices[Indices[3 * t + 0]];
@@ -1389,6 +1415,7 @@ public sealed class NavMesh
             }
             var p = new Vector3(px, (a.Y + b.Y) * 0.5f, pz);
             if (!TryFindTriangle(p, out var tri, includeFadeHidden: true)) return true;
+            if (IsUnavailable(tri)) return true;
             if (IsBlocked(tri)) return true;
         }
         return false;
@@ -1440,6 +1467,7 @@ public sealed class NavMesh
             for (int i = 0; i < bucket.Length; i++)
             {
                 int t = bucket[i];
+                if (IsUnavailable(t)) continue;
                 if (!includeFadeHidden && FadeHidden is not null && t < FadeHidden.Length && FadeHidden[t]) continue;
                 var a = Vertices[Indices[3 * t + 0]];
                 var b = Vertices[Indices[3 * t + 1]];

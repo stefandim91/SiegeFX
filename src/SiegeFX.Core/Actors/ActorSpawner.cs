@@ -544,6 +544,48 @@ public sealed class ActorSpawner
         return TryLoadAnyStanceClip(chorePrefix, new[] { stance }, suffix, actor.Instance);
     }
 
+    /// <summary>Resolve an interactive prop's authored transition using the same
+    /// asset cache as actor chores. Instance overrides take precedence.</summary>
+    public PrsAnimation? LoadTransitionClip(Template template, ActorInstance inst, string chore)
+    {
+        var prefix = TemplateStore.GetNodeAttribute(inst.Node, "body", "chore_dictionary", "chore_prefix")
+            ?? _store.GetAttribute(template, "body", "chore_dictionary", "chore_prefix");
+        if (string.IsNullOrWhiteSpace(prefix)) return null;
+        var dictionary = TemplateStore.FindChild(inst.Node, "body");
+        dictionary = dictionary is null ? null : TemplateStore.FindChild(dictionary, "chore_dictionary");
+        var instanceSection = dictionary is null ? null : TemplateStore.FindChild(dictionary, chore);
+        string? Field(string name) => TemplateStore.GetNodeAttribute(inst.Node,
+                "body", "chore_dictionary", chore, name)
+            ?? _store.GetAttribute(template, "body", "chore_dictionary", chore, name);
+        if (!(Field("skrit") ?? "").Trim().Trim('"').Split('?')[0]
+                .Equals("transition", StringComparison.OrdinalIgnoreCase)) return null;
+        var animFiles = FindAnimFiles(instanceSection);
+        // A derived template can override one chore field while inheriting its
+        // animation entries. GetSection returns the first section as a whole,
+        // so keep walking the specializes chain until entries are present.
+        for (var ancestor = template; animFiles is null && ancestor is not null;
+            ancestor = ancestor.Specializes)
+            animFiles = FindAnimFiles(_store.GetSection(ancestor,
+                "body", "chore_dictionary", chore));
+        if (animFiles is null) return null;
+        var stances = Field("chore_stances");
+        var section = new GasNode(chore, new[] { animFiles }, stances is null
+            ? Array.Empty<GasAttribute>() : new[] { new GasAttribute("chore_stances", null, stances) });
+        return TryLoadChoreClip(prefix.Trim().Trim('"'), section, inst, preferredStance: null);
+    }
+
+    /// <summary>GAS permits both [anim_files] blocks and the common
+    /// "anim_files: 00 = suffix" attributes used by original prop templates.</summary>
+    private static GasNode? FindAnimFiles(GasNode? section)
+    {
+        if (section is null) return null;
+        var child = TemplateStore.FindChild(section, "anim_files");
+        if (child is not null) return child;
+        var attrs = section.Attributes.Where(a =>
+            a.Name.StartsWith("anim_files:", StringComparison.OrdinalIgnoreCase)).ToArray();
+        return attrs.Length == 0 ? null : new GasNode("anim_files", Array.Empty<GasNode>(), attrs);
+    }
+
     /// <summary>Phase 10-SC-2 — load a representative PRS clip for one chore_* section.
     /// Walks every <c>[anim_files]</c> entry and stops at the first that resolves; returns
     /// null if none load. Two filename strategies depending on the section's
@@ -565,7 +607,7 @@ public sealed class ActorSpawner
     /// to the idle.</summary>
     PrsAnimation? TryLoadChoreClip(string prefix, GasNode section, ActorInstance inst, int? preferredStance)
     {
-        var animFiles = TemplateStore.FindChild(section, "anim_files");
+        var animFiles = FindAnimFiles(section);
         if (animFiles is null || animFiles.Attributes.Count == 0) return null;
 
         var stancesRaw = TemplateStore.FindAttr(section, "chore_stances");
@@ -584,12 +626,10 @@ public sealed class ActorSpawner
             return null;
         }
 
-        // Some ambient templates (dog_mp, birds, fish) author a complete
-        // stance in chore_prefix, e.g. a_c_na_dg_fs0, and omit
-        // chore_stances. Appending another zero requests fs00_dsf.prs and
-        // leaves the actor with no clip at all. Use that full prefix first;
-        // retain the normal stance-composition fallback for other templates.
-        if (stancesRaw is null && PrefixHasCompleteStance(prefix))
+        // Stanceless props use prefix_suffix, while some ambient animals
+        // include their complete stance in the prefix (a_c_na_dg_fs0).
+        // Try the authored prefix unchanged before numeric stance fallback.
+        if (stancesRaw is null)
         {
             foreach (var attr in animFiles.Attributes)
             {
@@ -608,15 +648,6 @@ public sealed class ActorSpawner
             if (clip is not null) return clip;
         }
         return null;
-    }
-
-    private static bool PrefixHasCompleteStance(string prefix)
-    {
-        int at = prefix.LastIndexOf("_fs", StringComparison.OrdinalIgnoreCase);
-        if (at < 0 || at + 3 >= prefix.Length) return false;
-        for (int i = at + 3; i < prefix.Length; i++)
-            if (!char.IsDigit(prefix[i])) return false;
-        return true;
     }
 
     /// <summary>Phase 10-SC-2 helper — load a PRS by full basename (no stance composition).

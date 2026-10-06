@@ -138,7 +138,7 @@ public sealed partial class RenderHost : IDisposable
         {
             foreach (var c in _chestProps) c.ChestOpened = ws.OpenedChests.Contains(c.Scid);
             foreach (var lu in _lockedUsables) lu.Unlocked = ws.UnlockedUsables.Contains(lu.Prop.Scid);
-            foreach (var lv in _leverProps) lv.LeverOn = ws.LeversOn.Contains(lv.Scid);
+            foreach (var lv in _leverProps) SetLeverState(lv, ws.LeversOn.Contains(lv.Scid), snap: true);
             foreach (var kv in _breakingByScid)
             {
                 bool destroyed = ws.BrokenProps.Contains(kv.Key);
@@ -161,7 +161,7 @@ public sealed partial class RenderHost : IDisposable
                     if (lu.Prop.Scid == scid) { lu.Unlocked = true; break; }
             foreach (var scid in ws.LeversOn)
                 foreach (var lv in _leverProps)
-                    if (lv.Scid == scid) { lv.LeverOn = true; break; }
+                    if (lv.Scid == scid) { if (!lv.LeverOn) SetLeverState(lv, true, snap: true); break; }
             foreach (var scid in ws.BrokenProps)
                 if (_breakingByScid.TryGetValue(scid, out var bp) && !bp.IsDestroyed)
                 { bp.IsDestroyed = true; structural = true; }
@@ -399,6 +399,9 @@ public sealed partial class RenderHost : IDisposable
     // interactive/emitter .gas. No skrit, no animation, no nav — just transform +
     // mesh + (optional) texture, drawn through the static-mesh pipeline.
     private readonly List<StaticPropInstance> _staticProps = new();
+    // Props placed on a moving elevator node retain their node-local pose;
+    // only these small groups need a world-matrix update during a ride.
+    private readonly Dictionary<uint, List<StaticPropInstance>> _movingPropsByNode = new();
     // SC-DOORS-OPEN (audit fold — finding #7) — parallel list of
     // door-only props so TickDoors doesn't scan 5810 props/frame to
     // find ~20 doors. Populated alongside _staticProps.Add at
@@ -505,6 +508,7 @@ public sealed partial class RenderHost : IDisposable
         public float T;                // ride progress 0..1
         public int CarInstanceIdx = -1;
         public Vector3 PrevCarPos;
+        public Vector3 DepartedCarMin, DepartedCarMax;
         public readonly List<ActorRenderState> Riders = new();
     }
     // Delayed fade tuples from movingN_actioninfo's optional 6th field
@@ -4498,10 +4502,27 @@ public sealed partial class RenderHost : IDisposable
         return _fadedSnodeCounts.ContainsKey(_navMesh.SourceSnodeGuid[tri]);
     }
 
+    private bool IsActorInFadedSnode(ActorRenderState actor)
+    {
+        if (_fadedSnodeCounts.Count == 0) return false;
+        foreach (var elevator in _elevators)
+            if (elevator.Moving && elevator.Riders.Contains(actor))
+                return _fadedSnodeCounts.ContainsKey(elevator.Def.CarNodeGuid);
+        return IsPosInFadedSnode(actor.CurrentTransform.Translation);
+    }
+
     private bool TryGetPlayerSnodeGuid(out uint snodeGuid)
     {
         snodeGuid = 0;
         if (_playerFollower is null || _navMesh is null) return false;
+        // The baked departure floor is unavailable during a ride, but the
+        // carried player still physically occupies the moving car node.
+        foreach (var elevator in _elevators)
+            if (elevator.Moving && _player is not null && elevator.Riders.Contains(_player))
+            {
+                snodeGuid = elevator.Def.CarNodeGuid;
+                return true;
+            }
         int tri = _playerFollower.CurrentTriangle;
         if (tri < 0 && !_navMesh.TryFindTriangle(_playerFollower.Position, out tri)) return false;
         if (tri < 0 || tri >= _navMesh.SourceSnodeGuid.Length) return false;
@@ -4527,6 +4548,7 @@ public sealed partial class RenderHost : IDisposable
         public StaticMesh Mesh = null!;
         public GlTexture? Texture;
         public Matrix4x4 World;
+        public Matrix4x4 NodeLocalWorld;
         public string Template = "";
         // SC-PROP-INVISIBLE — DS1 authors logic objects (life/mana shrines,
         // blocking_object) with a dev-marker [aspect] model PLUS
@@ -4588,6 +4610,12 @@ public sealed partial class RenderHost : IDisposable
         // at the elevator gizmo from BOTH states (a call button in effect).
         public bool   IsLever;
         public bool   LeverOn;
+        public UsableTransitionPose? LeverPose;
+        public SkinnedMesh? LeverPoseMesh;
+        public bool LeverPoseApplied;
+        public bool LeverStartsPosed;
+        public Matrix4x4 LeverPosedLocalWorld;
+        public Matrix4x4 LeverUnposedLocalWorld;
         public float  LeverUseRange = 2f;
         // SC-LEVER-MULTISEND — DS1 authors numbered send pairs
         // (on_scid/on_message, on_scid_2/on_message_2, …): cr_r1's stairwell
@@ -4693,7 +4721,7 @@ public sealed partial class RenderHost : IDisposable
     // happen per render frame via screen-space body picks and a ground-plane
     // raycast for walkability, mirroring the corresponding click handlers
     // so cursor visual tracks 1:1 with what a click actually picks.
-    private enum CursorState { Pointer, Attack, CastAttack, Smash, Grab, UseDoor, Talk, NoGo, NoTalk }
+    private enum CursorState { Pointer, Attack, CastAttack, Smash, Grab, UseDoor, UseLever, Talk, NoGo, NoTalk }
     private CursorState _cursorState = CursorState.Pointer;
     // Phase 22 — hover + walk-up pickup state. _hoverPile feeds the
     // bottom-center item readout; gold/spells also get the flat blue hover
@@ -14927,7 +14955,9 @@ void main()
                     }
                     var pp = rowPend.Position.ToVector3();
                     if (s.Brain is not null) s.Brain.Teleport(pp);
-                    s.CurrentTransform = Matrix4x4.CreateTranslation(pp);
+                    var restored = RestoreActorTransform(s.Actor.WorldTransform, pp, rowPend.Facing);
+                    s.Brain?.Wander.SetFacing(Vector3.TransformNormal(Vector3.UnitZ, restored));
+                    s.CurrentTransform = restored;
                     appliedPend++;
                     return true;
                 }
@@ -14951,6 +14981,7 @@ void main()
             // after the next click resolved against a meshless gap — reversing.
             var pendingTarget = !_playerFollower.ReachedGoal && !_playerFollower.PathBlocked
                 ? _playerFollower.Target : (Vector3?)null;
+            bool wasSuspended = _playerFollower.MovementSuspended;
             _playerFollower = new SiegeFX.Core.Nav.NavFollower(newNav, pos, speed)
             {
                 // Phase 24-NAV-LOGICAL-FLAGS — player respects the
@@ -14959,6 +14990,7 @@ void main()
                 Traversal = SiegeFX.Core.Nav.NavTraversal.Player,
                 DiagnosticLogging = true,
             };
+            if (wasSuspended) _playerFollower.SetMovementSuspended(true);
             if (pendingTarget is { } tgt) _playerFollower.SetTarget(tgt);
         }
 
@@ -15619,6 +15651,7 @@ void main()
                     var overrideTex = authoredTexName is null
                         ? null : ResolvePropOverrideTexture(authoredTexName);
                     var tex = overrideTex ?? ResolveAspTexture(asp);
+                    var nodeLocalWorld = ComposePlacementLocal(asp, p.Placement);
                     var world = ComposePlacementWorld(asp, p.Placement);
 
                     // Phase 17-SC-J — DS1 lets the placement override `aspect.scale_multiplier`
@@ -15629,9 +15662,12 @@ void main()
                     var scale = ResolveScaleMultiplier(template, p.Node);
                     if (scale != 1f)
                     {
+                        nodeLocalWorld = Matrix4x4.CreateScale(scale) * nodeLocalWorld;
                         world = Matrix4x4.CreateScale(scale) * world;
                         scaledPlacements++;
                     }
+                    if (_elevatorNodeOverrides.TryGetValue(p.Placement.NodeGuid, out var carPose))
+                        world = ComposeAttachedPropWorld(nodeLocalWorld, carPose);
 
                     // Phase 21c-1 — barrel-render investigation. Dump per-corner data
                     // for the first placement of any "barrel" template so we can verify
@@ -15928,6 +15964,7 @@ void main()
                         Mesh          = glMesh,
                         Texture       = tex,
                         World         = world,
+                        NodeLocalWorld = nodeLocalWorld,
                         Asp           = asp,
                         Template      = p.TemplateName,
                         ForceNoRender = forceNoRender,
@@ -15960,7 +15997,14 @@ void main()
                         CenterY       = world.Translation.Y,
                         Source        = p.Node,
                     };
+                    if (isLever) ConfigureLeverPose(inst, template!, p);
                     _staticProps.Add(inst);
+                    if (_elevatorNodeOverrides.ContainsKey(inst.NodeGuid))
+                    {
+                        if (!_movingPropsByNode.TryGetValue(inst.NodeGuid, out var attached))
+                            _movingPropsByNode[inst.NodeGuid] = attached = new List<StaticPropInstance>();
+                        attached.Add(inst);
+                    }
                     if (isDoor)
                     {
                         _doorProps.Add(inst);
@@ -19985,39 +20029,89 @@ void main()
     /// vertical re-bind gate refuses it, and every click is then rejected
     /// from a permanently off-mesh start. A ring search snaps them to the
     /// nearest real floor instead (the landing edge, in practice ≤1u away).</summary>
-    private void RescueOffMeshAfterRebuild(SiegeFX.Core.Nav.NavMesh nav)
+    private void RescueOffMeshAfterRebuild(SiegeFX.Core.Nav.NavMesh nav, ElevatorRuntime? departedElevator = null)
     {
+        bool IsRidingAnotherMovingPlatform(ActorRenderState actor)
+        {
+            foreach (var elevator in _elevators)
+                if (elevator.Moving && elevator.Riders.Contains(actor)) return true;
+            foreach (var stairwell in _stairwells)
+                if (stairwell.Moving)
+                    foreach (var segment in stairwell.Segments)
+                        if (segment.Riders.Contains(actor)) return true;
+            return false;
+        }
+        uint landingGuid = departedElevator is null ? 0
+            : departedElevator.AtStop == 1 ? departedElevator.Def.Connect2Guid : departedElevator.Def.Connect1Guid;
+        bool TryDepartedLanding(Vector3 pos, out Vector3 dest)
+        {
+            dest = default;
+            if (departedElevator is null || landingGuid == 0) return false;
+            var lo = departedElevator.DepartedCarMin;
+            var hi = departedElevator.DepartedCarMax;
+            if (pos.X < lo.X - 1f || pos.X > hi.X + 1f ||
+                pos.Z < lo.Z - 1f || pos.Z > hi.Z + 1f ||
+                pos.Y < lo.Y - 2f || pos.Y > hi.Y + 2f) return false;
+            float width = hi.X - lo.X, depth = hi.Z - lo.Z;
+            float maxLandingDistance = MathF.Max(8f, MathF.Sqrt(width * width + depth * depth) + 3f);
+            float best = float.PositiveInfinity;
+            for (int tri = 0; tri < nav.TriangleCount; tri++)
+            {
+                if (nav.SourceSnodeGuid[tri] != landingGuid || nav.IsBlocked(tri) ||
+                    nav.IsUnavailable(tri) || nav.IsFadeHidden(tri) ||
+                    !SiegeFX.Core.Nav.NavTraversal.Player.CanEnter(nav.Kinds[tri])) continue;
+                if (nav.Flags is not null && !nav.Flags.CanEnter(
+                    nav.SourceSnodeGuid[tri], (byte)nav.SourceLnodeIndex[tri],
+                    SiegeFX.Core.Nav.NavTraversal.Player.Actor)) continue;
+                var candidate = nav.NearestPointInTriangleXZ(tri, pos);
+                if (MathF.Abs(candidate.Y - pos.Y) > 3f) continue;
+                float dx = candidate.X - pos.X, dz = candidate.Z - pos.Z;
+                float d2 = dx * dx + dz * dz;
+                if (d2 >= best || d2 > maxLandingDistance * maxLandingDistance) continue;
+                best = d2;
+                dest = candidate;
+            }
+            return best < float.PositiveInfinity;
+        }
         bool StandableAt(Vector3 p, out float y)
         {
             y = p.Y;
             if (!nav.TryFindTriangle(p, out var tri, includeFadeHidden: true)) return false;
+            if (nav.IsUnavailable(tri)) return false;
             y = nav.SampleYOnTriangle(tri, p);
             return MathF.Abs(y - p.Y) <= 2.0f;
         }
         void Rescue(ActorRenderState s, SiegeFX.Core.Nav.NavFollower? follower)
         {
+            if (IsRidingAnotherMovingPlatform(s)) return;
             var pos = s.CurrentTransform.Translation;
             if (StandableAt(pos, out _)) return;
-            for (float r = 0.5f; r <= 3.01f; r += 0.5f)
+            Vector3? rescue = null;
+            for (float r = 0.5f; r <= 3.01f && rescue is null; r += 0.5f)
             {
                 for (int i = 0; i < 16; i++)
                 {
                     float a = i * MathF.PI * 2f / 16f;
                     var probe = new Vector3(pos.X + MathF.Cos(a) * r, pos.Y, pos.Z + MathF.Sin(a) * r);
                     if (!StandableAt(probe, out float y)) continue;
-                    var dest = probe with { Y = y };
-                    var t = s.CurrentTransform;
-                    t.Translation = dest;
-                    s.CurrentTransform = t;
-                    follower?.Teleport(dest);
-                    if (ReferenceEquals(s, _player)) _playerRenderInit = false;
-                    else s.PartyRenderInit = false;
-                    Console.WriteLine($"[nav-rescue] {(ReferenceEquals(s, _player) ? "player" : s.Actor.Template)} " +
-                        $"off-floor at ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) -> ({dest.X:F1},{dest.Y:F1},{dest.Z:F1})");
-                    return;
+                    rescue = probe with { Y = y };
+                    break;
                 }
             }
-            Console.WriteLine($"[nav-rescue] no floor within 3u of ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) — actor left in place");
+            if (rescue is null && TryDepartedLanding(pos, out var landing)) rescue = landing;
+            if (rescue is not { } dest)
+            {
+                Console.WriteLine($"[nav-rescue] no safe floor near ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) — actor left in place");
+                return;
+            }
+            var t = s.CurrentTransform;
+            t.Translation = dest;
+            s.CurrentTransform = t;
+            follower?.Teleport(dest);
+            if (ReferenceEquals(s, _player)) _playerRenderInit = false;
+            else s.PartyRenderInit = false;
+            Console.WriteLine($"[nav-rescue] {(ReferenceEquals(s, _player) ? "player" : s.Actor.Template)} " +
+                $"off-floor at ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) -> ({dest.X:F1},{dest.Y:F1},{dest.Z:F1})");
         }
         if (_player is not null && !_player.IsDead) Rescue(_player, _playerFollower);
         foreach (var m in _party)
@@ -20282,6 +20376,7 @@ void main()
     /// <see cref="UpdateElevatorCarInstance"/>.</summary>
     private void UpdateStairSegmentInstance(StairwellRuntime.Seg seg, Matrix4x4 pose)
     {
+        UpdatePropsOnMovingNode(seg.NodeGuid, pose);
         int idx = seg.InstanceIdx;
         if (idx < 0 || idx >= _regionInstances.Count || _regionInstances[idx].SnodeGuid != seg.NodeGuid)
         {
@@ -20296,11 +20391,26 @@ void main()
         _regionInstances[idx] = inst with { World = pose, WorldAabbMin = mn, WorldAabbMax = mx };
     }
 
+    /// <summary>Keep props attached to a moving SNO in its current world
+    /// pose, including while the terrain node is between stops.</summary>
+    private void UpdatePropsOnMovingNode(uint nodeGuid, Matrix4x4 pose)
+    {
+        _elevatorNodeOverrides[nodeGuid] = pose;
+        if (!_movingPropsByNode.TryGetValue(nodeGuid, out var attached))
+        {
+            attached = _staticProps.Where(p => p.NodeGuid == nodeGuid).ToList();
+            _movingPropsByNode[nodeGuid] = attached;
+        }
+        foreach (var prop in attached)
+            prop.World = ComposeAttachedPropWorld(prop.NodeLocalWorld, pose);
+    }
+
     /// <summary>Write <paramref name="pose"/> into the car node's render
     /// instance (found by snode guid, index cached). AABB recomputed so
     /// culling follows the platform.</summary>
     private void UpdateElevatorCarInstance(ElevatorRuntime el, Matrix4x4 pose)
     {
+        UpdatePropsOnMovingNode(el.Def.CarNodeGuid, pose);
         int idx = el.CarInstanceIdx;
         if (idx < 0 || idx >= _regionInstances.Count || _regionInstances[idx].SnodeGuid != el.Def.CarNodeGuid)
         {
@@ -20365,15 +20475,36 @@ void main()
         el.T = 0f;
         el.PrevCarPos = (el.AtStop == 1 ? el.Stop1 : el.Stop2).Translation;
         CaptureElevatorRiders(el);
+        SetElevatorRiderMovementSuspended(el, true);
+        if (el.CarInstanceIdx >= 0 && el.CarInstanceIdx < _regionInstances.Count)
+        {
+            var car = _regionInstances[el.CarInstanceIdx];
+            el.DepartedCarMin = car.WorldAabbMin;
+            el.DepartedCarMax = car.WorldAabbMax;
+        }
+        _navMesh?.SetUnavailableForSnode(el.Def.CarNodeGuid, true);
         var def = el.Def;
         bool departing1 = el.AtStop == 1;
         var info = departing1 ? def.Moving1ActionInfo : def.Moving2ActionInfo;
         var msg = departing1 ? def.Moving1Message : def.Moving2Message;
         var msgScid = departing1 ? def.Moving1Scid : def.Moving2Scid;
-        if (info.Length > 0) ApplyElevatorActionInfo(info);
+        // The authored fades describe the rider's view during travel. A
+        // remotely called empty car leaves the player on a visible landing.
+        if (info.Length > 0 && _player is not null && el.Riders.Contains(_player))
+            ApplyElevatorActionInfo(info);
         if (msgScid != 0 && msgScid != def.Scid) PostTriggerWorldMessage(msg, def.Scid, msgScid);
         Console.WriteLine($"[elevator] 0x{def.Scid:X8} departing stop{el.AtStop} -> stop{el.TargetStop} " +
             $"({def.DurationSeconds:F1}s, {el.Riders.Count} rider(s))");
+    }
+
+    private void SetElevatorRiderMovementSuspended(ElevatorRuntime el, bool suspended)
+    {
+        foreach (var rider in el.Riders)
+        {
+            var follower = ReferenceEquals(rider, _player)
+                ? _playerFollower : rider.Brain?.Wander?.Follower;
+            follower?.SetMovementSuspended(suspended);
+        }
     }
 
     /// <summary>movingN_actioninfo — semicolon-joined fade_nodes tuples
@@ -21265,7 +21396,7 @@ void main()
                 }
                 else
                 {
-                    var lp = lever.World.Translation;
+                    var lp = LeverPosition(lever);
                     float dx = pp.X - lp.X, dz = pp.Z - lp.Z;
                     // XZ range only + generous vertical: wall-mounted levers
                     // sit ~chest height above the floor the player stands on.
@@ -21370,6 +21501,7 @@ void main()
 
             if (el.T >= 1f)
             {
+                SetElevatorRiderMovementSuspended(el, false);
                 el.Moving = false;
                 el.AtStop = el.TargetStop;
                 var final = el.AtStop == 1 ? el.Stop1 : el.Stop2;
@@ -21387,11 +21519,13 @@ void main()
                     {
                         var pos = _player.CurrentTransform.Translation;
                         var speed = _playerFollower.Speed;
+                        bool wasSuspended = _playerFollower.MovementSuspended;
                         _playerFollower = new SiegeFX.Core.Nav.NavFollower(nav, pos, speed)
                         {
                             Traversal = SiegeFX.Core.Nav.NavTraversal.Player,
                             DiagnosticLogging = true,
                         };
+                        if (wasSuspended) _playerFollower.SetMovementSuspended(true);
                     }
                     // Party riders get a fresh follower on the new mesh at
                     // their ridden position (their old follower still holds
@@ -21410,7 +21544,7 @@ void main()
                     // this the follower's vertical re-bind gate correctly
                     // refuses the shaft bottom 12u below — and the player
                     // freezes over the hole with every click refused.
-                    RescueOffMeshAfterRebuild(nav);
+                    RescueOffMeshAfterRebuild(nav, el);
                 }
                 el.Riders.Clear();
                 Console.WriteLine($"[elevator] 0x{el.Def.Scid:X8} arrived at stop{el.AtStop}");
@@ -21470,11 +21604,13 @@ void main()
                     {
                         var pos = _player.CurrentTransform.Translation;
                         var speed = _playerFollower.Speed;
+                        bool wasSuspended = _playerFollower.MovementSuspended;
                         _playerFollower = new SiegeFX.Core.Nav.NavFollower(nav, pos, speed)
                         {
                             Traversal = SiegeFX.Core.Nav.NavTraversal.Player,
                             DiagnosticLogging = true,
                         };
+                        if (wasSuspended) _playerFollower.SetMovementSuspended(true);
                     }
                     foreach (var seg in sw.Segments)
                     foreach (var r in seg.Riders)
@@ -21543,49 +21679,72 @@ void main()
     /// the click ray must pass within a hand's width of the lever PROP —
     /// clicking the floor near a lever is just a move (the old floor-point
     /// radius turned ordinary walk clicks by the farm winch into "send the
-    /// elevator away", stranding the player topside). Floor-mounted levers
-    /// keep a tight floor-hit fallback for clicks at their base. The pull
+    /// elevator away", stranding the player topside). The pull
     /// fires from TickElevators once the player reaches the lever's authored
     /// use point (or plain use range when none authored).</summary>
     private void RequestLeverUseNear(Vector3 rayOrigin, Vector3 rayDir, Vector3 floorHit)
     {
-        if (_leverProps.Count == 0) return;
+        _pendingLeverUse = PickLeverOnRay(rayOrigin, rayDir, floorHit);
+    }
+
+    /// <summary>Shared lever probe for hover and click. A control only owns
+    /// the cursor when its pick volume is reached before the clicked floor.</summary>
+    private StaticPropInstance? PickLeverOnRay(Vector3 rayOrigin, Vector3 rayDir, Vector3 floorHit)
+    {
+        if (_leverProps.Count == 0) return null;
         var dir = rayDir;
         float dlen = dir.Length();
-        if (dlen > 1e-6f) dir /= dlen;
+        if (dlen <= 1e-6f) return null;
+        dir /= dlen;
+        float floorDistance = Vector3.Dot(floorHit - rayOrigin, dir);
         StaticPropInstance? best = null;
         float bestScore = float.MaxValue;
         foreach (var l in _leverProps)
         {
-            if (l.IsDestroyed) continue;
+            if (l.IsDestroyed || l.ForceNoRender || IsAbovePlayer(l.RegionPath)
+                || (l.NodeGuid != 0 && _fadedSnodeCounts.ContainsKey(l.NodeGuid))) continue;
+            if (l.LeverPoseApplied && l.LeverPose is { } pose)
+            {
+                pose.Update(_terrainTime);
+                float limit = Math.Min(120f, floorDistance + 0.05f);
+                if (pose.TryRayHit(rayOrigin, dir, l.World, limit, out float distance)
+                    && distance < bestScore) { bestScore = distance; best = l; }
+                continue;
+            }
             var lp = l.World.Translation;
             // Primary: click ray passes close to the lever prop itself
             // (covers wall/ceiling mounts like the winch — the nav-mesh hit
             // under them is meaningless for selection).
-            var toL = lp - rayOrigin;
-            float t = Vector3.Dot(toL, dir);
-            if (t > 0f && t < 120f)
-            {
-                float rd = Vector3.Distance(rayOrigin + dir * t, lp);
-                if (rd <= 0.9f && rd < bestScore) { bestScore = rd; best = l; continue; }
-            }
-            // Fallback: floor-mounted levers whose origin sits at the hit.
-            float dx = lp.X - floorHit.X, dz = lp.Z - floorHit.Z;
-            float dxz = MathF.Sqrt(dx * dx + dz * dz);
-            if (dxz <= 1.0f && MathF.Abs(lp.Y - floorHit.Y) <= 2.0f && dxz < bestScore)
-            { bestScore = dxz; best = l; }
+            if (LeverRayHitBeforeFloor(rayOrigin, dir, floorDistance, lp, out float rd)
+                && rd < bestScore) { bestScore = rd; best = l; }
         }
-        _pendingLeverUse = best;
+        return best;
+    }
+
+    internal static bool LeverRayHitBeforeFloor(Vector3 origin, Vector3 unitDir,
+        float floorDistance, Vector3 lever, out float rayDistance)
+    {
+        float t = Vector3.Dot(lever - origin, unitDir);
+        float radialDistance = Vector3.Distance(origin + unitDir * t, lever);
+        rayDistance = 0f;
+        const float pickRadius = 0.9f;
+        if (t <= 0f || t >= 120f || radialDistance > pickRadius) return false;
+        // Compare the FIRST intersection with the lever's pick volume, not
+        // its origin: an oblique click can hit the upper part of a floor
+        // lever before the floor while its origin lies slightly beyond it.
+        float entry = t - MathF.Sqrt(pickRadius * pickRadius - radialDistance * radialDistance);
+        rayDistance = MathF.Max(0f, entry);
+        return entry <= floorDistance + 0.05f;
     }
 
     private void PullLever(StaticPropInstance lever)
     {
-        lever.LeverOn = !lever.LeverOn;
+        SetLeverState(lever, !lever.LeverOn);
         // SC-MATERIAL-MATRIX — the lever's authored material picks its pull
         // sound (winch chain, metal crank, wooden handle — 12 authored
         // lever_start rows).
         PlayMaterialEvent(MaterialOfRef(lever.Template), "generic", "lever_start",
-            lever.World.Translation);
+            LeverPosition(lever));
         // SC-LEVER-MULTISEND — every authored send pair fires on the pull.
         var sends = lever.LeverOn ? lever.LeverOnSends : lever.LeverOffSends;
         Console.WriteLine($"[lever] 0x{lever.Scid:X8} pulled -> {(lever.LeverOn ? "on" : "off")}: " +
@@ -22153,8 +22312,10 @@ void main()
             {
                 var pos = _playerFollower.Position;
                 var speed = _playerFollower.Speed;
+                bool wasSuspended = _playerFollower.MovementSuspended;
                 _playerFollower = new SiegeFX.Core.Nav.NavFollower(nav, pos, speed)
                 { Traversal = SiegeFX.Core.Nav.NavTraversal.Player, DiagnosticLogging = true };
+                if (wasSuspended) _playerFollower.SetMovementSuspended(true);
             }
         }
     }
@@ -23243,12 +23404,19 @@ void main()
         return false;
     }
 
-    private Matrix4x4 ComposePlacementWorld(AspMesh asp, SiegeFX.Core.Assets.NodePlacement p)
+    private static Matrix4x4 ComposePlacementLocal(AspMesh asp, SiegeFX.Core.Assets.NodePlacement p)
     {
         var bindRoot = ComputeRootBindPose(asp);
-        var local = bindRoot *
-                    Matrix4x4.CreateFromQuaternion(p.Orientation) *
-                    Matrix4x4.CreateTranslation(p.LocalPosition);
+        return bindRoot * Matrix4x4.CreateFromQuaternion(p.Orientation) *
+               Matrix4x4.CreateTranslation(p.LocalPosition);
+    }
+
+    internal static Matrix4x4 ComposeAttachedPropWorld(Matrix4x4 nodeLocalWorld, Matrix4x4 nodePose)
+        => nodeLocalWorld * nodePose;
+
+    private Matrix4x4 ComposePlacementWorld(AspMesh asp, SiegeFX.Core.Assets.NodePlacement p)
+    {
+        var local = ComposePlacementLocal(asp, p);
         if (_regionLayout is null) return local;
         if (!_regionLayout.TryGetTransform(p.NodeGuid, out var nodeWorld)) return local;
         return local * nodeWorld;
@@ -23307,7 +23475,7 @@ void main()
     /// Z-up — the torch cantilevering off the wall. The correct test is whether
     /// any GEOMETRY binds past bone 0: attach bones carry no verts, so a rigid
     /// prop reads max-geometry-bone 0 regardless of how many sockets it has.</summary>
-    private static Matrix4x4 ComputeRootBindPose(AspMesh asp)
+    internal static Matrix4x4 ComputeRootBindPose(AspMesh asp)
     {
         if (asp.BindPose.Length == 0) return Matrix4x4.Identity;
         if (!IsRigidRootProp(asp)) return Matrix4x4.Identity;
@@ -23428,6 +23596,10 @@ void main()
             // and TryFindTriangle re-glues actors to them. All fade writers
             // are whole-snode, so the snode ref-count map is the full truth.
             nav.SetFadeHiddenForSnodes(new HashSet<uint>(_fadedSnodeCounts.Keys), true);
+            // A rebuild during travel must not resurrect the departing car's
+            // baked floor before the arrival pose is committed.
+            foreach (var moving in _elevators)
+                if (moving.Moving) nav.SetUnavailableForSnode(moving.Def.CarNodeGuid, true);
             Console.WriteLine($"  nav mesh rebuild: {nav.TriangleCount} tri(s), " +
                               $"{nav.Vertices.Length} welded vert(s), " +
                               $"{nav.SourceSnodeCount} snode(s), " +
@@ -26092,7 +26264,7 @@ void main()
         if (_player is not null
             && MathF.Abs(p.Y - _player.CurrentTransform.Translation.Y) > PickSameFloorYBand)
             return false;
-        return !IsPosInFadedSnode(p);
+        return !IsActorInFadedSnode(s);
     }
 
     /// <summary>SC-SCREEN-PICK — pick the actor whose SCREEN body the
@@ -33194,6 +33366,7 @@ void main()
             CursorState.CastAttack => "Left-click to attack",
             CursorState.Grab       => "Left-click to pick up item",
             CursorState.UseDoor    => "Left-click to open door",
+            CursorState.UseLever   => "Left-click to use lever",
             CursorState.Smash      => "Left-click to break",
             CursorState.Talk       => "Right-click to talk",
             _ => null,
@@ -33556,14 +33729,18 @@ void main()
         var groundHit = near + dir * t;
         if (_navMesh is not null)
         {
-            if (_navMesh.TryRaycast(near, dir, dir.Length(), out int navTri, out _))
+            if (_navMesh.TryRaycast(near, dir, dir.Length(), out int navTri, out var navHit))
             {
+                if (PickLeverOnRay(near, dir, navHit) is not null)
+                { _cursorState = CursorState.UseLever; return; }
                 if (PlayerCannotStandOn(navTri)) _cursorState = CursorState.NoGo;
             }
             else if (!_navMesh.TryFindTriangle(groundHit, out int planeTri))
             {
                 _cursorState = CursorState.NoGo;
             }
+            else if (PickLeverOnRay(near, dir, groundHit) is not null)
+            { _cursorState = CursorState.UseLever; return; }
             else if (PlayerCannotStandOn(planeTri))
             {
                 _cursorState = CursorState.NoGo;
@@ -33613,7 +33790,7 @@ void main()
                 int frame = (int)(_terrainTime * 12.0) % _cursorSmash.Length;
                 return (_cursorSmash[frame], hsSmallX, hsSmallY, small);
             }
-            case CursorState.Grab or CursorState.UseDoor when _cursorGrab is { Length: > 0 }:
+            case CursorState.Grab or CursorState.UseDoor or CursorState.UseLever when _cursorGrab is { Length: > 0 }:
             {
                 int frame = (int)(_terrainTime * 12.0) % _cursorGrab.Length;
                 return (_cursorGrab[frame], hsSmallX, hsSmallY, small);
@@ -38607,7 +38784,7 @@ void main()
                 // a moving actor points at wherever it spawned (the player's
                 // spawn is on the surface → body culled with the surface
                 // while the separately-drawn boots + dagger kept walking).
-                if (!s.IsPlayer && IsPosInFadedSnode(s.CurrentTransform.Translation)) continue;
+                if (!s.IsPlayer && IsActorInFadedSnode(s)) continue;
                 // Intro NIS gizmos (narrator voice-over; spent sleeping dog) stay in
                 // _actors for scripting but never draw as visible NPCs.
                 if (s.IsPlayer && s.Hidden)
@@ -38741,7 +38918,7 @@ void main()
                     var appos = s.CurrentTransform.Translation;
                     float apdx = appos.X - apCam.X, apdz = appos.Z - apCam.Z;
                     if (apdx * apdx + apdz * apdz > 80f * 80f) continue;
-                    if (IsPosInFadedSnode(appos)) continue;
+                    if (IsActorInFadedSnode(s)) continue;
                     var apClips = s.Actor.Clips;
                     if (apClips.Length == 0) continue;
                     var apClip = apClips[Math.Min(s.Actor.CurrentClipIndex, apClips.Length - 1)];
@@ -38927,6 +39104,7 @@ void main()
                 // the on-hit code already kicked debris particles at the
                 // origin so the disappearance reads as a break, not a pop.
                 if (prop.IsDestroyed) continue;
+                if (prop.LeverPoseApplied && prop.LeverPose is not null) continue;
                 // SC-PROP-INVISIBLE — authored-invisible logic objects
                 // (shrines, blockers) never draw their dev-marker mesh.
                 if (prop.ForceNoRender) continue;
@@ -38989,6 +39167,8 @@ void main()
             _gl.Enable(GLEnum.CullFace);
         }
 
+        DrawLeverPoses(vp);
+
         // Phase 21-SC-BARREL-C — frag-debris pass. Same shader and uFlipV
         // convention as the static-prop layer (frag .asps are authored
         // bottom-up like every other DS1 prop), but the model matrix is
@@ -39039,7 +39219,7 @@ void main()
                 if (s.WeaponMesh is null && s.ShieldMesh is null) continue;
                 // SC-REGION-LAYER-HIDE-ACTORS (follow-up) — no region stamp on
                 // actors yet; gear hides with the faded-snode gate below.
-                if (IsPosInFadedSnode(s.CurrentTransform.Translation)) continue;
+                if (IsActorInFadedSnode(s)) continue;
                 var npcClips = s.Actor.Clips;
                 int npcBones = s.Actor.Mesh.BoneCount;
                 if (_boneWorldsScratch.Length < npcBones)
@@ -41526,6 +41706,7 @@ void main()
         _propGlMeshCache.Clear();
         _propAspCache.Clear();
         _staticProps.Clear();
+        _movingPropsByNode.Clear();
         _doorProps.Clear();
         _pendingDoorUse = null;
         _pendingDoorActor = null;
@@ -41709,6 +41890,31 @@ void main()
         return _regionPath ?? "";
     }
 
+    /// <summary>Persist an actor's live horizontal heading. Missing headings
+    /// in older saves retain the existing pose instead of resetting to +Z.</summary>
+    internal static SiegeFX.Core.Save.Vec3? CaptureActorFacing(Matrix4x4 pose)
+    {
+        var forward = Vector3.TransformNormal(Vector3.UnitZ, pose);
+        var flat = new Vector3(forward.X, 0f, forward.Z);
+        if (!float.IsFinite(flat.X) || !float.IsFinite(flat.Z) || flat.LengthSquared() < 1e-8f)
+            return null;
+        return SiegeFX.Core.Save.Vec3.From(Vector3.Normalize(flat));
+    }
+
+    internal static Matrix4x4 RestoreActorTransform(Matrix4x4 spawned, Vector3 position,
+        SiegeFX.Core.Save.Vec3? savedFacing)
+    {
+        if (savedFacing is { } saved)
+        {
+            var facing = saved.ToVector3();
+            if (float.IsFinite(facing.X) && float.IsFinite(facing.Z) &&
+                facing.X * facing.X + facing.Z * facing.Z > 1e-8f)
+                spawned = Matrix4x4.CreateRotationY(MathF.Atan2(facing.X, facing.Z));
+        }
+        spawned.Translation = position;
+        return spawned;
+    }
+
     internal SiegeFX.Core.Save.SaveFile CaptureSave()
     {
         var profile = _activeWorld ?? throw new InvalidOperationException("This world has no save profile.");
@@ -41850,6 +42056,7 @@ void main()
                 Scid         = s.Actor.Instance.Scid,
                 TemplateName = s.Actor.Template.Name,
                 Position     = SiegeFX.Core.Save.Vec3.From(pos),
+                Facing       = CaptureActorFacing(s.CurrentTransform),
                 CurrentLife  = s.Actor.Combat.CurrentLife,
                 CurrentMana  = s.Actor.Combat.CurrentMana,
                 IsDead       = s.IsDead || s.Actor.Combat.IsDead,
@@ -42053,6 +42260,7 @@ void main()
                 TemplateName = m.Actor.Template.Name,
                 PartyIndex   = m.PartyIndex,
                 Position     = SiegeFX.Core.Save.Vec3.From(m.CurrentTransform.Translation),
+                Facing       = CaptureActorFacing(m.CurrentTransform),
                 CurrentLife  = m.Actor.Combat.CurrentLife,
                 CurrentMana  = m.Actor.Combat.CurrentMana,
                 Downed       = m.Actor.Combat.Downed,   // SC-DOWNED
@@ -42387,7 +42595,10 @@ void main()
                     OnPlayerRegionChanged(trueRegion!);
                 }
             }
-            s.CurrentTransform = Matrix4x4.CreateTranslation(pos);
+            var fallbackPose = s.IsPlayer ? s.CurrentTransform : s.Actor.WorldTransform;
+            var restored = RestoreActorTransform(fallbackPose, pos, snap.Facing);
+            s.Brain?.Wander.SetFacing(Vector3.TransformNormal(Vector3.UnitZ, restored));
+            s.CurrentTransform = restored;
             patched++;
         }
 
@@ -42599,7 +42810,13 @@ void main()
             if (structural)
             {
                 var nav = RebuildNavMesh();
-                if (nav is not null) { _navMesh = nav; MarkAllObstacles(); RehomeAllFollowers(nav); }
+                if (nav is not null)
+                {
+                    _navMesh = nav;
+                    MarkAllObstacles();
+                    RehomeAllFollowers(nav);
+                    _playerFollower?.Rehome(nav);
+                }
             }
             Console.WriteLine($"  load: world state — {ws.Bools.Count} bool(s), {ws.Accumulators.Count} accum, " +
                               $"{ws.OpenedChests.Count} chest(s), {ws.UnlockedUsables.Count} unlock(s), " +
@@ -42625,7 +42842,13 @@ void main()
         bool ApplyElevatorSnapshot(SiegeFX.Core.Save.ElevatorStopSnapshot es)
         {
             if (!_elevatorsByScid.TryGetValue(es.Scid, out var el)) return false;
-            if (el.AtStop == es.AtStop) return false;
+            bool wasMoving = el.Moving;
+            if (el.AtStop == es.AtStop && !wasMoving) return false;
+            // Save rows record parked stops, not an in-flight rider/car pose.
+            // Cancel transient carry even when the saved stop equals the
+            // departure stop, then rebuild the masked navigation floor.
+            if (wasMoving) SetElevatorRiderMovementSuspended(el, false);
+            el.Riders.Clear();
             el.AtStop = es.AtStop;
             el.Moving = false;
             el.T = 0f;
@@ -43050,7 +43273,8 @@ void main()
             ApplyMemberCombatMode(npc.PartyIndex);
             var cpos = cs.Position.ToVector3();
             if (npc.Brain is not null) npc.Brain.Teleport(cpos);
-            npc.CurrentTransform = Matrix4x4.CreateTranslation(cpos);
+            npc.CurrentTransform = RestoreActorTransform(npc.Actor.WorldTransform, cpos, cs.Facing);
+            npc.Brain?.Wander.SetFacing(Vector3.TransformNormal(Vector3.UnitZ, npc.CurrentTransform));
             npc.PartyRenderInit = false;
             // SC-COMPANION-DEAD-RESTORE — a member saved at 0 HP restores
             // as a DEAD, resurrectable corpse (retail semantics). The
@@ -43162,7 +43386,17 @@ void main()
                 foreach (var r in save.Actors)
                     if (r.Scid == pss.SummonScid) { srow = r; break; }
                 if (srow is not null && !srow.IsDead && srow.TemplateName.Length > 0)
-                    smn = TrySpawnCompanionActor(srow.TemplateName, srow.Scid, srow.Position.ToVector3());
+                {
+                    var summonPos = srow.Position.ToVector3();
+                    smn = TrySpawnCompanionActor(srow.TemplateName, srow.Scid, summonPos);
+                    if (smn is not null)
+                    {
+                        smn.CurrentTransform = RestoreActorTransform(
+                            smn.Actor.WorldTransform, summonPos, srow.Facing);
+                        smn.Brain?.Wander.SetFacing(
+                            Vector3.TransformNormal(Vector3.UnitZ, smn.CurrentTransform));
+                    }
+                }
             }
             if (smn is not null && !smn.IsDead)
             {
