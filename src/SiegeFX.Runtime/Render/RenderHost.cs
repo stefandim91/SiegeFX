@@ -5765,13 +5765,13 @@ public sealed partial class RenderHost : IDisposable
         }
     }
 
-    /// <summary>Write a named save from the Save Game window and raise the
-    /// "Game 'X' saved successfully" banner. Unlike <see cref="DoQuickSave"/>
-    /// (one fixed slot) this mints a timestamped file so many named saves
-    /// coexist in the list. <paramref name="overwritePath"/> (a confirmed
-    /// overwrite of an existing slot) writes that file in place instead;
-    /// SaveStore keeps the replaced generation as its .bak.</summary>
-    private void PerformNamedSave(string name, string? overwritePath = null)
+    /// <summary>Write a named save from the Save Game window and return the
+    /// message for its OK box — DS1's "Game 'X' saved successfully". Unlike
+    /// <see cref="DoQuickSave"/> (one fixed slot) this mints a timestamped file
+    /// so many named saves coexist in the list. <paramref name="overwritePath"/>
+    /// (a confirmed overwrite of an existing slot) writes that file in place
+    /// instead; SaveStore keeps the replaced generation as its .bak.</summary>
+    private string PerformNamedSave(string name, string? overwritePath = null)
     {
         var label = string.IsNullOrWhiteSpace(name)
             ? DateTime.Now.ToString("MMM d, yyyy") : name.Trim();
@@ -5782,14 +5782,12 @@ public sealed partial class RenderHost : IDisposable
             save.DisplayName = label;
             SiegeFX.Core.Save.SaveStore.Save(path, save);
             Console.WriteLine($"  save: wrote '{label}' ({save.Actors.Count} actors) -> {path}");
-            _saveToastText = $"Game '{label}' saved successfully.";
-            _saveToastRemaining = SaveToastDuration;
+            return $"Game '{label}' saved successfully";
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"  save: failed -- {ex.Message}");
-            _saveToastText = "Save failed.";
-            _saveToastRemaining = SaveToastDuration;
+            return "Save failed.";
         }
     }
 
@@ -5800,14 +5798,15 @@ public sealed partial class RenderHost : IDisposable
     {
         switch (r)
         {
+            // DS1 reports the result in an OK box over the Save window; OK closes it.
             case SaveGameDialog.Result.Save:
-                PerformNamedSave(_saveDialog.NameText);
-                _saveDialog.Close();
+                _saveDialog.ShowNotice(PerformNamedSave(_saveDialog.NameText));
                 break;
             case SaveGameDialog.Result.Overwrite:
                 if (_saveDialog.OverwriteTarget is { } target)
-                    PerformNamedSave(_saveDialog.NameText, target.Path);
-                _saveDialog.Close();
+                    _saveDialog.ShowNotice(PerformNamedSave(_saveDialog.NameText, target.Path));
+                else
+                    _saveDialog.Close();
                 break;
             case SaveGameDialog.Result.Delete:
                 if (_saveDialog.Selected is { } slot)
@@ -9669,11 +9668,11 @@ void main()
                 if (_saveDialog.IsOpen)
                 {
                     bool enter = key == Key.Enter || key == Key.KeypadEnter;
-                    // The overwrite Yes/No box answers Enter/Esc first.
-                    if (_saveDialog.ConfirmOpen)
+                    // The overwrite Yes/No or save-result OK box answers Enter/Esc first.
+                    if (_saveDialog.BoxOpen)
                     {
-                        if (enter) HandleSaveDialogResult(_saveDialog.AnswerConfirm(true));
-                        else if (key == Key.Escape) _saveDialog.AnswerConfirm(false);
+                        if (enter) HandleSaveDialogResult(_saveDialog.AnswerBox(true));
+                        else if (key == Key.Escape) HandleSaveDialogResult(_saveDialog.AnswerBox(false));
                         return;
                     }
                     if (key == Key.Backspace) { _saveDialog.OnChar('\b'); return; }
