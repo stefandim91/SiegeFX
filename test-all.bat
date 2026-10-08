@@ -813,25 +813,19 @@ goto MENU
 echo.
 echo --- Save safety, world profiles, offline content and authored launch (no window) ---
 echo [expect: all self-tests pass; real-map checks use the configured DS1 installation]
-echo [exits 0 on success, 1 with field-by-field diffs on failure]
+echo [each self-test prints PASS, or FAILED with field-by-field diffs]
 echo.
 dotnet "%RUN%" --selftest-save
-set EXITCODE=%ERRORLEVEL%
-if not "%EXITCODE%"=="0" goto T39_DONE
+if errorlevel 1 (echo *** SAVE SELFTEST FAILED ***) else (echo save: PASS)
 dotnet "%RUN%" --selftest-save-transaction
-set EXITCODE=%ERRORLEVEL%
-if not "%EXITCODE%"=="0" goto T39_DONE
+if errorlevel 1 (echo *** SAVE-TRANSACTION SELFTEST FAILED ***) else (echo save-transaction: PASS)
 dotnet "%RUN%" --selftest-world-profile
-set EXITCODE=%ERRORLEVEL%
-if not "%EXITCODE%"=="0" goto T39_DONE
+if errorlevel 1 (echo *** WORLD-PROFILE SELFTEST FAILED ***) else (echo world-profile: PASS)
 dotnet "%RUN%" --selftest-offline-content "%DS1%"
-set EXITCODE=%ERRORLEVEL%
-if not "%EXITCODE%"=="0" goto T39_DONE
+if errorlevel 1 (echo *** OFFLINE-CONTENT SELFTEST FAILED ***) else (echo offline-content: PASS)
 dotnet "%RUN%" --selftest-world-launch "%DS1%"
-set EXITCODE=%ERRORLEVEL%
-:T39_DONE
+if errorlevel 1 (echo *** WORLD-LAUNCH SELFTEST FAILED ***) else (echo world-launch: PASS)
 echo.
-echo === SiegeFX exited with code %EXITCODE% ===
 pause
 goto MENU
 
