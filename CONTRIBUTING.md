@@ -26,6 +26,13 @@ way: short, explaining what changed and why, with no checklists or review chatte
 would not want to read in `git log` a year from now. `.github/pull_request_template.md` is
 shaped for this; delete its comments before merging.
 
+PR titles follow [Conventional Commits](https://www.conventionalcommits.org/):
+`type(optional-scope): lowercase subject`, for example `feat(utraea): persist the selected world
+in saves` or `fix: keep the roof hidden indoors`. Allowed types are `feat`, `fix`, `docs`,
+`style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore` and `revert`. The **PR title** check
+(`.github/workflows/pr-title.yml`) enforces this on every PR and re-runs when the title is
+edited. Branch commits are not checked, since they are squashed away.
+
 ## Syncing from upstream
 
 Upstream syncs are the one exception to everything above, and they must **never** be squashed.
