@@ -3,6 +3,7 @@ using System.Text;
 using SiegeFX.Core.Actors;
 using SiegeFX.Core.Assets;
 using SiegeFX.Core.Tank;
+using SiegeFX.Runtime.Render;
 
 namespace SiegeFX.Runtime;
 
@@ -218,6 +219,7 @@ internal static class LeverPoseSelfTest
         VerifyOriginalEndpoints("upper", upperResult);
         VerifyOriginalEndpoints("lower/model07", lowerResult);
         VerifyOriginalPickBeforeFloor(upper, upperResult.Pose, upperResult.Mesh);
+        VerifyFlushControlPick(upper, upperResult.Pose);
     }
 
     private static OriginalPose LoadOriginalPose(
@@ -293,6 +295,24 @@ internal static class LeverPoseSelfTest
             return;
         }
         throw new InvalidDataException("upper lever has no finite non-degenerate posed triangle");
+    }
+
+    private static void VerifyFlushControlPick(ActorInstance instance, UsableTransitionPose pose)
+    {
+        pose.SetOpen(false, 0d, snap: true);
+        var world = Matrix4x4.CreateFromQuaternion(instance.Placement.Orientation)
+            * Matrix4x4.CreateTranslation(instance.Placement.LocalPosition);
+        var center = Vector3.Transform(pose.Center, world);
+        var axis = Vector3.Normalize(Vector3.TransformNormal(Vector3.UnitZ, world));
+        var origin = center + axis * 3f;
+        var direction = -axis;
+        const float floorDistance = 2.7f;
+        Require(!pose.TryRayHit(origin, direction, world, floorDistance, out _),
+            "upper button unexpectedly intersects the supporting floor before its posed surface");
+        var radius = Math.Clamp((pose.Max - pose.Min).Length() * 0.5f + 0.08f, 0.18f, 0.55f);
+        Require(RenderHost.LeverRayHitBeforeFloor(origin, direction, floorDistance,
+                center, out _, radius),
+            "upper button's narrow posed pick volume missed just behind the supporting floor");
     }
 
     private static string AuthoredTransitionSuffix(

@@ -30,6 +30,22 @@ internal static class ElevatorInteractionSelfTest
             origin, ray, 5f, new Vector3(1.2f, 5, 4), out _), false);
         ok &= Check("lever outside range", RenderHost.LeverRayHitBeforeFloor(
             origin, ray, 130f, new Vector3(0, 5, 121), out _), false);
+        // A wall-mounted button's triangles may sit just behind the nav floor
+        // seen by this ray. A small posed-center volume still selects it,
+        // while a floor well in front or a nearby walk click cannot.
+        var buttonCenter = new Vector3(0, 5, 6);
+        ok &= Check("flush posed button before floor", RenderHost.LeverRayHitBeforeFloor(
+            origin, ray, 5.8f, buttonCenter, out _, 0.35f), true);
+        ok &= Check("floor occludes posed button", RenderHost.LeverRayHitBeforeFloor(
+            origin, ray, 5f, buttonCenter, out _, 0.35f), false);
+        // A blocked surface may overlap a flush button, but must not make a
+        // control several units behind it selectable.
+        ok &= Check("flush button behind blocked surface", RenderHost.LeverRayHitBeforeFloor(
+            origin, ray, 5.35f + 0.55f, buttonCenter, out _, 0.35f), true);
+        ok &= Check("blocked foreground hides distant button", RenderHost.LeverRayHitBeforeFloor(
+            origin, ray, 3f + 0.55f, buttonCenter, out _, 0.35f), false);
+        ok &= Check("nearby ray misses posed button", RenderHost.LeverRayHitBeforeFloor(
+            origin, ray, 10f, buttonCenter + new Vector3(0.4f, 0, 0), out _, 0.35f), false);
         // A multi-bone control's raw vertices are already in bind space.
         // Applying its bone-0 rotation again tips the button toward the floor.
         var rootRotation = Quaternion.CreateFromAxisAngle(Vector3.UnitX, -MathF.PI / 2f);

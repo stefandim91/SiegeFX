@@ -21662,6 +21662,28 @@ void main()
     private bool TryNearestLeverUsePoint(StaticPropInstance lever, Vector3 refPos, out Vector3 world)
         => TryNearestUsePoint(lever.LeverUsePointScids, refPos, out world);
 
+    private bool TryLeverApproachPoint(StaticPropInstance lever, out Vector3 point, out int triangle)
+    {
+        point = default;
+        triangle = -1;
+        if (_navMesh is null || _playerFollower is null) return false;
+        var actorPos = ActingCharacter()?.CurrentTransform.Translation ?? _playerFollower.Position;
+        if (TryNearestLeverUsePoint(lever, actorPos, out var authored)
+            && _navMesh.TryFindTriangle(authored, out triangle)
+            && !PlayerCannotStandOn(triangle))
+        {
+            point = authored;
+            return true;
+        }
+        var center = LeverPosition(lever);
+        if (!_navMesh.TryFindNearestEnterable(center,
+            MathF.Max(2f, lever.LeverUseRange), 3.5f,
+            SiegeFX.Core.Nav.NavTraversal.Player, out triangle, out point)) return false;
+        float dx = point.X - center.X, dz = point.Z - center.Z;
+        return dx * dx + dz * dz <= lever.LeverUseRange * lever.LeverUseRange
+            && !PlayerCannotStandOn(triangle);
+    }
+
     private bool TryNearestUsePoint(uint[] scids, Vector3 refPos, out Vector3 world)
     {
         world = default;
@@ -21689,14 +21711,19 @@ void main()
 
     /// <summary>Shared lever probe for hover and click. A control only owns
     /// the cursor when its pick volume is reached before the clicked floor.</summary>
-    private StaticPropInstance? PickLeverOnRay(Vector3 rayOrigin, Vector3 rayDir, Vector3 floorHit)
+    private StaticPropInstance? PickLeverOnRay(Vector3 rayOrigin, Vector3 rayDir,
+        Vector3? floorHit, float floorAllowance = 0f, bool posedOnly = false)
     {
         if (_leverProps.Count == 0) return null;
         var dir = rayDir;
         float dlen = dir.Length();
         if (dlen <= 1e-6f) return null;
         dir /= dlen;
-        float floorDistance = Vector3.Dot(floorHit - rayOrigin, dir);
+        // A wall control can be visible even when its ray has no walkable
+        // floor behind it. Only posed controls get that floorless fallback;
+        // their visible mesh or its tightly bounded pick volume must be hit.
+        float floorDistance = floorHit is { } floor
+            ? Vector3.Dot(floor - rayOrigin, dir) + floorAllowance : 120f;
         StaticPropInstance? best = null;
         float bestScore = float.MaxValue;
         foreach (var l in _leverProps)
@@ -21709,8 +21736,26 @@ void main()
                 float limit = Math.Min(120f, floorDistance + 0.05f);
                 if (pose.TryRayHit(rayOrigin, dir, l.World, limit, out float distance)
                     && distance < bestScore) { bestScore = distance; best = l; }
+                else
+                {
+                    // Thin buttons sit flush with authored floor/wall meshes.
+                    // A tight volume around the POSED shape covers tiny gaps
+                    // between visible triangles and the nav ray, without the
+                    // old broad floor-point proximity pick.
+                    var center = LeverPosition(l);
+                    float scale = MathF.Max(
+                        Vector3.TransformNormal(Vector3.UnitX, l.World).Length(),
+                        MathF.Max(Vector3.TransformNormal(Vector3.UnitY, l.World).Length(),
+                                  Vector3.TransformNormal(Vector3.UnitZ, l.World).Length()));
+                    float radius = Math.Clamp((pose.Max - pose.Min).Length() * 0.5f * scale + 0.08f,
+                        0.18f, 0.55f);
+                    if (LeverRayHitBeforeFloor(rayOrigin, dir, floorDistance, center,
+                            out distance, radius) && distance < bestScore)
+                    { bestScore = distance; best = l; }
+                }
                 continue;
             }
+            if (floorHit is null || posedOnly) continue;
             var lp = l.World.Translation;
             // Primary: click ray passes close to the lever prop itself
             // (covers wall/ceiling mounts like the winch — the nav-mesh hit
@@ -21722,12 +21767,11 @@ void main()
     }
 
     internal static bool LeverRayHitBeforeFloor(Vector3 origin, Vector3 unitDir,
-        float floorDistance, Vector3 lever, out float rayDistance)
+        float floorDistance, Vector3 lever, out float rayDistance, float pickRadius = 0.9f)
     {
         float t = Vector3.Dot(lever - origin, unitDir);
         float radialDistance = Vector3.Distance(origin + unitDir * t, lever);
         rayDistance = 0f;
-        const float pickRadius = 0.9f;
         if (t <= 0f || t >= 120f || radialDistance > pickRadius) return false;
         // Compare the FIRST intersection with the lever's pick volume, not
         // its origin: an oblique click can hit the upper part of a floor
@@ -29304,31 +29348,56 @@ void main()
         // edge from a shallow camera angle).
         Vector3 hit;
         int tri;
+        StaticPropInstance? leverWithoutFloor = null;
         if (!_navMesh.TryRaycast(near, dir, dir.Length(), out tri, out hit))
         {
-            float planeY = _playerFollower.Position.Y;
-            if (MathF.Abs(dir.Y) < 1e-4f) return;
-            float t = (planeY - near.Y) / dir.Y;
-            if (t < 0f) return;
-            hit = near + dir * t;
-            if (TryClickPickupAt(hit)) return;
-            if (!_navMesh.TryFindTriangle(hit, out tri)) return;
+            leverWithoutFloor = PickLeverOnRay(near, dir, null);
+            if (leverWithoutFloor is not null && TryLeverApproachPoint(leverWithoutFloor, out hit, out tri))
+            {
+                // A visible wall button is an interaction even if the cursor
+                // ray passes beyond every walkable triangle.
+            }
+            else
+            {
+                leverWithoutFloor = null;
+                float planeY = _playerFollower.Position.Y;
+                if (MathF.Abs(dir.Y) < 1e-4f) return;
+                float t = (planeY - near.Y) / dir.Y;
+                if (t < 0f) return;
+                hit = near + dir * t;
+                if (TryClickPickupAt(hit)) return;
+                if (!_navMesh.TryFindTriangle(hit, out tri)) return;
+            }
         }
         else
         {
-            // Phase 21-SC-SCROLL-CLICKLOOT — DS1 has no walk-over auto-pickup;
-            // items must be clicked to be looted. If the click landed near a
-            // settled loot pile (within 1.0u tolerance), pick it up and
-            // suppress click-to-move so the player doesn't ALSO walk past
-            // the now-empty pile spot.
-            if (TryClickPickupAt(hit)) return;
-            // Parity fallback: a pile at a walkable border can sit >1u in XZ
-            // from the nearest ray-mesh hit while the old plane projection
-            // landed right on it — keep those clicks lootable.
-            if (MathF.Abs(dir.Y) >= 1e-4f)
+            // A flush wall button can sit just behind a non-walkable nav
+            // surface. Allow only a small depth overlap around that surface;
+            // blocked foreground ground must still occlude distant controls.
+            if (PlayerCannotStandOn(tri)
+                && PickLeverOnRay(near, dir, hit, 0.55f, posedOnly: true) is { } directLever
+                && TryLeverApproachPoint(directLever, out var stand, out var standTri))
             {
-                float tPlane = (_playerFollower.Position.Y - near.Y) / dir.Y;
-                if (tPlane >= 0f && TryClickPickupAt(near + dir * tPlane)) return;
+                leverWithoutFloor = directLever;
+                hit = stand;
+                tri = standTri;
+            }
+            else
+            {
+                // Phase 21-SC-SCROLL-CLICKLOOT — DS1 has no walk-over auto-pickup;
+                // items must be clicked to be looted. If the click landed near a
+                // settled loot pile (within 1.0u tolerance), pick it up and
+                // suppress click-to-move so the player doesn't ALSO walk past
+                // the now-empty pile spot.
+                if (TryClickPickupAt(hit)) return;
+                // Parity fallback: a pile at a walkable border can sit >1u in XZ
+                // from the nearest ray-mesh hit while the old plane projection
+                // landed right on it — keep those clicks lootable.
+                if (MathF.Abs(dir.Y) >= 1e-4f)
+                {
+                    float tPlane = (_playerFollower.Position.Y - near.Y) / dir.Y;
+                    if (tPlane >= 0f && TryClickPickupAt(near + dir * tPlane)) return;
+                }
             }
         }
         hit = hit with { Y = _navMesh.SampleYOnTriangle(tri, hit) };
@@ -29355,7 +29424,8 @@ void main()
             // SC-ELEVATOR — clicking ON a lever prop (ray hit) queues a
             // walk-up-and-pull; a click that misses every lever clears any
             // pending pull.
-            RequestLeverUseNear(near, dir, hit);
+            if (leverWithoutFloor is not null) _pendingLeverUse = leverWithoutFloor;
+            else RequestLeverUseNear(near, dir, hit);
             // ALPHA-2C — same walk-up pattern for chests.
             RequestChestUseNear(hit);
             // ALPHA-2E — and for locked usables (Star Device).
@@ -33722,28 +33792,39 @@ void main()
         var near = new Vector3(nearH.X / nearH.W, nearH.Y / nearH.W, nearH.Z / nearH.W);
         var far_ = new Vector3(farH.X  / farH.W,  farH.Y  / farH.W,  farH.Z  / farH.W);
         var dir  = far_ - near;
-        if (dir.LengthSquared() < 1e-8f || MathF.Abs(dir.Y) < 1e-4f) return;
-        float planeY = _player.CurrentTransform.Translation.Y;
-        float t = (planeY - near.Y) / dir.Y;
-        if (t < 0f) return;
-        var groundHit = near + dir * t;
+        if (dir.LengthSquared() < 1e-8f) return;
         if (_navMesh is not null)
         {
             if (_navMesh.TryRaycast(near, dir, dir.Length(), out int navTri, out var navHit))
             {
                 if (PickLeverOnRay(near, dir, navHit) is not null)
                 { _cursorState = CursorState.UseLever; return; }
-                if (PlayerCannotStandOn(navTri)) _cursorState = CursorState.NoGo;
+                if (PlayerCannotStandOn(navTri))
+                {
+                    if (PickLeverOnRay(near, dir, navHit, 0.55f, posedOnly: true) is { } control
+                        && TryLeverApproachPoint(control, out _, out _))
+                    { _cursorState = CursorState.UseLever; return; }
+                    _cursorState = CursorState.NoGo;
+                }
             }
-            else if (!_navMesh.TryFindTriangle(groundHit, out int planeTri))
+            else
             {
-                _cursorState = CursorState.NoGo;
-            }
-            else if (PickLeverOnRay(near, dir, groundHit) is not null)
-            { _cursorState = CursorState.UseLever; return; }
-            else if (PlayerCannotStandOn(planeTri))
-            {
-                _cursorState = CursorState.NoGo;
+                if (PickLeverOnRay(near, dir, null) is { } floorlessLever
+                    && TryLeverApproachPoint(floorlessLever, out _, out _))
+                { _cursorState = CursorState.UseLever; return; }
+                if (MathF.Abs(dir.Y) < 1e-4f)
+                { _cursorState = CursorState.NoGo; return; }
+                float planeY = _player.CurrentTransform.Translation.Y;
+                float t = (planeY - near.Y) / dir.Y;
+                if (t < 0f)
+                { _cursorState = CursorState.NoGo; return; }
+                var groundHit = near + dir * t;
+                if (!_navMesh.TryFindTriangle(groundHit, out int planeTri))
+                    _cursorState = CursorState.NoGo;
+                else if (PickLeverOnRay(near, dir, groundHit) is not null)
+                { _cursorState = CursorState.UseLever; return; }
+                else if (PlayerCannotStandOn(planeTri))
+                    _cursorState = CursorState.NoGo;
             }
         }
     }
