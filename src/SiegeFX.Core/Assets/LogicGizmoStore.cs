@@ -49,24 +49,21 @@ public static class LogicGizmoStore
         ("check_quest", LogicGizmoKind.CheckQuest),
     };
 
-    /// <summary>Scan every <c>objects/*.gas</c> file of <paramref name="regionPath"/>
+    /// <summary>Scan every flat or <c>objects/regular/*.gas</c> placement file of
+    /// <paramref name="regionPath"/>
     /// for placements carrying one of the four logic components (instance
     /// section first, template chain as marker fallback — shipped data
     /// authors the CONFIG on the instance). <paramref name="store"/> may be
     /// null; then only instance-authored sections are found.</summary>
     public static IReadOnlyList<LogicGizmoDef> Load(
-        TankReader tank, string regionPath, TemplateStore? store)
+        TankReader tank, string regionPath, TemplateStore? store, bool multiplayerContent = false)
     {
         var defs = new List<LogicGizmoDef>();
         var norm = regionPath.TrimEnd('/');
-        var objPrefix = norm + "/objects/";
-        foreach (var file in tank.ListFiles())
+        foreach (var fileName in RegionObjects.PlacementFileNames(tank, norm))
         {
-            if (!file.StartsWith(objPrefix, StringComparison.OrdinalIgnoreCase)) continue;
-            if (!file.EndsWith(".gas", StringComparison.OrdinalIgnoreCase)) continue;
-            var fileName = file[objPrefix.Length..];
-            if (fileName.Contains('/')) continue;
-            var (placements, _) = RegionObjects.LoadPlacements(tank, norm, fileName);
+            var (placements, _) = RegionObjects.LoadPlacements(
+                tank, norm, fileName, multiplayerContent);
             foreach (var p in placements)
             {
                 foreach (var (section, kind) in Sections)

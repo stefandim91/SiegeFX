@@ -45,7 +45,8 @@ public static class FrontendShotHost
     static int RenderShot(IWindow window, string logicTankPath, string objectsTankPath,
                           string stateName, string outPath, int width, int height, float timeSec)
     {
-        if (!Enum.TryParse<FrontendScene.ScreenState>(stateName, ignoreCase: true, out var state))
+        bool worldSelect = stateName.Equals("WorldSelect", StringComparison.OrdinalIgnoreCase);
+        if (!Enum.TryParse<FrontendScene.ScreenState>(worldSelect ? "SinglePlayer" : stateName, ignoreCase: true, out var state))
         {
             Console.Error.WriteLine($"frontend-shot: unknown state '{stateName}'. Valid states:");
             foreach (var n in Enum.GetNames<FrontendScene.ScreenState>())
@@ -115,6 +116,20 @@ public static class FrontendShotHost
         scene.Draw(width, height);
 
         gl.Disable(EnableCap.ScissorTest);
+
+        if (worldSelect)
+        {
+            using var bars = new BarRenderer(gl);
+            using var text = new TextRenderer(gl);
+            var font = BitmapFont.TryLoadByName(resolver, "b_gui_fnt_12p_copperplate-light")
+                ?? throw new InvalidDataException("World selector font missing.");
+            text.SetFont(font);
+            text.BeginPass();
+            var dialog = new WorldSelectDialog();
+            dialog.Open();
+            dialog.Draw(bars, text, width, height);
+            text.EndPass();
+        }
 
         var pixels = new byte[width * height * 4];
         unsafe

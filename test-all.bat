@@ -811,14 +811,21 @@ goto MENU
 
 :T39
 echo.
-echo --- Phase 19a: SaveFile JSON round-trip (no window) ---
-echo [expect: "[selftest-save] OK - 3 actor(s), player + camera, schema v1 round-tripped at <path>"]
-echo [exits 0 on success, 1 with field-by-field diffs on failure]
+echo --- Save safety, world profiles, offline content and authored launch (no window) ---
+echo [expect: all self-tests pass; real-map checks use the configured DS1 installation]
+echo [each self-test prints PASS, or FAILED with field-by-field diffs]
 echo.
 dotnet "%RUN%" --selftest-save
-set EXITCODE=%ERRORLEVEL%
+if errorlevel 1 (echo *** SAVE SELFTEST FAILED ***) else (echo save: PASS)
+dotnet "%RUN%" --selftest-save-transaction
+if errorlevel 1 (echo *** SAVE-TRANSACTION SELFTEST FAILED ***) else (echo save-transaction: PASS)
+dotnet "%RUN%" --selftest-world-profile
+if errorlevel 1 (echo *** WORLD-PROFILE SELFTEST FAILED ***) else (echo world-profile: PASS)
+dotnet "%RUN%" --selftest-offline-content "%DS1%"
+if errorlevel 1 (echo *** OFFLINE-CONTENT SELFTEST FAILED ***) else (echo offline-content: PASS)
+dotnet "%RUN%" --selftest-world-launch "%DS1%"
+if errorlevel 1 (echo *** WORLD-LAUNCH SELFTEST FAILED ***) else (echo world-launch: PASS)
 echo.
-echo === SiegeFX exited with code %EXITCODE% ===
 pause
 goto MENU
 

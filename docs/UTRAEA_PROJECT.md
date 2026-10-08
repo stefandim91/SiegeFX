@@ -1340,6 +1340,12 @@ The preferred philosophy is:
 
 Make Utraea a first-class offline world that can launch, save, reload, and execute multiplayer-authored content without requiring a network session.
 
+Implementation status: the offline frontend, authored start, world-aware saves,
+and content-rule separation are integrated. Gameplay acceptance remains pending;
+see the [short status checklist](MILESTONE_1_STATUS.md) and
+[audited plan and validation record](MILESTONE_1_PLAN.md) for evidence and
+remaining playtests.
+
 ## Required work
 
 1. Build current upstream SiegeFX successfully.

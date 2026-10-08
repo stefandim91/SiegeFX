@@ -603,14 +603,21 @@ T36() {
 }
 T39() {
     echo
-    printf '%s\n' "--- Phase 19a: SaveFile JSON round-trip (no window) ---"
-    printf '%s\n' "[expect: \"[selftest-save] OK - 3 actor(s), player + camera, schema v1 round-tripped at <path>\"]"
-    printf '%s\n' "[exits 0 on success, 1 with field-by-field diffs on failure]"
+    printf '%s\n' "--- Save safety, world profiles, offline content and authored launch (no window) ---"
+    printf '%s\n' "[expect: all self-tests pass; real-map checks use the configured DS1 installation]"
+    printf '%s\n' "[each self-test prints PASS, or FAILED with field-by-field diffs]"
     echo
     "$RUN" --selftest-save; ERRORLEVEL=$?
-    export EXITCODE="${ERRORLEVEL}"
+    if [ "$ERRORLEVEL" -ge 1 ]; then printf '%s\n' "*** SAVE SELFTEST FAILED ***"; else printf '%s\n' "save: PASS"; fi
+    "$RUN" --selftest-save-transaction; ERRORLEVEL=$?
+    if [ "$ERRORLEVEL" -ge 1 ]; then printf '%s\n' "*** SAVE-TRANSACTION SELFTEST FAILED ***"; else printf '%s\n' "save-transaction: PASS"; fi
+    "$RUN" --selftest-world-profile; ERRORLEVEL=$?
+    if [ "$ERRORLEVEL" -ge 1 ]; then printf '%s\n' "*** WORLD-PROFILE SELFTEST FAILED ***"; else printf '%s\n' "world-profile: PASS"; fi
+    "$RUN" --selftest-offline-content "${DS1}"; ERRORLEVEL=$?
+    if [ "$ERRORLEVEL" -ge 1 ]; then printf '%s\n' "*** OFFLINE-CONTENT SELFTEST FAILED ***"; else printf '%s\n' "offline-content: PASS"; fi
+    "$RUN" --selftest-world-launch "${DS1}"; ERRORLEVEL=$?
+    if [ "$ERRORLEVEL" -ge 1 ]; then printf '%s\n' "*** WORLD-LAUNCH SELFTEST FAILED ***"; else printf '%s\n' "world-launch: PASS"; fi
     echo
-    printf '%s\n' "=== SiegeFX exited with code ${EXITCODE} ==="
     pause
 }
 T40() {

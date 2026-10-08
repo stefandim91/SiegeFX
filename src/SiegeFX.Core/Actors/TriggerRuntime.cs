@@ -16,9 +16,14 @@ namespace SiegeFX.Core.Actors;
 /// renderer from needing to know about trigger semantics.</summary>
 public sealed class TriggerRuntime
 {
-    /// <summary>TRUE while an MP session is live — gates authored
-    /// single_player=false rows (MP-only duplicates skip in SP).</summary>
+    /// <summary>TRUE while an MP session is live. Networked sessions retain
+    /// their historical access to multiplayer-authored trigger rows.</summary>
     public bool IsMultiplayerSession { get; set; }
+
+    /// <summary>Enables multiplayer-authored trigger rows without requiring a
+    /// network session. Offline Utraea sets this from its world profile while
+    /// the Kingdom of Ehb keeps the default <see langword="false"/>.</summary>
+    public bool EnableMultiplayerAuthoredTriggers { get; set; }
 
     readonly List<TriggerInstance> _instances = new();
     /// <summary>Replay queue for delayed actions. The 20 Hz tick is fast enough that
@@ -288,10 +293,10 @@ public sealed class TriggerRuntime
             var row = matrix.Rows[r];
             ref var state = ref trig.RowStateAt(r);
 
-            // Authored single_player=false rows are MP-only (mood/fade/
-            // quest duplicates for the MP flow); a single-player session
-            // never evaluates them.
-            if (!row.SinglePlayer && !IsMultiplayerSession) continue;
+            // Authored single_player=false rows belong to multiplayer-authored
+            // content. They may run either in a real MP session or in an offline
+            // world profile that explicitly enables those content rules.
+            if (!row.SinglePlayer && !(EnableMultiplayerAuthoredTriggers || IsMultiplayerSession)) continue;
             // single_shot rows latch: once they've fired, they never evaluate again.
             if (state.FiredOnce && row.SingleShot) continue;
             // reset_duration cooldown gate: row stays cold until the cooldown expires.

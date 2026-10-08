@@ -17,7 +17,7 @@ namespace SiegeFX.Runtime.Render;
 /// Phase 3 just draws a reference grid so WASD + mouse-look can be verified;
 /// later phases will hang real scene objects off this.
 /// </summary>
-public sealed class RenderHost : IDisposable
+public sealed partial class RenderHost : IDisposable
 {
     private readonly IWindow _window;
     private readonly string? _meshPath;
@@ -2301,6 +2301,11 @@ public sealed class RenderHost : IDisposable
     /// (and refunds nothing) when the party is full or gold is short.</summary>
     private bool TryRecruit(ActorRenderState npc)
     {
+        if (_activeWorld == WorldProfile.UtraeanPeninsula && _mpNetSession is null)
+        {
+            AddGameMessage("Solo Adventure uses one character.");
+            return false;
+        }
         if (npc.IsPartyMember) return false;
         var hire = ResolveHireable(npc.Actor.Template);
         if (hire is null) return false;
@@ -3365,7 +3370,7 @@ public sealed class RenderHost : IDisposable
         var mapReader = new TankReader(_playMapTank);
         foreach (var rp in regionPaths)
         {
-            var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, "command.gas");
+            var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, "command.gas", multiplayerContent: MultiplayerContent);
             foreach (var p in placements)
             {
                 if (!p.TemplateName.Equals("cmd_inventory_changer", StringComparison.OrdinalIgnoreCase)) continue;
@@ -3486,7 +3491,7 @@ public sealed class RenderHost : IDisposable
         var mapReader = new TankReader(_playMapTank);
         foreach (var rp in regionPaths)
         {
-            var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, "command.gas");
+            var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, "command.gas", multiplayerContent: MultiplayerContent);
             foreach (var p in placements)
             {
                 if (!p.TemplateName.Equals("cmd_puzzle_steam", StringComparison.OrdinalIgnoreCase)) continue;
@@ -3527,7 +3532,7 @@ public sealed class RenderHost : IDisposable
         int added = 0;
         foreach (var rp in regionPaths)
         {
-            var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, "special.gas");
+            var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, "special.gas", multiplayerContent: MultiplayerContent);
             foreach (var p in placements)
             {
                 if (!p.TemplateName.Equals("activate_chapter", StringComparison.OrdinalIgnoreCase)) continue;
@@ -3576,7 +3581,7 @@ public sealed class RenderHost : IDisposable
         int added = 0;
         foreach (var rp in regionPaths)
         {
-            var defs = SiegeFX.Core.Assets.LogicGizmoStore.Load(mapReader, rp, _templateStore);
+            var defs = SiegeFX.Core.Assets.LogicGizmoStore.Load(mapReader, rp, _templateStore, multiplayerContent: MultiplayerContent);
             foreach (var d in defs)
             {
                 if (_logicGizmos.ContainsKey(d.Scid)) continue;
@@ -5581,7 +5586,7 @@ public sealed class RenderHost : IDisposable
     /// boot (CaptureSave still writes, but ApplySave refuses it without a region).</summary>
     private void DoQuickSave()
     {
-        var path = SiegeFX.Core.Save.SaveStore.QuicksavePath();
+        var path = SiegeFX.Core.Save.SaveStore.QuicksavePath(_saveSetId);
         try
         {
             var save = CaptureSave();
@@ -5708,8 +5713,17 @@ public sealed class RenderHost : IDisposable
     /// boot.</summary>
     private void PerformLoad(SiegeFX.Core.Save.SaveStore.SaveSlot slot, bool mainMenuStyle)
     {
+        SiegeFX.Core.Save.SaveFile selectedSave;
+        try { selectedSave = SiegeFX.Core.Save.SaveStore.Load(slot.Path); }
+        catch (Exception ex)
+        {
+            _worldLaunchError = $"Could not load adventure: {ex.Message}";
+            _saveToastText = "Load failed."; _saveToastRemaining = SaveToastDuration;
+            return;
+        }
         bool sameRegion = !mainMenuStyle
-            && IsRegionLive(slot.RegionPath)
+            && HasSaveCoordinateFrame(selectedSave)
+            && selectedSave.SaveSetId == _saveSetId
             && _player is not null;
         if (sameRegion)
         {
@@ -5717,7 +5731,7 @@ public sealed class RenderHost : IDisposable
             if (_cursorScroll is not null) ClearScrollDrag();
             try
             {
-                ApplySave(SiegeFX.Core.Save.SaveStore.Load(slot.Path));
+                ApplySave(selectedSave);
                 ShowLoadedBanner();
             }
             catch (Exception ex)
@@ -5751,29 +5765,29 @@ public sealed class RenderHost : IDisposable
         }
     }
 
-    /// <summary>Write a named save from the Save Game window and raise the
-    /// "Game 'X' saved successfully" banner. Unlike <see cref="DoQuickSave"/>
-    /// (one fixed slot) this mints a timestamped file so many named saves
-    /// coexist in the list.</summary>
-    private void PerformNamedSave(string name)
+    /// <summary>Write a named save from the Save Game window and return the
+    /// message for its OK box — DS1's "Game 'X' saved successfully". Unlike
+    /// <see cref="DoQuickSave"/> (one fixed slot) this mints a timestamped file
+    /// so many named saves coexist in the list. <paramref name="overwritePath"/>
+    /// (a confirmed overwrite of an existing slot) writes that file in place
+    /// instead; SaveStore keeps the replaced generation as its .bak.</summary>
+    private string PerformNamedSave(string name, string? overwritePath = null)
     {
         var label = string.IsNullOrWhiteSpace(name)
             ? DateTime.Now.ToString("MMM d, yyyy") : name.Trim();
-        var path = SiegeFX.Core.Save.SaveStore.NamedSavePath(label, DateTime.Now);
+        var path = overwritePath ?? SiegeFX.Core.Save.SaveStore.NamedSavePath(label, DateTime.Now);
         try
         {
             var save = CaptureSave();
             save.DisplayName = label;
             SiegeFX.Core.Save.SaveStore.Save(path, save);
             Console.WriteLine($"  save: wrote '{label}' ({save.Actors.Count} actors) -> {path}");
-            _saveToastText = $"Game '{label}' saved successfully.";
-            _saveToastRemaining = SaveToastDuration;
+            return $"Game '{label}' saved successfully";
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"  save: failed -- {ex.Message}");
-            _saveToastText = "Save failed.";
-            _saveToastRemaining = SaveToastDuration;
+            return "Save failed.";
         }
     }
 
@@ -5784,9 +5798,15 @@ public sealed class RenderHost : IDisposable
     {
         switch (r)
         {
+            // DS1 reports the result in an OK box over the Save window; OK closes it.
             case SaveGameDialog.Result.Save:
-                PerformNamedSave(_saveDialog.NameText);
-                _saveDialog.Close();
+                _saveDialog.ShowNotice(PerformNamedSave(_saveDialog.NameText));
+                break;
+            case SaveGameDialog.Result.Overwrite:
+                if (_saveDialog.OverwriteTarget is { } target)
+                    _saveDialog.ShowNotice(PerformNamedSave(_saveDialog.NameText, target.Path));
+                else
+                    _saveDialog.Close();
                 break;
             case SaveGameDialog.Result.Delete:
                 if (_saveDialog.Selected is { } slot)
@@ -6082,7 +6102,7 @@ public sealed class RenderHost : IDisposable
     private void DoQuickLoad()
     {
         if (_cursorScroll is not null) ClearScrollDrag();
-        var path = SiegeFX.Core.Save.SaveStore.QuicksavePath();
+        var path = SiegeFX.Core.Save.SaveStore.QuicksavePath(_saveSetId);
         try
         {
             if (!File.Exists(path))
@@ -6095,7 +6115,7 @@ public sealed class RenderHost : IDisposable
             // streamed here (saves stamp the TRUE region now). Route those
             // through the relaunch loader like any cross-region load instead
             // of letting ApplySave's guard silently no-op.
-            if (!IsRegionLive(save.RegionPath))
+            if (!HasSaveCoordinateFrame(save))
             {
                 Console.WriteLine($"  load: quicksave region '{save.RegionPath}' not loaded — relaunching");
                 if (_ds1ResourcesDir is not null)
@@ -9393,6 +9413,7 @@ void main()
         _regionMapTankPath = regionMapTankPath;
         _regionTerrainTankPath = regionTerrainTankPath;
         _regionPath = regionPath;
+        InitializeWorldIdentity(regionPath);
         _worldMapTankPath = worldMapTankPath;
         _worldTerrainTankPath = worldTerrainTankPath;
         _worldRootHint = worldRootHint;
@@ -9620,6 +9641,11 @@ void main()
             };
             kb.KeyDown += (_, key, _) =>
             {
+                if (_worldSelect.IsOpen)
+                {
+                    if (key == Key.Escape) _worldSelect.Close();
+                    return;
+                }
                 // Backspace is not a printable char, so KeyChar gets the
                 // platform-specific ASCII 0x08 on Windows but not on all
                 // backends — route it through KeyDown explicitly so creator
@@ -9641,13 +9667,16 @@ void main()
                 // typing a save name can't fire one.
                 if (_saveDialog.IsOpen)
                 {
-                    if (key == Key.Backspace) { _saveDialog.OnChar('\b'); return; }
-                    if (key == Key.Enter || key == Key.KeypadEnter)
+                    bool enter = key == Key.Enter || key == Key.KeypadEnter;
+                    // The overwrite Yes/No or save-result OK box answers Enter/Esc first.
+                    if (_saveDialog.BoxOpen)
                     {
-                        PerformNamedSave(_saveDialog.NameText);
-                        _saveDialog.Close();
+                        if (enter) HandleSaveDialogResult(_saveDialog.AnswerBox(true));
+                        else if (key == Key.Escape) HandleSaveDialogResult(_saveDialog.AnswerBox(false));
                         return;
                     }
+                    if (key == Key.Backspace) { _saveDialog.OnChar('\b'); return; }
+                    if (enter) { HandleSaveDialogResult(_saveDialog.RequestSave()); return; }
                     if (key == Key.Escape) { _saveDialog.Close(); return; }
                     return;
                 }
@@ -10447,6 +10476,13 @@ void main()
         {
             mouse.MouseDown += (m, btn) =>
             {
+                if (_worldSelect.IsOpen)
+                {
+                    var sz = _window.FramebufferSize;
+                    if (btn == MouseButton.Left)
+                        _worldSelect.OnMouseDown((int)m.Position.X, (int)m.Position.Y, sz.X, sz.Y);
+                    return;
+                }
                 // Phase 21d-2a-viii-b — character creator owns the screen until
                 // Begin/Cancel; LMB lands on its buttons and never falls through
                 // to click-to-move. RMB swallowed too so a stray right-click
@@ -11590,6 +11626,13 @@ void main()
             };
             mouse.MouseUp += (m, btn) =>
             {
+                if (_worldSelect.IsOpen)
+                {
+                    var sz = _window.FramebufferSize;
+                    if (btn == MouseButton.Left)
+                        HandleWorldSelection(_worldSelect.OnMouseUp((int)m.Position.X, (int)m.Position.Y, sz.X, sz.Y));
+                    return;
+                }
                 // SC-HUD-DRAG — releasing the button locks the dragged HUD
                 // piece where it sits (with magnetic edge/home snapping) and
                 // persists the spot immediately.
@@ -12084,6 +12127,13 @@ void main()
             };
             mouse.MouseMove += (_, pos) =>
             {
+                if (_worldSelect.IsOpen)
+                {
+                    _currentMousePos = pos;
+                    var sz = _window.FramebufferSize;
+                    _worldSelect.OnMouseMove((int)pos.X, (int)pos.Y, sz.X, sz.Y);
+                    return;
+                }
                 // Phase 21-SC-SCROLL-PRE — track the latest mouse position for
                 // any UI that needs cursor-anchored rendering (the spell-scroll
                 // drag follows the cursor across panels). _lastMousePos below
@@ -13584,7 +13634,7 @@ void main()
             }
         }
         catch { /* no map-local quests — the shipped catalog stands */ }
-        var (instances, instDiags) = SiegeFX.Core.Assets.RegionObjects.LoadActors(mapReader, regionPath);
+        var (instances, instDiags) = SiegeFX.Core.Assets.RegionObjects.LoadActors(mapReader, regionPath, multiplayerContent: MultiplayerContent);
 
         // Phase 21a-2 — when LoadNeighborTerrain stashed a world layout +
         // per-region graphs, swap _regionLayout for a unified world-space
@@ -13610,7 +13660,7 @@ void main()
                 if (path == regionPath) continue;
                 try
                 {
-                    var (more, moreDiags) = SiegeFX.Core.Assets.RegionObjects.LoadActors(mapReader, path);
+                    var (more, moreDiags) = SiegeFX.Core.Assets.RegionObjects.LoadActors(mapReader, path, multiplayerContent: MultiplayerContent);
                     allInstances.AddRange(more);
                     neighborInstanceCount += more.Count;
                 }
@@ -13654,6 +13704,7 @@ void main()
         _actorRuntime = spawner.Runtime;
         _actorBus     = spawner.MessageBus;
         _triggerRuntime = spawner.TriggerRuntime;
+        _triggerRuntime.EnableMultiplayerAuthoredTriggers = MultiplayerContent;
         // SC-PCGEN — the authored jewelry generation tables (pcontent.gas
         // [modifiers] + the pcontent.skrit roll math). #ring/#amulet specs
         // roll REAL generated jewelry; pcgen_ names re-materialize on
@@ -13697,7 +13748,7 @@ void main()
         foreach (var rp in triggerRegions)
         {
             var (placements, diags) =
-                SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, "special.gas");
+                SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, "special.gas", multiplayerContent: MultiplayerContent);
             foreach (var d in diags) Console.WriteLine("  " + d);
             // SC-FADE-NODES-LNODE region-scope diag: confirm which regions
             // actually contributed special.gas triggers. If hc_r1 returns 0,
@@ -13878,7 +13929,7 @@ void main()
         foreach (var rp in triggerRegions)
         {
             var (placements, diags) =
-                SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, "emitter.gas");
+                SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, "emitter.gas", multiplayerContent: MultiplayerContent);
             foreach (var d in diags) Console.WriteLine("  " + d);
             emitterPlacementCount += placements.Count;
             spawner.SpawnTriggers(placements);
@@ -14757,7 +14808,7 @@ void main()
         {
             try
             {
-                var (more, _) = SiegeFX.Core.Assets.RegionObjects.LoadActors(mapReader, rp);
+                var (more, _) = SiegeFX.Core.Assets.RegionObjects.LoadActors(mapReader, rp, multiplayerContent: MultiplayerContent);
                 newInstances.AddRange(more);
             }
             catch (Exception ex)
@@ -15471,7 +15522,7 @@ void main()
             foreach (var fileName in SiegeFX.Core.Assets.RegionObjects.StaticPropFiles)
             {
                 var (placements, diags) =
-                    SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, fileName);
+                    SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, fileName, multiplayerContent: MultiplayerContent);
                 foreach (var d in diags) Console.WriteLine("  " + d);
 
                 foreach (var p in placements)
@@ -16001,7 +16052,7 @@ void main()
         {
             if (!_inventoryGasLoaded.Add(rp)) { skippedAlready++; continue; }
             var (placements, diags) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(
-                mapReader, rp, SiegeFX.Core.Assets.RegionObjects.WorldInventoryFile);
+                mapReader, rp, SiegeFX.Core.Assets.RegionObjects.WorldInventoryFile, multiplayerContent: MultiplayerContent);
             foreach (var d in diags) Console.WriteLine("  " + d);
 
             foreach (var p in placements)
@@ -16120,7 +16171,7 @@ void main()
         {
             if (!_generatorGasLoaded.Add(rp)) continue;
             var (placements, diags) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(
-                mapReader, rp, "generator.gas");
+                mapReader, rp, "generator.gas", multiplayerContent: MultiplayerContent);
             foreach (var d in diags) Console.WriteLine("  " + d);
 
             foreach (var p in placements)
@@ -17417,7 +17468,7 @@ void main()
         {
             if (!_commandGasLoaded.Add(rp)) continue;
             var (placements, diags) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(
-                mapReader, rp, "command.gas");
+                mapReader, rp, "command.gas", multiplayerContent: MultiplayerContent);
             foreach (var d in diags) Console.WriteLine("  " + d);
             foreach (var p in placements)
             {
@@ -17707,7 +17758,7 @@ void main()
         _lastAutoSaveAt = _playSeconds;
         try
         {
-            var path = Path.Combine(SiegeFX.Core.Save.SaveStore.DefaultSaveDirectory(), "autosave.save");
+            var path = SiegeFX.Core.Save.SaveStore.AutoSavePath(_saveSetId);
             var save = CaptureSave();
             // Dated label so the Load window's rolling autosave slot reads as
             // a checkpoint ("Autosave — Jul 11, 6:22 PM"), not a bare name.
@@ -20167,10 +20218,10 @@ void main()
         var swDefs = new List<SiegeFX.Core.Assets.StairwellDef>();
         foreach (var rp in regionPaths)
         {
-            var (d, diags) = SiegeFX.Core.Assets.ElevatorStore.Load(mapReader, rp);
+            var (d, diags) = SiegeFX.Core.Assets.ElevatorStore.Load(mapReader, rp, multiplayerContent: MultiplayerContent);
             foreach (var dg in diags) Console.WriteLine("  " + dg);
             defs.AddRange(d);
-            var (sd, sdiags) = SiegeFX.Core.Assets.ElevatorStore.LoadStairwells(mapReader, rp);
+            var (sd, sdiags) = SiegeFX.Core.Assets.ElevatorStore.LoadStairwells(mapReader, rp, multiplayerContent: MultiplayerContent);
             foreach (var dg in sdiags) Console.WriteLine("  " + dg);
             swDefs.AddRange(sd);
         }
@@ -21949,14 +22000,9 @@ void main()
         int added = 0;
         foreach (var rp in regionPaths)
         {
-            var objPrefix = rp.TrimEnd('/') + "/objects/";
-            foreach (var file in mapReader.ListFiles())
+            foreach (var fileName in RegionObjects.PlacementFileNames(mapReader, rp))
             {
-                if (!file.StartsWith(objPrefix, StringComparison.OrdinalIgnoreCase) ||
-                    !file.EndsWith(".gas", StringComparison.OrdinalIgnoreCase)) continue;
-                var fileName = file[objPrefix.Length..];
-                if (fileName.Contains('/')) continue;
-                var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp.TrimEnd('/'), fileName);
+                var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp.TrimEnd('/'), fileName, multiplayerContent: MultiplayerContent);
                 foreach (var p in placements)
                 {
                     if (_shrinesByScid.ContainsKey(p.Scid)) continue;
@@ -21999,14 +22045,9 @@ void main()
         int added = 0;
         foreach (var rp in regionPaths)
         {
-            var objPrefix = rp.TrimEnd('/') + "/objects/";
-            foreach (var file in mapReader.ListFiles())
+            foreach (var fileName in RegionObjects.PlacementFileNames(mapReader, rp))
             {
-                if (!file.StartsWith(objPrefix, StringComparison.OrdinalIgnoreCase) ||
-                    !file.EndsWith(".gas", StringComparison.OrdinalIgnoreCase)) continue;
-                var fileName = file[objPrefix.Length..];
-                if (fileName.Contains('/')) continue;
-                var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp.TrimEnd('/'), fileName);
+                var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp.TrimEnd('/'), fileName, multiplayerContent: MultiplayerContent);
                 foreach (var p in placements)
                 {
                     if (!_templateStore.TryGet(p.TemplateName, out var tpl)) continue;
@@ -22216,14 +22257,9 @@ void main()
         int added = 0;
         foreach (var rp in regionPaths)
         {
-            var objPrefix = rp.TrimEnd('/') + "/objects/";
-            foreach (var file in mapReader.ListFiles())
+            foreach (var fileName in RegionObjects.PlacementFileNames(mapReader, rp))
             {
-                if (!file.StartsWith(objPrefix, StringComparison.OrdinalIgnoreCase) ||
-                    !file.EndsWith(".gas", StringComparison.OrdinalIgnoreCase)) continue;
-                var fileName = file[objPrefix.Length..];
-                if (fileName.Contains('/')) continue;
-                var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp.TrimEnd('/'), fileName);
+                var (placements, _) = SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp.TrimEnd('/'), fileName, multiplayerContent: MultiplayerContent);
                 foreach (var p in placements)
                 {
                     if (!_templateStore.TryGet(p.TemplateName, out var tpl)) continue;
@@ -24986,10 +25022,10 @@ void main()
         // suppressed so a fast click doesn't fire on a half-flown panel.
         _spMenu.IsActive = state == Hud.FrontendScene.ScreenState.SinglePlayer
                            && !_aboutOpen && !_optionsMenu.IsOpen && !_creator.IsOpen
-                           && !_loadDialog.IsOpen;
+                           && !_loadDialog.IsOpen && !_worldSelect.IsOpen;
         if (state != Hud.FrontendScene.ScreenState.SinglePlayer) return;
         // The frontend Load window owns input while open; drain nothing else.
-        if (_loadDialog.IsOpen) return;
+        if (_loadDialog.IsOpen || _worldSelect.IsOpen) return;
         var act = _spMenu.ConsumeAction();
         if (act != SinglePlayerMenuPanel.Action.None) _audio?.Play(SfxFrontendBigButton);
         switch (act)
@@ -25004,11 +25040,8 @@ void main()
                 _spMenu.ClearHover();
                 break;
             case SinglePlayerMenuPanel.Action.NewGame:
-                // Phase 28-CD-FLYOUT — SP → Character Creator transition.
-                // mainmenu_sng2cd / menubars_lm2cd / backbutton_b2pn /
-                // heromenu_begin run together; auto-advances to
-                // CharacterSelect at SpToCdDur.
-                _frontendScene.SetState(Hud.FrontendScene.ScreenState.SinglePlayerToCd);
+                _worldLaunchError = null;
+                _worldSelect.Open();
                 _spMenu.IsActive = false;
                 _spMenu.ClearHover();
                 break;
@@ -25435,11 +25468,13 @@ void main()
         {
             string installRoot = System.IO.Path.GetDirectoryName(ds1ResourcesDir.TrimEnd('\\', '/'))
                                  ?? ds1ResourcesDir;
-            string mapTank   = System.IO.Path.Combine(installRoot, "Maps", "World.dsmap");
+            var profile = mp is null ? _selectedWorld : WorldProfile.KingdomOfEhb;
+            var launch = WorldLaunchPlan.ForNewGame(System.IO.Path.Combine(installRoot, "Maps"), profile);
+            string mapTank   = launch.MapTankPath;
             string terrain   = System.IO.Path.Combine(ds1ResourcesDir, "Terrain.dsres");
             string logic     = System.IO.Path.Combine(ds1ResourcesDir, "Logic.dsres");
             string objects   = System.IO.Path.Combine(ds1ResourcesDir, "Objects.dsres");
-            const string regionPath = "/world/maps/map_world/regions/fh_r1";
+            string regionPath = launch.RegionPath;
 
             // Resolve the right command. Two cases:
             //   (1) Self-contained published exe: ProcessPath is our
@@ -25481,6 +25516,8 @@ void main()
             psi.ArgumentList.Add(objects);
             psi.ArgumentList.Add(regionPath);
 
+            SetOfflineLaunchIdentity(psi, profile, Guid.NewGuid().ToString("N"));
+            if (_diagMode) psi.ArgumentList.Add("--diag");
             // Forward picker via env vars. HeroVariantPicker.FromEnv
             // reads these on the new process boot.
             psi.Environment["SIEGEFX_HERO_GENDER"] = _creator.Picker.Gender == HeroGender.Girl ? "girl" : "boy";
@@ -25532,6 +25569,7 @@ void main()
         catch (Exception ex)
         {
             Console.Error.WriteLine($"SC-DIFF-LAUNCH failed: {ex.Message}");
+            _worldLaunchError = $"Could not start {_selectedWorld.DisplayName}: {ex.Message}";
         }
     }
 
@@ -25579,6 +25617,11 @@ void main()
                 return;
             }
 
+            var profile = WorldProfile.Get(save.WorldId);
+            var launch = WorldLaunchPlan.ForSave(Path.GetDirectoryName(Path.GetFullPath(mapTank))!, save);
+            mapTank = launch.MapTankPath;
+            if (!File.Exists(mapTank)) throw new FileNotFoundException("Required world map is missing.", mapTank);
+
             string? exePath = Environment.ProcessPath;
             if (exePath is null)
             {
@@ -25606,6 +25649,8 @@ void main()
             psi.ArgumentList.Add(objects);
             psi.ArgumentList.Add(regionPath);
 
+            SetOfflineLaunchIdentity(psi, profile, save.SaveSetId);
+            if (_diagMode) psi.ArgumentList.Add("--diag");
             // Forward the saved hero appearance so the spawned body matches the
             // save before the state patch lands. Null variant = stock farmboy
             // (leave the envs unset, exactly like a default New Game).
@@ -25650,6 +25695,7 @@ void main()
         catch (Exception ex)
         {
             Console.Error.WriteLine($"SC-MAINMENU-LOADGAME failed: {ex.Message}");
+            _worldLaunchError = $"Could not load adventure: {ex.Message}";
         }
     }
 
@@ -27560,6 +27606,12 @@ void main()
             _loadDialog.Draw(_gl, _barRenderer, _textRenderer, _iconRenderer,
                              TryGetGuiTexture, GetCommonTexture, viewportW, viewportH);
         }
+        if (_worldSelect.IsOpen && _barRenderer is not null && _textRenderer is not null)
+            _worldSelect.Draw(_barRenderer, _textRenderer, viewportW, viewportH);
+        if (_worldLaunchError is not null && _textRenderer is not null)
+            _textRenderer.DrawString(viewportW, viewportH,
+                "Adventure could not load. Check the game files and console log.",
+                20, viewportH - 70, new Vector4(1f, 0.7f, 0.5f, 1f));
         // Phase 27-SP-FLYOUT — sword cursor in the frontend menu, drawn LAST so
         // it sits ON TOP of the Options dialog and Load-game overlay (both of
         // which render above the frontend chrome). Same FrontendWantsSpriteCursor
@@ -41835,9 +41887,14 @@ void main()
 
     internal SiegeFX.Core.Save.SaveFile CaptureSave()
     {
+        var profile = _activeWorld ?? throw new InvalidOperationException("This world has no save profile.");
         var save = new SiegeFX.Core.Save.SaveFile
         {
             SchemaVersion = SiegeFX.Core.Save.SaveFile.CurrentSchemaVersion,
+            WorldId       = profile.Id,
+            SaveSetId     = _saveSetId,
+            AdventureMode = profile == WorldProfile.UtraeanPeninsula ? "SoloAdventure" : "OriginalCampaign",
+            EngineVersion = typeof(RenderHost).Assembly.GetName().Version?.ToString() ?? "unknown",
             SavedAt       = DateTime.UtcNow,
             // SC-SAVE-REGION — the session's coordinate-frame root (see
             // SaveFrameRegion). The player's actual region rides separately
@@ -41852,7 +41909,7 @@ void main()
             // fill the HERO / MAP / ELAPSED TIME info box; Thumbnail is the most
             // recent clean-gameplay screenshot (may be null on a viewer save).
             HeroName        = _heroName,
-            MapName         = FriendlyMapName(DeriveMapName(_regionPath)),
+            MapName         = profile.DisplayName,
             ElapsedSeconds  = _playSeconds,
             Thumbnail       = _sceneThumbnail,
         };
@@ -42265,13 +42322,16 @@ void main()
     // patch that adds NPCs).
     internal void ApplySave(SiegeFX.Core.Save.SaveFile save)
     {
-        if (!IsRegionLive(save.RegionPath))
+        if (save.WorldId != _activeWorld?.Id)
+            throw new InvalidDataException("Save belongs to a different world; relaunch is required.");
+        if (!HasSaveCoordinateFrame(save))
         {
             Console.Error.WriteLine(
                 $"  load: save region '{save.RegionPath}' is not streamed here " +
                 $"(boot '{_regionPath}') — this load needs the relaunch path");
-            return;
+            throw new InvalidDataException("Save region is not loaded; relaunch is required.");
         }
+        _saveSetId = save.SaveSetId;
         // SC-LOAD-DIAG — end-to-end receipts for every load. One block at
         // entry, per-companion outcomes below, a summary at the end; the
         // underground/region machinery logs its own decisions.
