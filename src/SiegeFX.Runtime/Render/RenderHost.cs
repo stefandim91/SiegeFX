@@ -5768,12 +5768,14 @@ public sealed partial class RenderHost : IDisposable
     /// <summary>Write a named save from the Save Game window and raise the
     /// "Game 'X' saved successfully" banner. Unlike <see cref="DoQuickSave"/>
     /// (one fixed slot) this mints a timestamped file so many named saves
-    /// coexist in the list.</summary>
-    private void PerformNamedSave(string name)
+    /// coexist in the list. <paramref name="overwritePath"/> (a confirmed
+    /// overwrite of an existing slot) writes that file in place instead;
+    /// SaveStore keeps the replaced generation as its .bak.</summary>
+    private void PerformNamedSave(string name, string? overwritePath = null)
     {
         var label = string.IsNullOrWhiteSpace(name)
             ? DateTime.Now.ToString("MMM d, yyyy") : name.Trim();
-        var path = SiegeFX.Core.Save.SaveStore.NamedSavePath(label, DateTime.Now);
+        var path = overwritePath ?? SiegeFX.Core.Save.SaveStore.NamedSavePath(label, DateTime.Now);
         try
         {
             var save = CaptureSave();
@@ -5800,6 +5802,11 @@ public sealed partial class RenderHost : IDisposable
         {
             case SaveGameDialog.Result.Save:
                 PerformNamedSave(_saveDialog.NameText);
+                _saveDialog.Close();
+                break;
+            case SaveGameDialog.Result.Overwrite:
+                if (_saveDialog.OverwriteTarget is { } target)
+                    PerformNamedSave(_saveDialog.NameText, target.Path);
                 _saveDialog.Close();
                 break;
             case SaveGameDialog.Result.Delete:
@@ -9661,13 +9668,16 @@ void main()
                 // typing a save name can't fire one.
                 if (_saveDialog.IsOpen)
                 {
-                    if (key == Key.Backspace) { _saveDialog.OnChar('\b'); return; }
-                    if (key == Key.Enter || key == Key.KeypadEnter)
+                    bool enter = key == Key.Enter || key == Key.KeypadEnter;
+                    // The overwrite Yes/No box answers Enter/Esc first.
+                    if (_saveDialog.ConfirmOpen)
                     {
-                        PerformNamedSave(_saveDialog.NameText);
-                        _saveDialog.Close();
+                        if (enter) HandleSaveDialogResult(_saveDialog.AnswerConfirm(true));
+                        else if (key == Key.Escape) _saveDialog.AnswerConfirm(false);
                         return;
                     }
+                    if (key == Key.Backspace) { _saveDialog.OnChar('\b'); return; }
+                    if (enter) { HandleSaveDialogResult(_saveDialog.RequestSave()); return; }
                     if (key == Key.Escape) { _saveDialog.Close(); return; }
                     return;
                 }

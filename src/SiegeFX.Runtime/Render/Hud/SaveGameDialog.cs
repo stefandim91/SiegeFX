@@ -25,7 +25,7 @@ public sealed class SaveGameDialog
 {
     public bool IsOpen { get; private set; }
 
-    public enum Result { None, Save, Delete, Cancel }
+    public enum Result { None, Save, Overwrite, Delete, Cancel }
 
     private const int RefW = 640, RefH = 480;
 
@@ -40,6 +40,14 @@ public sealed class SaveGameDialog
     private static readonly (int x0, int y0, int x1, int y1) RDelete  = (273, 388, 365, 404);
     private static readonly (int x0, int y0, int x1, int y1) RCancel  = (375, 388, 467, 404);
 
+    // Overwrite confirmation — DS1's generic in-game Yes/No box,
+    // /ui/interfaces/backend/backend_dialog/backend_dialog.gas, authored at
+    // 800×600 and converted here to the 640×480 reference (×0.8).
+    private static readonly (int x0, int y0, int x1, int y1) RConfirm     = (168, 184, 472, 296);
+    private static readonly (int x0, int y0, int x1, int y1) RConfirmText = (187, 203, 453, 251);
+    private static readonly (int x0, int y0, int x1, int y1) RConfirmYes  = (240, 267, 312, 280);
+    private static readonly (int x0, int y0, int x1, int y1) RConfirmNo   = (328, 267, 400, 280);
+
     private readonly List<SaveStore.SaveSlot> _saves = new();
     private string _name = "";
     private int _selected = -1;   // index into _saves; -1 = none (Delete disabled)
@@ -50,9 +58,10 @@ public sealed class SaveGameDialog
     // these; Draw writes them. All handlers call Layout first so a resize between
     // a draw and a click can't stale the geometry.
     private (int x, int y, int w, int h) _sPanel, _sList, _sEdit, _sSave, _sDelete, _sCancel;
+    private (int x, int y, int w, int h) _sConfirm, _sConfirmYes, _sConfirmNo;
     private int _rowH, _visibleRows;
 
-    private enum Btn { None, Save, Delete, Cancel }
+    private enum Btn { None, Save, Delete, Cancel, Yes, No }
     private Btn _pressed = Btn.None;
     private Btn _hover = Btn.None;
 
@@ -90,6 +99,36 @@ public sealed class SaveGameDialog
     public SaveStore.SaveSlot? Selected =>
         _selected >= 0 && _selected < _saves.Count ? _saves[_selected] : null;
 
+    /// <summary>The existing save a Save press replaces: the highlighted row,
+    /// as long as the name box still holds its label. Typing a different name
+    /// means a new save.</summary>
+    public SaveStore.SaveSlot? OverwriteTarget =>
+        Selected is { } sel && string.Equals(_name.Trim(), sel.DisplayName.Trim(), StringComparison.Ordinal)
+            ? sel : null;
+
+    /// <summary>True while the "overwrite this save?" Yes/No box is up. It owns
+    /// input until answered.</summary>
+    public bool ConfirmOpen { get; private set; }
+
+    /// <summary>Save button / Enter. A press that would replace an existing
+    /// save raises the confirmation instead of saving.</summary>
+    public Result RequestSave()
+    {
+        if (!IsOpen || ConfirmOpen) return Result.None;
+        if (OverwriteTarget is null) return Result.Save;
+        ConfirmOpen = true;
+        return Result.None;
+    }
+
+    /// <summary>Answer the overwrite confirmation (Yes / Enter, or No / Esc).</summary>
+    public Result AnswerConfirm(bool overwrite)
+    {
+        if (!ConfirmOpen) return Result.None;
+        ConfirmOpen = false;
+        _pressed = Btn.None;
+        return overwrite && OverwriteTarget is not null ? Result.Overwrite : Result.None;
+    }
+
     /// <summary>Open the dialog against the current on-disk save list, with the
     /// name box pre-filled (DS1 defaults it to the day's date).</summary>
     public void Open(IReadOnlyList<SaveStore.SaveSlot> saves, string defaultName)
@@ -102,12 +141,14 @@ public sealed class SaveGameDialog
         _caret = 0f;
         _pressed = Btn.None;
         _hover = Btn.None;
+        ConfirmOpen = false;
         IsOpen = true;
     }
 
     public void Close()
     {
         IsOpen = false;
+        ConfirmOpen = false;
         _pressed = Btn.None;
         _thumbTex?.Dispose();
         _thumbTex = null;
@@ -121,7 +162,7 @@ public sealed class SaveGameDialog
     /// label than a 14-char hero name.</summary>
     public void OnChar(char c)
     {
-        if (!IsOpen) return;
+        if (!IsOpen || ConfirmOpen) return;
         if (c == '\b') { if (_name.Length > 0) _name = _name[..^1]; return; }
         if (c < ' ' || c > '~') return;
         if ("<>:/\\|?*%\"".IndexOf(c) >= 0) return; // filename-hostile + gas-hostile
@@ -148,6 +189,9 @@ public sealed class SaveGameDialog
         _sSave   = Scr(RSave);
         _sDelete = Scr(RDelete);
         _sCancel = Scr(RCancel);
+        _sConfirm    = Scr(RConfirm);
+        _sConfirmYes = Scr(RConfirmYes);
+        _sConfirmNo  = Scr(RConfirmNo);
 
         _rowH = Math.Max(1, (int)MathF.Round(15 * s));
         // Inset the list interior a hair so rows don't kiss the frame.
@@ -171,7 +215,7 @@ public sealed class SaveGameDialog
         if (!IsOpen) return false;
         Layout(vw, vh);
         _pressed = HitButton(px, py);
-        if (_pressed == Btn.None) TrySelectRow(px, py);
+        if (_pressed == Btn.None && !ConfirmOpen) TrySelectRow(px, py);
         return true;
     }
 
@@ -187,9 +231,11 @@ public sealed class SaveGameDialog
         if (up == Btn.None || up != was) return Result.None;
         return up switch
         {
-            Btn.Save   => Result.Save,
+            Btn.Save   => RequestSave(),
             Btn.Delete => Selected is null ? Result.None : Result.Delete,
             Btn.Cancel => Result.Cancel,
+            Btn.Yes    => AnswerConfirm(true),
+            Btn.No     => AnswerConfirm(false),
             _          => Result.None,
         };
     }
@@ -197,13 +243,19 @@ public sealed class SaveGameDialog
     /// <summary>Mouse wheel over the list scrolls it. dir>0 = wheel up.</summary>
     public void OnScroll(float dir)
     {
-        if (!IsOpen) return;
+        if (!IsOpen || ConfirmOpen) return;
         int maxScroll = Math.Max(0, _saves.Count - _visibleRows);
         _scrollRow = Math.Clamp(_scrollRow - Math.Sign(dir), 0, maxScroll);
     }
 
     private Btn HitButton(int px, int py)
     {
+        if (ConfirmOpen)
+        {
+            if (In(px, py, _sConfirmYes)) return Btn.Yes;
+            if (In(px, py, _sConfirmNo))  return Btn.No;
+            return Btn.None;
+        }
         if (In(px, py, _sSave))   return Btn.Save;
         if (In(px, py, _sDelete)) return Btn.Delete;
         if (In(px, py, _sCancel)) return Btn.Cancel;
@@ -220,8 +272,9 @@ public sealed class SaveGameDialog
         if (row >= 0 && row < _saves.Count)
         {
             _selected = row;
-            // Clicking a save copies its label into the name box, matching DS1
-            // (overwrite-in-place; the timestamp is re-appended on save).
+            // Clicking a save copies its label into the name box, matching DS1.
+            // Saving with that label unchanged overwrites this file in place
+            // (after confirmation); see OverwriteTarget.
             _name = _saves[row].DisplayName;
         }
     }
@@ -364,6 +417,52 @@ public sealed class SaveGameDialog
         DrawButton(bars, text, icons, guiTex, vw, vh, _sSave,   "Save",   Btn.Save,   true,  fs);
         DrawButton(bars, text, icons, guiTex, vw, vh, _sDelete, "Delete", Btn.Delete, Selected is not null, fs);
         DrawButton(bars, text, icons, guiTex, vw, vh, _sCancel, "Cancel", Btn.Cancel, true,  fs);
+
+        if (ConfirmOpen) DrawConfirm(bars, text, icons, guiTex, vw, vh, Frame, parch, fs);
+    }
+
+    private void DrawConfirm(BarRenderer bars, TextRenderer text, IconRenderer? icons,
+                             Func<string, GlTexture?>? guiTex, int vw, int vh,
+                             Action<(int x, int y, int w, int h)> frame, Vector4 ink, int fs)
+    {
+        // Same dark backing + cpbox treatment as the Save window, drawn over it.
+        bars.DrawRect(vw, vh, _sConfirm.x, _sConfirm.y, _sConfirm.w, _sConfirm.h,
+                      new Vector4(0.03f, 0.03f, 0.04f, 0.85f));
+        frame(_sConfirm);
+
+        var box = Scr(RConfirmText, vw, vh);
+        string name = OverwriteTarget?.DisplayName ?? _name;
+        var lines = Wrap(text, $"A saved game named \"{name}\" already exists. Do you want to overwrite it?",
+                         box.w, fs);
+        int lh = text.LineHeight * fs;
+        int y = box.y + Math.Max(0, (box.h - lines.Count * lh) / 2);
+        foreach (var line in lines)
+        {
+            int w = text.MeasureWidth(line, fs);
+            text.DrawString(vw, vh, line, box.x + (box.w - w) / 2, y, ink, fs);
+            y += lh;
+        }
+
+        DrawButton(bars, text, icons, guiTex, vw, vh, _sConfirmYes, "Yes", Btn.Yes, true, fs);
+        DrawButton(bars, text, icons, guiTex, vw, vh, _sConfirmNo,  "No",  Btn.No,  true, fs);
+    }
+
+    private static List<string> Wrap(TextRenderer text, string s, int maxW, int fs)
+    {
+        var lines = new List<string>();
+        var line = "";
+        foreach (var word in s.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var next = line.Length == 0 ? word : line + " " + word;
+            if (line.Length > 0 && text.MeasureWidth(next, fs) > maxW)
+            {
+                lines.Add(line);
+                line = Truncate(text, word, maxW, fs);
+            }
+            else line = text.MeasureWidth(next, fs) > maxW ? Truncate(text, next, maxW, fs) : next;
+        }
+        if (line.Length > 0) lines.Add(line);
+        return lines;
     }
 
     private void DrawButton(BarRenderer bars, TextRenderer text, IconRenderer? icons,
