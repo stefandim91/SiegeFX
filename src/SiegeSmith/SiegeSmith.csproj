@@ -1,12 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!-- SiegeSmith — the Dungeon Siege modding studio, built on SiegeFX.Core.
-       On .NET 11 (preview 5). The SiegeFX engine projects (Core/Runtime/Tools/
-       Audio) are still net8 and referenced cross-target; migrating the engine to
-       net11 as well is tracked as the ".NET 11 migration" task. -->
+       WPF, so Windows only for now; on .NET 10 like the engine. -->
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net11.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
@@ -17,7 +15,7 @@
     <!-- Early alpha: feature-complete per plan but not yet field-tested by
          the public. Without this property the assembly defaulted to 1.0.0,
          which the About dialog dutifully over-promised. -->
-    <Version>0.4.0</Version>
+    <Version>0.5.0</Version>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
   </PropertyGroup>
 
@@ -43,19 +41,22 @@
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
   </PropertyGroup>
 
-  <!-- .NET 11 preview SDK bug: a self-contained publish omits ijwhost.dll, the
-       mixed-mode "IJW" host shim that WPF's DirectWriteForwarder.dll imports.
-       Without it a self-contained SiegeSmith crashes at startup with a
-       DirectWriteForwarder FileNotFoundException ("module could not be
-       found"). The framework-dependent dev build works because ijwhost.dll
-       lives in the shared WindowsDesktop runtime. Add it to the publish set
-       (so it also rides inside the single-file bundle and extracts alongside
-       DirectWriteForwarder) straight from the host pack. -->
+  <!-- The SDK (the .NET 11 previews, and still 10.0.112) leaves ijwhost.dll
+       out of a self-contained publish: the mixed-mode "IJW" host shim that
+       WPF's DirectWriteForwarder.dll imports. Without it a self-contained
+       SiegeSmith crashes at startup with a DirectWriteForwarder
+       FileNotFoundException ("module could not be found"). The
+       framework-dependent dev build works because ijwhost.dll lives in the
+       shared WindowsDesktop runtime. Add it to the publish set (so it also
+       rides inside the single-file bundle and extracts alongside
+       DirectWriteForwarder) from the app host pack the SDK resolved: the
+       SDK's packs folder on Windows, the NuGet cache when another OS
+       publishes for Windows. -->
   <Target Name="IncludeIjwHostForSelfContained"
           BeforeTargets="ComputeResolvedFilesToPublishList;_ComputeFilesToBundle"
           Condition=" '$(RuntimeIdentifier)' != '' and '$(SelfContained)' == 'true' ">
     <PropertyGroup>
-      <_IjwHostPath>$(NetCoreRoot)packs\Microsoft.NETCore.App.Host.$(RuntimeIdentifier)\$(BundledNETCoreAppPackageVersion)\runtimes\$(RuntimeIdentifier)\native\ijwhost.dll</_IjwHostPath>
+      <_IjwHostPath>$([System.IO.Path]::Combine($([System.IO.Path]::GetDirectoryName('$(AppHostSourcePath)')), 'ijwhost.dll'))</_IjwHostPath>
     </PropertyGroup>
     <Error Condition=" !Exists('$(_IjwHostPath)') "
            Text="ijwhost.dll not found at $(_IjwHostPath) — a self-contained WPF publish will crash. Check the host pack version." />

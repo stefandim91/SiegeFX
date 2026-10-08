@@ -6,6 +6,10 @@ using SiegeFX.Core.Nav;
 using SiegeFX.Core.Skrit;
 using SiegeFX.Core.Tank;
 
+// Bundled OpenAL Soft stays findable on a distribution-built .NET
+// (see NativeLibraryFallback) for the audio commands.
+SiegeFX.Audio.NativeLibraryFallback.Install();
+
 if (args.Length == 0)
 {
     PrintUsage();
@@ -44,6 +48,7 @@ try
         "tsd"       => DispatchTsd(args[1..]),
         "quests"    => DispatchQuests(args[1..]),
         "weapons"   => DispatchWeapons(args[1..]),
+        "parity"    => ParityLedger.Dispatch(args[1..]),
         _      => UnknownCommand(args[0]),
     };
 }
@@ -78,6 +83,7 @@ static void PrintUsage()
     Console.WriteLine("SiegeFX CLI");
     Console.WriteLine();
     Console.WriteLine("Usage:");
+    Console.WriteLine("  siegefx parity ledger <install> [--engine=DIR] [--out=DIR] [--baseline=FILE] [--write-baseline=FILE]");
     Console.WriteLine("  siegefx tank info    <tank>");
     Console.WriteLine("  siegefx tank list    <tank> [--prefix=PATH] [--ext=.EXT]");
     Console.WriteLine("  siegefx tank extract <tank> <resource-path> [dest-file]");
@@ -1049,22 +1055,19 @@ static int CmdRegionCmdAudit(string[] a)
     var mapReader = new TankReader(mapTank);
     string filter = a.Length >= 2 ? a[1].Trim() : "all";
 
-    // Verbs the runtime actually dispatches (RenderHost.ActivateAiCommand /
-    // BuildCommandRoute / the NIS engine). Everything else logs "recognized but
-    // not yet implemented" and is effectively inert.
-    var handled = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    // Which templates the engine acts on, and by which path, comes from the
+    // command catalog the engine itself consults (SiegeFX.Core.Parity), so a
+    // template reported as not implemented is one the engine leaves inert.
+    static string PathsOf(SiegeFX.Core.Parity.CommandHandling h)
     {
-        "cmd_ai_c_move", "cmd_ai_c_move_orient", "cmd_ai_t_move", "cmd_ai_t_move_orient",
-        "cmd_enter_nis", "cmd_camera_command", "cmd_camera_waypoint", "cmd_leave_nis",
-    };
-    // "route" verbs aren't message-dispatched, but their positions ARE consumed by
-    // BuildCommandRoute -> AssignPatrolRoutes: an actor whose [mind] initial_command
-    // points at one of these walks the chain as a patrol. So the 105 scripted
-    // patrollers DO move; the verb-specific nuance (orient/face-on-arrival) is lost.
-    var routeVerbs = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-    {
-        "cmd_ai_c_patrol", "cmd_ai_c_patrol_orient",
-    };
+        if (h == SiegeFX.Core.Parity.CommandHandling.None) return "STUB";
+        var parts = new List<string>();
+        if (h.HasFlag(SiegeFX.Core.Parity.CommandHandling.Activate))    parts.Add("activate");
+        if (h.HasFlag(SiegeFX.Core.Parity.CommandHandling.Nis))         parts.Add("nis");
+        if (h.HasFlag(SiegeFX.Core.Parity.CommandHandling.RegionLoad))  parts.Add("load");
+        if (h.HasFlag(SiegeFX.Core.Parity.CommandHandling.PatrolRoute)) parts.Add("route");
+        return string.Join('+', parts);
+    }
 
     var regionPaths = new List<string>();
     {
@@ -1123,16 +1126,17 @@ static int CmdRegionCmdAudit(string[] a)
     Console.WriteLine($"  {totalCmds} command placement(s), {verbCount.Count} distinct verb(s)");
     Console.WriteLine($"  {actorsWithInitial} actor(s) reference a scripted route via [mind] initial_command");
     Console.WriteLine();
-    Console.WriteLine($"  {"count",5} {"status",-8} verb (regions)");
+    Console.WriteLine($"  {"count",5} {"path",-14} verb (regions) — what the engine does");
     int stubbed = 0, stubPlacements = 0;
     foreach (var kv in verbCount.OrderByDescending(k => k.Value))
     {
-        string status = handled.Contains(kv.Key) ? "handled"
-                      : routeVerbs.Contains(kv.Key) ? "route"
-                      : "STUB";
-        if (status == "STUB") { stubbed++; stubPlacements += kv.Value; }
+        var handling = SiegeFX.Core.Parity.CommandCatalog.Classify(kv.Key);
+        string status = PathsOf(handling);
+        if (handling == SiegeFX.Core.Parity.CommandHandling.None) { stubbed++; stubPlacements += kv.Value; }
         int rc = verbRegions.TryGetValue(kv.Key, out var s) ? s.Count : 0;
-        Console.WriteLine($"  {kv.Value,5} {status,-8} {kv.Key}  ({rc} region{(rc == 1 ? "" : "s")})");
+        string note = SiegeFX.Core.Parity.CommandCatalog.Describe(kv.Key);
+        Console.WriteLine($"  {kv.Value,5} {status,-14} {kv.Key}  ({rc} region{(rc == 1 ? "" : "s")})" +
+                          (note.Length > 0 ? $" — {note}" : ""));
     }
     Console.WriteLine();
     if (initialByRegion.Count > 0)
@@ -1142,7 +1146,8 @@ static int CmdRegionCmdAudit(string[] a)
             Console.WriteLine($"  {kv.Value,4}  {kv.Key}");
         Console.WriteLine();
     }
-    Console.WriteLine($"VERDICT: {verbCount.Count - stubbed}/{verbCount.Count} verb type(s) handled; {stubbed} stubbed ({stubPlacements} placements) — those scripted set-pieces are inert.");
+    Console.WriteLine($"VERDICT: {verbCount.Count - stubbed}/{verbCount.Count} verb type(s) handled; {stubbed} not implemented " +
+                      $"({stubPlacements} placement{(stubPlacements == 1 ? "" : "s")}) — those scripted set-pieces are inert.");
     return 0;
 }
 
@@ -1708,6 +1713,25 @@ static int CmdWorldCampaignAudit(string[] a)
     Console.WriteLine("campaign order (stitch-BFS depth : regions):");
     foreach (var g in regionPaths.GroupBy(Depth).OrderBy(g => g.Key))
         Console.WriteLine($"  {(g.Key == int.MaxValue ? "unreached" : g.Key.ToString()),9} : {string.Join(", ", g.Select(ShortName))}");
+
+    // Triage check: the curated lists above against the names in the built
+    // engine (EngineVocabulary). A "handled" section or dispatched verb the
+    // engine never names is a stale claim; a "benign" section it does name may
+    // be implemented by now and wants re-triage. Names are a ceiling, not
+    // proof of faithful behaviour, so this is a review list, not a verdict.
+    Console.WriteLine();
+    var vocab = ParityLedger.LoadEngineVocabulary();
+    if (vocab is null)
+    {
+        Console.WriteLine("triage check skipped: no built engine (build src/SiegeFX.Runtime)");
+        return 0;
+    }
+    var scaffolding = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "placement", "gizmo", "template" };
+    static string List(IEnumerable<string> items) { var s = string.Join(", ", items.Order(StringComparer.Ordinal)); return s.Length == 0 ? "(none)" : s; }
+    Console.WriteLine("TRIAGE CHECK against the built engine (review list; names are a ceiling, not proof):");
+    Console.WriteLine($"  listed handled, never named by the engine : {List(handled.Where(h => !scaffolding.Contains(h) && !vocab.Names(h)))}");
+    Console.WriteLine($"  listed benign, named by the engine now    : {List(benign.Keys.Where(vocab.Names))}");
+    Console.WriteLine($"  listed dispatched, never named            : {List(dispatchedConditions.Concat(dispatchedActions).Where(v => !vocab.Names(v)))}");
 
     return 0;
 }
@@ -9851,7 +9875,7 @@ static int CmdSfxParamAudit(string[] a)
 
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var keys = new List<(string Key, string Kind)>();
-        WalkParamStrings(script.Name, script.Body, sfx, visited, keys, ref paramStrings);
+        SiegeFX.Core.Sfx.SfxParamInventory.WalkParamStrings(script.Name, script.Body, sfx, visited, keys, ref paramStrings);
 
         foreach (var (key, kind) in keys)
         {
@@ -9906,78 +9930,6 @@ static int CmdSfxParamAudit(string[] a)
     return 0;
 }
 
-// Walks a compiled sfx script (recursing one level into `call <sub>` like
-// WalkAuditScript) collecting every param key from every statement that
-// carries a quoted param string, tagged with the create-kind (or verb)
-// it was authored on.
-static void WalkParamStrings(string scriptName, string body, SfxScriptStore store,
-    HashSet<string> visited, List<(string Key, string Kind)> keys, ref int paramStrings)
-{
-    if (!visited.Add(scriptName)) return; // cycle / mutual-call guard
-    SiegeFX.Core.Sfx.SfxProgram prog;
-    try { prog = SiegeFX.Core.Sfx.SfxScriptCompiler.Compile(scriptName, body); }
-    catch { return; }
-
-    foreach (var stmt in prog.Statements)
-    {
-        if (!string.IsNullOrEmpty(stmt.ParamString))
-        {
-            paramStrings++;
-            var kind = stmt.Kind == SiegeFX.Core.Sfx.StatementKind.SfxCreate && stmt.Tokens.Count > 0
-                ? stmt.Tokens[0].ToLowerInvariant()
-                : "(" + stmt.Verb + ")";
-            foreach (var key in ExtractParamKeys(stmt.ParamString!))
-                keys.Add((key, kind));
-        }
-        if (stmt.Kind == SiegeFX.Core.Sfx.StatementKind.Call && stmt.Tokens.Count > 0)
-        {
-            var callName = stmt.Tokens[0].Trim('"').Trim();
-            int sp = callName.IndexOf(' ');
-            if (sp >= 0) callName = callName.Substring(0, sp);
-            if (!string.IsNullOrEmpty(callName) && store.TryGet(callName, out var sub))
-                WalkParamStrings(sub.Name, sub.Body, store, visited, keys, ref paramStrings);
-        }
-    }
-}
-
-// Tokenizes a DS1 param string (`key(args)key2(args)...[0][1]`) into its
-// key names. A key is an identifier followed by `(`; paren contents are
-// skipped flat (no shipped DS1 value nests parens — same limitation as
-// ExtractAuditTextures, documented there). Bare identifiers outside parens
-// are also yielded — shipped strings author flag-style keys both ways.
-// `[N]` caller-arg slots and `$var` leftovers are not keys.
-static IEnumerable<string> ExtractParamKeys(string raw)
-{
-    int i = 0;
-    while (i < raw.Length)
-    {
-        char c = raw[i];
-        if (c == '$')
-        {
-            i++;
-            while (i < raw.Length && (char.IsLetterOrDigit(raw[i]) || raw[i] == '_')) i++;
-        }
-        else if (char.IsLetter(c) || c == '_')
-        {
-            int start = i;
-            while (i < raw.Length && (char.IsLetterOrDigit(raw[i]) || raw[i] == '_')) i++;
-            var name = raw.Substring(start, i - start);
-            int j = i;
-            while (j < raw.Length && char.IsWhiteSpace(raw[j])) j++;
-            if (j < raw.Length && raw[j] == '(')
-            {
-                yield return name;
-                int close = raw.IndexOf(')', j + 1);
-                i = close < 0 ? raw.Length : close + 1;
-            }
-            else
-            {
-                yield return name; // bare flag-style key
-            }
-        }
-        else i++;
-    }
-}
 
 // Phase 23b — deterministic cast-timeline dump. One spell prints to
 // stdout; --all writes one file per spell into --out (default
@@ -10691,7 +10643,7 @@ static int CmdAudioCoverage(string[] a)
 {
     if (a.Length < 1)
     {
-        Console.Error.WriteLine("usage: siegefx audio coverage <Sound.dsres> [--list-orphan-categories] [--list-unwired=PREFIX]");
+        Console.Error.WriteLine("usage: siegefx audio coverage <Sound.dsres> [--list-orphan-categories] [--list-unwired=PREFIX]   (PREFIX lists its unreachable sounds)");
         return 1;
     }
     string? soundPath = null;
@@ -10713,45 +10665,41 @@ static int CmdAudioCoverage(string[] a)
     }
     if (soundPath is null) { Console.Error.WriteLine("missing <Sound.dsres>"); return 1; }
 
-    // Static wired-id list mirrors RenderHost's Sfx* constants + the inline
-    // clip ids it registers (swing_01..04, hit_flesh_1..5, die_<species>).
-    // When RenderHost grows new TryRegisterSfx calls, append here so the
-    // gap report stays accurate. See feedback_siegefx_diagnostic_clis.md.
-    var wiredPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    // Reachable = what the engine can play: a sound the engine names, or one
+    // a GAS field it reads names (template sound events, mood music, effect
+    // scripts). The same analysis feeds the parity ledger's sounds row, read
+    // from the built engine rather than a list kept beside it.
+    var resourcesDir = Path.GetDirectoryName(Path.GetFullPath(soundPath))!;
+    var logicPath = Path.Combine(resourcesDir, "Logic.dsres");
+    var worldPath = Path.Combine(Path.GetDirectoryName(resourcesDir) ?? resourcesDir, "Maps", "World.dsmap");
+    if (!File.Exists(logicPath) || !File.Exists(worldPath))
     {
-        "/sound/effects/s_e_spell_zap_cast.wav",
-        "/sound/effects/s_e_spell_healing_wind_cast.wav",
-        "/sound/effects/s_e_swing_01.wav",
-        "/sound/effects/s_e_swing_02.wav",
-        "/sound/effects/s_e_swing_03.wav",
-        "/sound/effects/s_e_swing_04.wav",
-        "/sound/effects/s_e_hit_steelsword_flesh1.wav",
-        "/sound/effects/s_e_hit_steelsword_flesh2.wav",
-        "/sound/effects/s_e_hit_steelsword_flesh3.wav",
-        "/sound/effects/s_e_hit_steelsword_flesh4.wav",
-        "/sound/effects/s_e_hit_steelsword_flesh5.wav",
-        "/sound/effects/s_e_miss_melee.wav",
-        "/sound/effects/s_e_level_up_melee.wav",
-        "/sound/effects/s_e_die_goblin.wav",
-        "/sound/effects/s_e_die_gremal.wav",
-        "/sound/effects/s_e_die_krug_scout.wav",
-        "/sound/effects/s_e_die_krug_dog.wav",
-        "/sound/effects/s_e_gui_inventory_sheet.wav",
-        "/sound/effects/s_e_gui_pick_up.wav",
-        "/sound/effects/s_e_gui_out_of_mana.wav",
-    };
+        Console.Error.WriteLine($"audio coverage needs Logic.dsres beside {Path.GetFileName(soundPath)} and Maps/World.dsmap in the install");
+        return 1;
+    }
+    var vocab = ParityLedger.LoadEngineVocabulary();
+    if (vocab is null) { Console.Error.WriteLine("audio coverage needs a built engine (build src/SiegeFX.Runtime)"); return 1; }
 
     using var tank = TankFile.Open(soundPath);
+    using var logicTank = TankFile.Open(logicPath);
+    using var worldTank = TankFile.Open(worldPath);
     var reader = new TankReader(tank);
+    var reach = ParityLedger.SoundReachability(reader, new TankReader(logicTank), new TankReader(worldTank), vocab);
+    bool Reachable(string p) => reach.TryGetValue(p, out var r) && r.Kind == ParityLedger.SoundReach.Reachable;
+    int Count(ParityLedger.SoundReach kind) => reach.Values.Count(r => r.Kind == kind);
 
-    int wavTotal = 0, musicTotal = 0, otherTotal = 0;
-    int wiredFound = 0, wiredMissing = 0;
+    int wavTotal = 0, musicTotal = 0, otherTotal = 0, musicReachable = 0;
     var byCategory = new SortedDictionary<string, (int Authored, int Wired, List<string> Unwired)>(StringComparer.OrdinalIgnoreCase);
 
     foreach (var path in reader.ListFiles())
     {
         var lower = path.ToLowerInvariant();
-        if (lower.StartsWith("/sound/music/", StringComparison.Ordinal)) { musicTotal++; continue; }
+        if (lower.StartsWith("/sound/music/", StringComparison.Ordinal))
+        {
+            musicTotal++;
+            if (Reachable(path)) musicReachable++;
+            continue;
+        }
         if (!lower.EndsWith(".wav", StringComparison.Ordinal))           { otherTotal++; continue; }
         if (!lower.StartsWith("/sound/effects/s_e_", StringComparison.Ordinal))
         {
@@ -10771,22 +10719,19 @@ static int CmdAudioCoverage(string[] a)
         if (!byCategory.TryGetValue(cat, out var cell))
             cell = (0, 0, new List<string>());
         cell.Authored++;
-        if (wiredPaths.Contains(path)) cell.Wired++;
+        if (Reachable(path)) cell.Wired++;
         else cell.Unwired.Add(path);
         byCategory[cat] = cell;
     }
 
-    foreach (var w in wiredPaths)
-    {
-        if (reader.TryGetFile(w, out _)) wiredFound++;
-        else wiredMissing++;
-    }
-
     Console.WriteLine($"audio coverage: {Path.GetFileName(soundPath)}");
     Console.WriteLine($"  totals: {wavTotal} wav(s), {musicTotal} music track(s), {otherTotal} other");
-    Console.WriteLine($"  wired-list health: {wiredFound}/{wiredPaths.Count} resolve in tank ({wiredMissing} missing — report stale runtime constants)");
+    Console.WriteLine("  reachable = the engine names the sound, or a GAS field it reads does");
+    Console.WriteLine($"  all sounds: {Count(ParityLedger.SoundReach.Reachable)} reachable, " +
+                      $"{Count(ParityLedger.SoundReach.UnreadField)} named only in fields the engine does not read (gaps), " +
+                      $"{Count(ParityLedger.SoundReach.Unreferenced)} named by no data (unused, or played by the original's own code)");
     Console.WriteLine();
-    Console.WriteLine($"  {"category",-12}  {"authored",8}  {"wired",5}  gap");
+    Console.WriteLine($"  {"category",-12}  {"authored",8}  {"reach",5}  gap");
     Console.WriteLine($"  {new string('-', 12)}  {new string('-', 8)}  {new string('-', 5)}  ---");
 
     var orphans = new List<string>();
@@ -10798,8 +10743,8 @@ static int CmdAudioCoverage(string[] a)
     }
 
     Console.WriteLine();
-    Console.WriteLine($"  unwired categories ({orphans.Count}): {string.Join(", ", orphans)}");
-    Console.WriteLine($"  music: 0/{musicTotal} wired (no music playback path in runtime yet)");
+    Console.WriteLine($"  categories with nothing reachable ({orphans.Count}): {string.Join(", ", orphans)}");
+    Console.WriteLine($"  music: {musicReachable}/{musicTotal} reachable");
 
     if (listOrphans && orphans.Count > 0)
     {
@@ -10816,7 +10761,7 @@ static int CmdAudioCoverage(string[] a)
     if (listUnwiredPrefix is not null)
     {
         Console.WriteLine();
-        Console.WriteLine($"unwired entries in [{listUnwiredPrefix}] (full list):");
+        Console.WriteLine($"unreachable entries in [{listUnwiredPrefix}] (full list):");
         if (byCategory.TryGetValue(listUnwiredPrefix, out var cellList))
         {
             foreach (var p in cellList.Unwired) Console.WriteLine($"  {p}");
@@ -11900,11 +11845,14 @@ static int CmdQuestsAudit(string[] a)
         {
             foreach (var node in conv.Nodes)
             {
-                var key = node.ActivateQuest;
-                if (string.IsNullOrWhiteSpace(key)) continue;
-                if (!perKey.TryGetValue(key, out var sites))
-                    perKey[key] = sites = new List<(string, string)>();
-                sites.Add((regionPath, convKey));
+                // A node can activate several quests ('King' grants two); split
+                // them exactly as the engine does.
+                foreach (var key in SiegeFX.Core.Assets.DialogueNode.SplitQuestKeys(node.ActivateQuest))
+                {
+                    if (!perKey.TryGetValue(key, out var sites))
+                        perKey[key] = sites = new List<(string, string)>();
+                    sites.Add((regionPath, convKey));
+                }
             }
         }
     }

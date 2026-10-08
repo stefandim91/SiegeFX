@@ -1,5 +1,9 @@
 using SiegeFX.Runtime.Render;
 
+// Bundled GLFW / OpenAL Soft stay findable on a distribution-built .NET
+// (see NativeLibraryFallback); must run before the first window or device.
+SiegeFX.Audio.NativeLibraryFallback.Install();
+
 // Crash logger — dumps any unhandled exception (including ones the CLR would
 // otherwise report via its own stderr banner) to siegefx_crash.log next to the
 // DLL. test-all.bat's T23 prints this file after the process exits so the user
@@ -18,7 +22,7 @@ AppDomain.CurrentDomain.UnhandledException += (_, e) =>
     try
     {
         var dir = System.IO.Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData, Environment.SpecialFolderOption.DoNotVerify),
             "SiegeFX", "logs");
         System.IO.Directory.CreateDirectory(dir);
         System.IO.File.WriteAllText(
@@ -41,12 +45,13 @@ System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, e) =>
 // now a closed window took its console output with it, so live bug reports
 // had no evidence trail). Newest 8 sessions are kept. SIEGEFX_DEBUG_LOG_FILE
 // still overrides the target path for directed diagnosis. Auto-flush on every
-// write so a forced quit still leaves a valid log.
+// write so a forced quit still leaves a valid log. The per-user folders are
+// looked up with DoNotVerify (see SaveStore.DefaultSaveDirectory).
 var teePath = System.Environment.GetEnvironmentVariable("SIEGEFX_DEBUG_LOG_FILE");
 if (string.IsNullOrWhiteSpace(teePath))
 {
     var logDir = System.IO.Path.Combine(
-        System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData),
+        System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData, Environment.SpecialFolderOption.DoNotVerify),
         "SiegeFX", "logs");
     teePath = System.IO.Path.Combine(logDir, $"session-{DateTime.Now:yyyyMMdd-HHmmss}.log");
     try
@@ -72,6 +77,10 @@ try
     Console.WriteLine($"[log] session log: {teePath}");
 }
 catch (Exception ex) { Console.WriteLine($"  tee log: failed to open '{teePath}': {ex.Message}"); }
+// Which build ran, and where: the line a bug report quotes.
+Console.WriteLine($"[log] SiegeFX {SiegeFX.Core.Net.MpDiag.BuildString()} on " +
+                  $"{System.Runtime.InteropServices.RuntimeInformation.OSDescription} " +
+                  $"({System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier})");
 
 // Invocation shapes:
 //   SiegeFX.Runtime                                          → boot to main menu (Phase 24)
@@ -248,6 +257,12 @@ else if (args.Length >= 1 && args[0] == "--selftest-net")
     // malformed-frame safety. No window; suitable for test-all.bat.
     return SiegeFX.Runtime.NetSelfTest.Run() ? 0 : 1;
 }
+else if (args.Length >= 1 && args[0] == "--selftest-eos")
+{
+    // Internet play end to end: the EOS module, the game's credentials, a
+    // device-id login and a lobby round trip through Epic. Needs the network.
+    return SiegeFX.Runtime.EosSelfTest.Run() ? 0 : 1;
+}
 else if (args.Length >= 1 && args[0] == "--selftest-dialogue")
 {
     // Phase 20a self-test. Parses a synthetic conversations.gas (mirroring
@@ -318,11 +333,15 @@ else if (args.Length == 0)
         // alone is invisible. Same pattern the host.Run crash net uses.
         var msg = new System.Text.StringBuilder();
         msg.AppendLine("siegefx: couldn't find a Dungeon Siege install. Tried:");
-        foreach (var p in CandidateDs1Paths()) msg.AppendLine($"   {p}");
-        msg.AppendLine("Fix: create a file named ds1path.txt NEXT TO SiegeFX.exe whose first");
-        msg.AppendLine("line is your Dungeon Siege install path (the folder containing");
-        msg.AppendLine("Resources\\Logic.dsres), then re-launch. (The SIEGEFX_DS1 env var");
-        msg.AppendLine("also works.)");
+        int tried = 0;
+        foreach (var p in CandidateDs1Paths()) { msg.AppendLine($"   {p}"); tried++; }
+        if (tried == 0)
+            msg.AppendLine("   (nothing: no path file, environment variable, store or launcher location)");
+        msg.AppendLine("Fix: create a file named ds1path.txt NEXT TO the SiegeFX program, or");
+        msg.AppendLine($"at {SiegeFX.Core.IO.DsInstallLocator.UserPathFile}, whose first line is");
+        msg.AppendLine("your Dungeon Siege install path (the folder containing");
+        msg.AppendLine($"Resources{System.IO.Path.DirectorySeparatorChar}Logic.dsres), then re-launch.");
+        msg.AppendLine("(The SIEGEFX_DS1 environment variable also works.)");
         Console.Error.Write(msg.ToString());
         try { System.IO.File.WriteAllText(crashLogPath, msg.ToString()); } catch { }
         return 1;
@@ -334,32 +353,11 @@ else
     texturePath = args.Length > 1 ? args[1] : null;
 }
 
-static IEnumerable<string> CandidateDs1Paths()
-{
-    var env = Environment.GetEnvironmentVariable("SIEGEFX_DS1");
-    if (!string.IsNullOrEmpty(env)) yield return env;
-    // ALPHA-PACKAGING — ds1path.txt next to the exe: the no-env-var way for
-    // testers to point at a non-standard install (first non-empty line =
-    // the DS1 install or Resources folder).
-    string? txt = null;
-    try
-    {
-        var p = System.IO.Path.Combine(AppContext.BaseDirectory, "ds1path.txt");
-        if (System.IO.File.Exists(p))
-            txt = System.IO.File.ReadLines(p)
-                .Select(l => l.Trim().Trim('"'))
-                .FirstOrDefault(l => l.Length > 0 && !l.StartsWith("#"));
-    }
-    catch { /* unreadable = skip */ }
-    if (!string.IsNullOrEmpty(txt)) yield return txt!;
-    yield return @"D:\GOG Games\Dungeon Siege";
-    yield return @"C:\GOG Games\Dungeon Siege";
-    yield return @"C:\Program Files (x86)\GOG Galaxy\Games\Dungeon Siege";
-    yield return @"C:\Program Files (x86)\Steam\steamapps\common\Dungeon Siege 1";
-    yield return @"C:\Program Files\Steam\steamapps\common\Dungeon Siege 1";
-    yield return @"C:\Program Files (x86)\Microsoft Games\Dungeon Siege";
-    yield return @"C:\Program Files\Microsoft Games\Dungeon Siege";
-}
+// ALPHA-PACKAGING — SIEGEFX_DS1, a ds1path.txt beside the program or in the
+// user's config folder (first non-empty line = the DS1 install or its
+// Resources folder), then each platform's store and launcher locations; see
+// SiegeFX.Core.IO.DsInstallLocator (shared with SiegeSmith).
+static IEnumerable<string> CandidateDs1Paths() => SiegeFX.Core.IO.DsInstallLocator.Candidates();
 
 static string? ResolveDs1Resources()
 {
