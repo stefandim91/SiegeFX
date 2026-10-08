@@ -811,12 +811,31 @@ goto MENU
 
 :T39
 echo.
-echo --- Phase 19a: SaveFile JSON round-trip (no window) ---
-echo [expect: "[selftest-save] OK - 3 actor(s), player + camera, schema v1 round-tripped at <path>"]
+echo --- Save safety, world profiles, offline content and authored launch (no window) ---
+echo [expect: all self-tests pass; real-map checks use the configured DS1 installation]
 echo [exits 0 on success, 1 with field-by-field diffs on failure]
 echo.
 dotnet "%RUN%" --selftest-save
 set EXITCODE=%ERRORLEVEL%
+if not "%EXITCODE%"=="0" goto T39_DONE
+dotnet "%RUN%" --selftest-save-transaction
+set EXITCODE=%ERRORLEVEL%
+if not "%EXITCODE%"=="0" goto T39_DONE
+dotnet "%RUN%" --selftest-world-profile
+set EXITCODE=%ERRORLEVEL%
+if not "%EXITCODE%"=="0" goto T39_DONE
+dotnet "%RUN%" --selftest-offline-content "%DS1%"
+set EXITCODE=%ERRORLEVEL%
+if not "%EXITCODE%"=="0" goto T39_DONE
+dotnet "%RUN%" --selftest-world-launch "%DS1%"
+set EXITCODE=%ERRORLEVEL%
+if not "%EXITCODE%"=="0" goto T39_DONE
+dotnet "%RUN%" --selftest-screen-actor-pick
+set EXITCODE=%ERRORLEVEL%
+if not "%EXITCODE%"=="0" goto T39_DONE
+dotnet "%RUN%" --selftest-terrain-textures "%DS1%"
+set EXITCODE=%ERRORLEVEL%
+:T39_DONE
 echo.
 echo === SiegeFX exited with code %EXITCODE% ===
 pause
@@ -2444,6 +2463,10 @@ goto MENU
 :T105
 echo.
 echo --- SC-ELEVATOR: farmhouse grate lift ride (hc_r1, closest lift to spawn) ---
+dotnet "%RUN%" --selftest-elevator-interaction
+if errorlevel 1 (echo FAIL: elevator interaction geometry & pause & goto MENU)
+dotnet "%RUN%" --selftest-lever-pose "%DS1%"
+if errorlevel 1 (echo FAIL: authored lever poses and picking & pause & goto MENU)
 echo [Same basement house as the stair/cutaway tests - besides the stairs it
 echo  has a METAL GRATE floor section that is a working lift now. Spawn =
 echo  top of its shaft (world ~76,-4,-72; hc_r1 streams as fh_r1 neighbor).
@@ -2461,6 +2484,12 @@ echo    grate descends ~12u over 5s WITH you standing on it; the authored
 echo    cutaway fades swap surface/basement sections mid-ride.
 echo  - Ordinary move-clicks on the floor NEAR the winch must NOT pull it
 echo    (the old bug: elevator left without you + player froze topside).
+echo  - If a lever does send the EMPTY car away, the landing must stay
+echo    visible and walkable; this matches retail Dungeon Siege behavior.
+echo  - While the car moves, walking onto its old floor must be refused.
+echo  - Save at a parked stop, start a ride, then load that save while the
+echo    car is moving: the car and player return to the saved stop, and a
+echo    fresh walk click still works.
 echo  - If you somehow stand over the open shaft when the car is away, a
 echo    [nav-rescue] line nudges you to the landing edge instead of freezing.
 echo  - At the bottom: walk OFF onto the cellar floor (nav rebuilds on

@@ -286,9 +286,12 @@ public sealed class ActorSpawner
 
         var world = ComposeWorldTransform(inst.Placement);
         // SC-INSTANCE-OVERRIDES — the placement's own [aspect] block (life /
-        // max_life / scale_multiplier) wins over the template chain.
+        // max_life / scale_base / scale_multiplier) wins over the template chain.
         var stats = ActorStats.FromTemplate(_store, template, inst.Node);
         var actor = new Actor(inst, template, world, mesh, clips, skrit, host, stats, walkIdx, clipIndexByName);
+        // Resolve equipment stance before scheduling any initial one-shot;
+        // its duration must match the clip that will actually render.
+        RefreshMotionClips(actor, preferredStance ?? DeriveStanceFromEquipment(template));
         // SC-IDLE-FIDGET — honor the template's authored [body] initial_chore
         // as the idle fallback clip. DS1 starts actors in it; for flyers
         // (phrak) and other static-default creatures that's chore_fidget —
@@ -300,13 +303,33 @@ public sealed class ActorSpawner
         if (!string.IsNullOrEmpty(initialChore)
             && clipIndexByName.TryGetValue(initialChore!, out var idleIdx))
             actor.IdleClipIndex = idleIdx;
-        // Phase 18 — resolve the animation stance from the AUTHORED equipment
-        // when the caller didn't supply one (NPCs): an axe-armed krug idles,
-        // walks, and swings in fs1/fs3 instead of the unarmed fs0 the plain
-        // "first stance that loads" pick landed on. Also populates the
-        // attack-variant set + qffg pad + authored base duration for every
-        // spawned combatant (clip cache makes the second pass cheap).
-        RefreshMotionClips(actor, preferredStance ?? DeriveStanceFromEquipment(template));
+        // The stock job_fidget.skrit requests CHORE_FIDGET on entering its
+        // idle state and again when the animation completes. Its visual
+        // request was previously missing here: the blender kept the static
+        // chore_default pose forever even while the brain was ticking.
+        // Honor both the inherited job and a placement's authored opt-out.
+        var autoFidgets = TemplateStore.GetNodeAttribute(inst.Node, "mind", "actor_auto_fidgets")
+            ?? _store.GetAttribute(template, "mind", "actor_auto_fidgets");
+        var fidgetJob = TemplateStore.GetNodeAttribute(inst.Node, "mind", "jat_fidget")
+            ?? _store.GetAttribute(template, "mind", "jat_fidget");
+        var fidgetSection = TemplateStore.FindChild(dictionary!, "chore_fidget");
+        var fidgetSkrit = fidgetSection is null ? null : TemplateStore.FindAttr(fidgetSection, "skrit");
+        if (!string.Equals(autoFidgets?.Trim(), "false", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(fidgetJob)
+            && clipIndexByName.TryGetValue("chore_fidget", out var fidgetIdx))
+            actor.IdleClipIndex = fidgetIdx;
+        else if (string.Equals(autoFidgets?.Trim(), "false", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(initialChore, "chore_fidget", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(fidgetSkrit, "select_fidget", StringComparison.OrdinalIgnoreCase)
+            && actor.IdleClipIndex > 0)
+        {
+            // select_fidget.skrit is one-shot. An explicit placement opt-out
+            // suppresses repeat requests, but the initial chore still plays
+            // once before the static default stance takes over.
+            int initialIdx = actor.IdleClipIndex;
+            actor.IdleClipIndex = 0;
+            actor.Host.OverrideAnimIndex(initialIdx, actor.Clips[initialIdx].AnimLength);
+        }
         return actor;
     }
 
@@ -521,6 +544,48 @@ public sealed class ActorSpawner
         return TryLoadAnyStanceClip(chorePrefix, new[] { stance }, suffix, actor.Instance);
     }
 
+    /// <summary>Resolve an interactive prop's authored transition using the same
+    /// asset cache as actor chores. Instance overrides take precedence.</summary>
+    public PrsAnimation? LoadTransitionClip(Template template, ActorInstance inst, string chore)
+    {
+        var prefix = TemplateStore.GetNodeAttribute(inst.Node, "body", "chore_dictionary", "chore_prefix")
+            ?? _store.GetAttribute(template, "body", "chore_dictionary", "chore_prefix");
+        if (string.IsNullOrWhiteSpace(prefix)) return null;
+        var dictionary = TemplateStore.FindChild(inst.Node, "body");
+        dictionary = dictionary is null ? null : TemplateStore.FindChild(dictionary, "chore_dictionary");
+        var instanceSection = dictionary is null ? null : TemplateStore.FindChild(dictionary, chore);
+        string? Field(string name) => TemplateStore.GetNodeAttribute(inst.Node,
+                "body", "chore_dictionary", chore, name)
+            ?? _store.GetAttribute(template, "body", "chore_dictionary", chore, name);
+        if (!(Field("skrit") ?? "").Trim().Trim('"').Split('?')[0]
+                .Equals("transition", StringComparison.OrdinalIgnoreCase)) return null;
+        var animFiles = FindAnimFiles(instanceSection);
+        // A derived template can override one chore field while inheriting its
+        // animation entries. GetSection returns the first section as a whole,
+        // so keep walking the specializes chain until entries are present.
+        for (var ancestor = template; animFiles is null && ancestor is not null;
+            ancestor = ancestor.Specializes)
+            animFiles = FindAnimFiles(_store.GetSection(ancestor,
+                "body", "chore_dictionary", chore));
+        if (animFiles is null) return null;
+        var stances = Field("chore_stances");
+        var section = new GasNode(chore, new[] { animFiles }, stances is null
+            ? Array.Empty<GasAttribute>() : new[] { new GasAttribute("chore_stances", null, stances) });
+        return TryLoadChoreClip(prefix.Trim().Trim('"'), section, inst, preferredStance: null);
+    }
+
+    /// <summary>GAS permits both [anim_files] blocks and the common
+    /// "anim_files: 00 = suffix" attributes used by original prop templates.</summary>
+    private static GasNode? FindAnimFiles(GasNode? section)
+    {
+        if (section is null) return null;
+        var child = TemplateStore.FindChild(section, "anim_files");
+        if (child is not null) return child;
+        var attrs = section.Attributes.Where(a =>
+            a.Name.StartsWith("anim_files:", StringComparison.OrdinalIgnoreCase)).ToArray();
+        return attrs.Length == 0 ? null : new GasNode("anim_files", Array.Empty<GasNode>(), attrs);
+    }
+
     /// <summary>Phase 10-SC-2 — load a representative PRS clip for one chore_* section.
     /// Walks every <c>[anim_files]</c> entry and stops at the first that resolves; returns
     /// null if none load. Two filename strategies depending on the section's
@@ -542,7 +607,7 @@ public sealed class ActorSpawner
     /// to the idle.</summary>
     PrsAnimation? TryLoadChoreClip(string prefix, GasNode section, ActorInstance inst, int? preferredStance)
     {
-        var animFiles = TemplateStore.FindChild(section, "anim_files");
+        var animFiles = FindAnimFiles(section);
         if (animFiles is null || animFiles.Attributes.Count == 0) return null;
 
         var stancesRaw = TemplateStore.FindAttr(section, "chore_stances");
@@ -559,6 +624,19 @@ public sealed class ActorSpawner
                 if (clip is not null) return clip;
             }
             return null;
+        }
+
+        // Stanceless props use prefix_suffix, while some ambient animals
+        // include their complete stance in the prefix (a_c_na_dg_fs0).
+        // Try the authored prefix unchanged before numeric stance fallback.
+        if (stancesRaw is null)
+        {
+            foreach (var attr in animFiles.Attributes)
+            {
+                if (string.IsNullOrWhiteSpace(attr.Value)) continue;
+                var clip = TryLoadFullNameClip(prefix + "_" + attr.Value, inst);
+                if (clip is not null) return clip;
+            }
         }
 
         var stances = ParseChoreStances(stancesRaw);

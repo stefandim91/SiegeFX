@@ -16,9 +16,14 @@ namespace SiegeFX.Core.Actors;
 /// renderer from needing to know about trigger semantics.</summary>
 public sealed class TriggerRuntime
 {
-    /// <summary>TRUE while an MP session is live — gates authored
-    /// single_player=false rows (MP-only duplicates skip in SP).</summary>
+    /// <summary>TRUE while an MP session is live. Networked sessions retain
+    /// their historical access to multiplayer-authored trigger rows.</summary>
     public bool IsMultiplayerSession { get; set; }
+
+    /// <summary>Enables multiplayer-authored trigger rows without requiring a
+    /// network session. Offline Utraea sets this from its world profile while
+    /// the Kingdom of Ehb keeps the default <see langword="false"/>.</summary>
+    public bool EnableMultiplayerAuthoredTriggers { get; set; }
 
     readonly List<TriggerInstance> _instances = new();
     /// <summary>Replay queue for delayed actions. The 20 Hz tick is fast enough that
@@ -162,6 +167,8 @@ public sealed class TriggerRuntime
     /// rows (<c>party_member_entered/left_trigger_group(NAME, ...)</c>) compare current vs
     /// previous to fire on transitions.</summary>
     public IReadOnlyDictionary<string, bool> Occupants => _occupiedNow;
+    /// <summary>Diagnostic for authored group entry/exit while validating content.</summary>
+    public bool TraceGroupTransitions { get; set; }
     Dictionary<string, bool> _occupiedNow = new(StringComparer.OrdinalIgnoreCase);
     Dictionary<string, bool> _occupiedPrev = new(StringComparer.OrdinalIgnoreCase);
 
@@ -214,6 +221,16 @@ public sealed class TriggerRuntime
             var trig = _instances[i];
             if (!trig.IsActive) continue;
             UpdateOccupantsForInstance(trig, ctx);
+        }
+
+        if (TraceGroupTransitions)
+        {
+            foreach (var group in _occupiedNow.Keys)
+                if (!_occupiedPrev.ContainsKey(group))
+                    Console.WriteLine($"[trigger-group] entered '{group}'");
+            foreach (var group in _occupiedPrev.Keys)
+                if (!_occupiedNow.ContainsKey(group))
+                    Console.WriteLine($"[trigger-group] left '{group}'");
         }
 
         for (int i = 0; i < _instances.Count; i++)
@@ -288,10 +305,10 @@ public sealed class TriggerRuntime
             var row = matrix.Rows[r];
             ref var state = ref trig.RowStateAt(r);
 
-            // Authored single_player=false rows are MP-only (mood/fade/
-            // quest duplicates for the MP flow); a single-player session
-            // never evaluates them.
-            if (!row.SinglePlayer && !IsMultiplayerSession) continue;
+            // Authored single_player=false rows belong to multiplayer-authored
+            // content. They may run either in a real MP session or in an offline
+            // world profile that explicitly enables those content rules.
+            if (!row.SinglePlayer && !(EnableMultiplayerAuthoredTriggers || IsMultiplayerSession)) continue;
             // single_shot rows latch: once they've fired, they never evaluate again.
             if (state.FiredOnce && row.SingleShot) continue;
             // reset_duration cooldown gate: row stays cold until the cooldown expires.
@@ -302,6 +319,7 @@ public sealed class TriggerRuntime
             // TriggerRow rarely exceeds 4 groups in shipped data; a small dict is fine.
             var firedGroups = new HashSet<int>();
             bool anySatisfied = false;
+            bool messageSatisfied = false;
             for (int c = 0; c < row.Conditions.Count; c++)
             {
                 var cond = row.Conditions[c];
@@ -310,6 +328,8 @@ public sealed class TriggerRuntime
                     Bump(_conditionHits, cond.Verb);
                     firedGroups.Add(cond.Group);
                     anySatisfied = true;
+                    if (cond.Verb.Equals("receive_world_message", StringComparison.OrdinalIgnoreCase))
+                        messageSatisfied = true;
                 }
             }
 
@@ -326,7 +346,10 @@ public sealed class TriggerRuntime
             // "on_every_enter". Caveat: a row mixing a held level condition
             // with a receive_world_message condition would consume messages
             // without dispatching while held — no shipped row does this.
-            bool risingEdge = !state.ConditionHeld && anySatisfied;
+            // World messages are impulses, not held spatial conditions. A row
+            // must fire for each queued matching message even if the previous
+            // tick also consumed one (e.g. successive SFX1 hammer impacts).
+            bool risingEdge = anySatisfied && (!state.ConditionHeld || messageSatisfied);
             state.ConditionHeld = anySatisfied;
 
             if (!anySatisfied)
@@ -344,13 +367,13 @@ public sealed class TriggerRuntime
                         // SC-FADE-BOX-REVERSE — box-family fade templates
                         // (trigger_fade_nodes_box / trigger_fade_node_box /
                         // trigger_change_mood_box) hold their "out" fades only
-                        // while a party member is inside the volume; DS1 ships
+                        // while a spatial condition remains true; DS1 ships
                         // a separate *_offonly_box variant for one-way fades,
                         // which is the tell. fh_r1's hide-the-cellar boxes
                         // restore hc_r1's sections on exit this way — nothing
                         // else ever reveals sections 3/4. "in" actions stay
                         // sticky (staged reveals never re-hide).
-                        if (trig.AutoReverseFades &&
+                        if (trig.AutoReverseFades && HasHeldVolumeCondition(row) &&
                             TryReverseFadeAction(act, out var reversedArgs))
                         {
                             Bump(_actionFireCounts, act.Verb);
@@ -501,14 +524,29 @@ public sealed class TriggerRuntime
             case "receive_world_message":
             {
                 // Drained against the per-row inbox the runtime fills from message-bus
-                // posts targeted at trig.Scid. Match is by message name (arg 0).
-                if (cond.Args.Count == 0) return false;
-                var name = cond.Args[0];
-                return state.ConsumeReceivedMessage(name);
+                // posts targeted at trig.Scid. The optional second condition
+                // argument filters the message's first long (SFX1..SFX4 use it).
+                if (!TryGetWorldMessageFilter(cond, out var name, out var arg1)) return false;
+                return state.ConsumeReceivedMessage(name, arg1);
             }
             default:
                 return false;
         }
+    }
+
+    internal static bool TryGetWorldMessageFilter(TriggerCall condition,
+        out string name, out long? arg1)
+    {
+        name = "";
+        arg1 = null;
+        if (!condition.Verb.Equals("receive_world_message", StringComparison.OrdinalIgnoreCase)
+            || condition.Args.Count == 0) return false;
+        name = condition.Args[0];
+        if (condition.Args.Count > 1
+            && long.TryParse(condition.Args[1], NumberStyles.Integer,
+                CultureInfo.InvariantCulture, out var expected))
+            arg1 = expected;
+        return true;
     }
 
     void Dispatch(TriggerInstance trig, TriggerCall act, TriggerContext ctx, bool deferred)
@@ -553,7 +591,7 @@ public sealed class TriggerRuntime
                 var scriptName = act.Args[0];
                 IReadOnlyList<string>? scriptArgs =
                     act.Args.Count > 1 ? act.Args.Skip(1).ToList() : null;
-                ctx.CallSfxScript(scriptName, scriptArgs, trig.Position);
+                ctx.CallSfxScript(scriptName, scriptArgs, trig);
                 return;
             }
             // ALPHA-2B — runtime camera-flag flips on a specific snode:
@@ -591,7 +629,7 @@ public sealed class TriggerRuntime
     /// message into every row's pending-message inbox; rows whose
     /// <c>receive_world_message</c> condition matches will consume the stamp on their
     /// next eval.</summary>
-    public void PostInboundMessage(uint targetScid, string name)
+    public void PostInboundMessage(uint targetScid, string name, long arg1 = 0)
     {
         // SC-TRIGGER-ARM — we_trigger_activate/_deactivate are ACTIVATION
         // messages, not inbox messages: they flip the instance's IsActive.
@@ -605,7 +643,7 @@ public sealed class TriggerRuntime
             if (_instances[i].Scid != targetScid) continue;
             if (arm) _instances[i].IsActive = true;
             else if (disarm) _instances[i].IsActive = false;
-            else _instances[i].DepositMessage(name);
+            else _instances[i].DepositMessage(name, arg1);
         }
     }
 
@@ -628,6 +666,15 @@ public sealed class TriggerRuntime
     /// held fade action: same verb/target keys with the "out"/"out:black"
     /// mode token replaced by "in". Returns false for non-fade verbs and for
     /// actions that were already reveals (those stay sticky).</summary>
+    static bool HasHeldVolumeCondition(TriggerRow row) => row.Conditions.Any(c =>
+        c.Verb.Equals("party_member_within_bounding_box", StringComparison.OrdinalIgnoreCase) ||
+        c.Verb.Equals("party_member_within_sphere", StringComparison.OrdinalIgnoreCase) ||
+        c.Verb.Equals("party_member_within_node", StringComparison.OrdinalIgnoreCase) ||
+        c.Verb.Equals("actor_within_bounding_box", StringComparison.OrdinalIgnoreCase) ||
+        c.Verb.Equals("actor_within_sphere", StringComparison.OrdinalIgnoreCase) ||
+        c.Verb.Equals("go_within_bounding_box", StringComparison.OrdinalIgnoreCase) ||
+        c.Verb.Equals("go_within_sphere", StringComparison.OrdinalIgnoreCase));
+
     static bool TryReverseFadeAction(TriggerCall act, out string[] reversedArgs)
     {
         reversedArgs = Array.Empty<string>();
@@ -681,8 +728,8 @@ public struct TriggerRowState
     /// run more than a couple deep between ticks.</summary>
     InboundMessages _inbox;
 
-    public void DepositMessage(string name) => _inbox.Push(name);
-    public bool ConsumeReceivedMessage(string name) => _inbox.TryConsume(name);
+    public void DepositMessage(string name, long arg1 = 0) => _inbox.Push(name, arg1);
+    public bool ConsumeReceivedMessage(string name, long? arg1 = null) => _inbox.TryConsume(name, arg1);
 
     struct InboundMessages
     {
@@ -690,23 +737,27 @@ public struct TriggerRowState
         // dropped — DS1's tightest trigger chain is never that deep, and a runaway
         // would be a content authoring bug we'd rather catch as "missed expected
         // message" than silently grow an unbounded queue.
-        string? _m0, _m1, _m2, _m3;
+        readonly record struct Received(string Name, long Arg1);
+        Received? _m0, _m1, _m2, _m3;
 
-        public void Push(string name)
+        public void Push(string name, long arg1)
         {
-            if (_m0 is null) { _m0 = name; return; }
-            if (_m1 is null) { _m1 = name; return; }
-            if (_m2 is null) { _m2 = name; return; }
-            if (_m3 is null) { _m3 = name; return; }
+            var message = new Received(name, arg1);
+            if (_m0 is null) { _m0 = message; return; }
+            if (_m1 is null) { _m1 = message; return; }
+            if (_m2 is null) { _m2 = message; return; }
+            if (_m3 is null) { _m3 = message; return; }
             // Inbox full — silently drop. Future SC can add an overflow counter.
         }
 
-        public bool TryConsume(string name)
+        public bool TryConsume(string name, long? arg1)
         {
-            if (_m0 is not null && _m0 == name) { Compact(0); return true; }
-            if (_m1 is not null && _m1 == name) { Compact(1); return true; }
-            if (_m2 is not null && _m2 == name) { Compact(2); return true; }
-            if (_m3 is not null && _m3 == name) { Compact(3); return true; }
+            bool Matches(Received? message) => message is { } m
+                && m.Name == name && (!arg1.HasValue || m.Arg1 == arg1.Value);
+            if (Matches(_m0)) { Compact(0); return true; }
+            if (Matches(_m1)) { Compact(1); return true; }
+            if (Matches(_m2)) { Compact(2); return true; }
+            if (Matches(_m3)) { Compact(3); return true; }
             return false;
         }
 
@@ -780,12 +831,23 @@ public sealed class TriggerInstance
 
     public ref TriggerRowState RowStateAt(int rowIndex) => ref _rowStates[rowIndex];
 
-    public void DepositMessage(string name)
+    public void DepositMessage(string name, long arg1 = 0)
     {
-        // Every row of the matrix sees the same inbox stream — DS1 trigger rows are
-        // sibling listeners, not exclusive. Each row consumes (or doesn't) on its
-        // own evaluation pass.
-        for (int i = 0; i < _rowStates.Length; i++) _rowStates[i].DepositMessage(name);
+        // Sibling rows independently receive messages matching their own
+        // conditions. Unrelated messages must not occupy their bounded inboxes
+        // forever (an SFX2 stream cannot block an SFX1 or death row).
+        for (int i = 0; i < _rowStates.Length; i++)
+        {
+            foreach (var condition in Matrix.Rows[i].Conditions)
+            {
+                if (!TriggerRuntime.TryGetWorldMessageFilter(condition,
+                    out var expectedName, out var expectedArg1)) continue;
+                if (!string.Equals(expectedName, name, StringComparison.Ordinal)
+                    || (expectedArg1.HasValue && expectedArg1.Value != arg1)) continue;
+                _rowStates[i].DepositMessage(name, arg1);
+                break;
+            }
+        }
     }
 }
 
@@ -840,4 +902,10 @@ public class TriggerContext
     /// drive trigger fan-out without dragging the Runtime project in. Live
     /// hosts override to dispatch into <c>SfxRuntime</c>.</summary>
     public virtual void CallSfxScript(string scriptName, IReadOnlyList<string>? args, Vector3 origin) { }
+
+    /// <summary>Pass the originating Game Object so live hosts can resolve
+    /// its orientation and visual anchor. Existing headless contexts keep
+    /// receiving the placement position through the legacy overload.</summary>
+    public virtual void CallSfxScript(string scriptName, IReadOnlyList<string>? args, TriggerInstance trigger)
+        => CallSfxScript(scriptName, args, trigger.Position);
 }

@@ -45,7 +45,8 @@ public sealed class ActorInstance
     public override string ToString() => $"[t:{TemplateName},n:0x{Scid:x8}]";
 }
 
-/// <summary>Loads region object files (<c>objects/actor.gas</c>,
+/// <summary>Loads region object files (<c>objects/actor.gas</c> or the
+/// multiplayer-authored <c>objects/regular/actor.gas</c>,
 /// <c>non_interactive.gas</c>, <c>container.gas</c>, etc.) into a flat list of
 /// <see cref="ActorInstance"/> records. Every DS1 object .gas shares the
 /// <c>[t:T,n:SCID] { [placement] { q,p } }</c> shape, so the same parser
@@ -87,22 +88,84 @@ public static class RegionObjects
     public const string WorldInventoryFile = "inventory.gas";
 
     public static (IReadOnlyList<ActorInstance> Actors, IReadOnlyList<string> Diagnostics) LoadActors(
-        TankReader tank, string regionPath) =>
-        LoadPlacements(tank, regionPath, "actor.gas");
+        TankReader tank, string regionPath, bool multiplayerContent = false) =>
+        LoadPlacements(tank, regionPath, "actor.gas", multiplayerContent);
 
-    /// <summary>Generic placement loader. Reads <c>{regionPath}/objects/{fileName}</c>
+    /// <summary>Candidate paths for one placement layer, in precedence order.
+    /// Original single-player maps normally use the flat <c>objects/</c> form;
+    /// multiplayer-authored maps may put the same layers under
+    /// <c>objects/regular/</c>. The fallback is considered only when the flat
+    /// file is absent, so existing maps and mods retain their override behavior.</summary>
+    public static IReadOnlyList<string> CandidatePlacementPaths(string regionPath, string fileName)
+    {
+        var norm = regionPath.TrimEnd('/');
+        return new[]
+        {
+            norm + "/objects/" + fileName,
+            norm + "/objects/regular/" + fileName,
+        };
+    }
+
+    /// <summary>Returns the distinct placement-layer filenames authored directly
+    /// under <c>objects/</c> or <c>objects/regular/</c>. Difficulty-tier folders
+    /// such as <c>veteran</c> and <c>elite</c> are intentionally excluded: they are
+    /// separate authored variants and must not be inferred from game difficulty.</summary>
+    public static IReadOnlyList<string> PlacementFileNames(TankReader tank, string regionPath)
+    {
+        var prefix = regionPath.TrimEnd('/') + "/objects/";
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in tank.ListFiles())
+        {
+            if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+            var relative = path[prefix.Length..];
+            if (relative.StartsWith("regular/", StringComparison.OrdinalIgnoreCase))
+                relative = relative["regular/".Length..];
+            if (relative.Contains('/')) continue;
+            if (!relative.EndsWith(".gas", StringComparison.OrdinalIgnoreCase)) continue;
+            names.Add(relative);
+        }
+        return names.OrderBy(name => name, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    /// <summary>Applies the authored game-mode flags on a placement.
+    /// <paramref name="multiplayerContent"/> describes the world's authored
+    /// content rules, independently of whether a network session exists.</summary>
+    public static bool IsPlacementEnabled(GasNode node, bool multiplayerContent)
+    {
+        var exclusionFlag = multiplayerContent ? "is_multi_player" : "is_single_player";
+        foreach (var child in node.Children)
+        {
+            if (!string.Equals(child.Header, "common", StringComparison.OrdinalIgnoreCase)) continue;
+            foreach (var attr in child.Attributes)
+            {
+                if (!string.Equals(attr.Name, exclusionFlag, StringComparison.OrdinalIgnoreCase)) continue;
+                if (attr.Value.Trim().Equals("false", StringComparison.OrdinalIgnoreCase)) return false;
+            }
+            break;
+        }
+        return true;
+    }
+
+    /// <summary>Generic placement loader. Reads <c>{regionPath}/objects/{fileName}</c>,
+    /// falling back to <c>{regionPath}/objects/regular/{fileName}</c> when the flat
+    /// file is absent,
     /// and parses every <c>[t:T,n:SCID]</c> root block as an <see cref="ActorInstance"/>.
     /// "ActorInstance" is a misnomer for non-actor files (it just stores the placement
     /// + template name + scid + raw node) but the type already serves as the shared
     /// placement record so we keep one shape across the runtime.</summary>
     public static (IReadOnlyList<ActorInstance> Placements, IReadOnlyList<string> Diagnostics) LoadPlacements(
-        TankReader tank, string regionPath, string fileName)
+        TankReader tank, string regionPath, string fileName, bool multiplayerContent = false)
     {
         var diags = new List<string>();
-        var norm = regionPath.TrimEnd('/');
-        var actorPath = norm + "/objects/" + fileName;
+        string? actorPath = null;
+        foreach (var candidate in CandidatePlacementPaths(regionPath, fileName))
+        {
+            if (!tank.TryGetFile(candidate, out _)) continue;
+            actorPath = candidate;
+            break;
+        }
 
-        if (!tank.TryGetFile(actorPath, out _))
+        if (actorPath is null)
         {
             // Quiet: most region/file combos are simply absent (e.g. trap.gas is
             // empty in fh_r1, elevator.gas only exists in towns). Caller filters.
@@ -129,24 +192,11 @@ public static class RegionObjects
                 diags.Add($"{actorPath}: bad SCID '{scidText}' on [{node.Header}]"); continue;
             }
 
-            // SC-SP-FILTER — DS1 authors mode-exclusive twins (fh_r1 ships an
+            // SC-CONTENT-FILTER — DS1 authors mode-exclusive twins (fh_r1 ships an
             // "SP Norick" with is_multi_player=false AND an "MP Norick" with
-            // is_single_player=false at the same bridge). SiegeFX is
-            // single-player: placements flagged is_single_player=false are
-            // the multiplayer variants and must not spawn, or both twins
-            // appear at once.
-            bool spExcluded = false;
-            foreach (var c in node.Children)
-            {
-                if (!string.Equals(c.Header, "common", StringComparison.OrdinalIgnoreCase)) continue;
-                foreach (var attr in c.Attributes)
-                {
-                    if (!string.Equals(attr.Name, "is_single_player", StringComparison.OrdinalIgnoreCase)) continue;
-                    if (attr.Value.Trim().Equals("false", StringComparison.OrdinalIgnoreCase)) spExcluded = true;
-                }
-                break;
-            }
-            if (spExcluded) continue;
+            // is_single_player=false at the same bridge). Select the authored
+            // content variant; active networking is intentionally irrelevant.
+            if (!IsPlacementEnabled(node, multiplayerContent)) continue;
 
             var placement = node.Children.FirstOrDefault(c =>
                 string.Equals(c.Header, "placement", StringComparison.OrdinalIgnoreCase));
