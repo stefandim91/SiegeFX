@@ -109,9 +109,9 @@ public sealed class TriggerRow
     public bool FlipFlop { get; }
     public bool SingleShot { get; }
     public bool StartActive { get; }
-    /// <summary>Authored `single_player` flag — FALSE marks an MP-only row
-    /// (29 shipped rows across 15 regions author it). A single-player
-    /// session must skip those or MP mood/fade/quest dupes fire in SP.</summary>
+    /// <summary>Authored `single_player` flag — FALSE marks a
+    /// multiplayer-authored row (29 shipped rows across 15 regions author it).
+    /// Eligibility is a world-content rule; it does not imply active networking.</summary>
     public bool SinglePlayer { get; }
     public float ResetDuration { get; }
     public float Delay { get; }
@@ -172,10 +172,10 @@ public sealed class TriggerRow
                 case "reset_duration":  resetDuration = ParseFloat(attr.Value, resetDuration); break;
                 case "delay":           delay = ParseFloat(attr.Value, delay); break;
                 case "occupants_group": occupantsGroup = attr.Value; break;
-                // single_player=false marks MP-only rows — REAL gameplay
+                // single_player=false marks multiplayer-authored rows — REAL gameplay
                 // state, not an editor hint (the old comment was wrong):
-                // shipped rows duplicate moods/fades/quest flips for MP and
-                // must not fire in SP. multi_player / can_self_destruct /
+                // shipped rows duplicate moods/fades/quest flips for MP-authored
+                // worlds. multi_player / can_self_destruct /
                 // dev_instance_text stay runtime-ignored.
                 case "single_player": singlePlayer = ParseBool(attr.Value, singlePlayer); break;
             }

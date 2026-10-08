@@ -59,9 +59,10 @@ public static class ElevatorStore
     /// region (component header contains "hidden_stairwell"). Same file as
     /// the 2-stop elevators; those parse via <see cref="Load"/>.</summary>
     public static (IReadOnlyList<StairwellDef> Defs, IReadOnlyList<string> Diagnostics) LoadStairwells(
-        TankReader tank, string regionPath)
+        TankReader tank, string regionPath, bool multiplayerContent = false)
     {
-        var (placements, diags) = RegionObjects.LoadPlacements(tank, regionPath, FileName);
+        var (placements, diags) = RegionObjects.LoadPlacements(
+            tank, regionPath, FileName, multiplayerContent);
         if (placements.Count == 0) return (Array.Empty<StairwellDef>(), diags);
         var extraDiags = new List<string>();
         var defs = new List<StairwellDef>();
@@ -109,9 +110,10 @@ public static class ElevatorStore
     /// in shipped data; a placement without an <c>elevator_node</c> is logged
     /// by the caller via the returned diagnostics.</summary>
     public static (IReadOnlyList<ElevatorDef> Defs, IReadOnlyList<string> Diagnostics) Load(
-        TankReader tank, string regionPath)
+        TankReader tank, string regionPath, bool multiplayerContent = false)
     {
-        var (placements, diags) = RegionObjects.LoadPlacements(tank, regionPath, FileName);
+        var (placements, diags) = RegionObjects.LoadPlacements(
+            tank, regionPath, FileName, multiplayerContent);
         if (placements.Count == 0) return (Array.Empty<ElevatorDef>(), diags);
 
         var extraDiags = new List<string>(diags);

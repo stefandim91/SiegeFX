@@ -26,8 +26,13 @@ internal static class SaveSelfTest
         var original = new SaveFile
         {
             SchemaVersion = SaveFile.CurrentSchemaVersion,
+            WorldId = "UtraeanPeninsula",
+            SaveSetId = "5a4ad37c-edb9-4974-a7c3-d50f02281a2f",
+            AdventureMode = "SoloAdventure",
+            EngineVersion = "selftest",
             SavedAt    = savedAt,
             RegionPath = "world/maps/multiplayer_world/regions/town_center",
+            PlayerRegion = "/world/maps/multiplayer_world/regions/town_center",
             Player = new PlayerSnapshot
             {
                 Scid          = 0xA1B2C3D4,
@@ -114,8 +119,13 @@ internal static class SaveSelfTest
 
         var failures = new List<string>();
         Check(failures, "SchemaVersion", original.SchemaVersion, loaded.SchemaVersion);
+        Check(failures, "WorldId",       original.WorldId,       loaded.WorldId);
+        Check(failures, "SaveSetId",     original.SaveSetId,     loaded.SaveSetId);
+        Check(failures, "AdventureMode", original.AdventureMode, loaded.AdventureMode);
+        Check(failures, "EngineVersion", original.EngineVersion, loaded.EngineVersion);
         Check(failures, "SavedAt",       original.SavedAt,       loaded.SavedAt);
         Check(failures, "RegionPath",    original.RegionPath,    loaded.RegionPath);
+        Check(failures, "PlayerRegion",  original.PlayerRegion,  loaded.PlayerRegion);
         if (loaded.Player is null) failures.Add("Player block was null after round-trip");
         else
         {
