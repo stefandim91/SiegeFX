@@ -328,8 +328,18 @@ public static class MoodStore
         IReadOnlyDictionary<string, MoodSetting> moods,
         string mapName,
         string regionName)
+        => FindRegionDefaultForMapFolder(moods, "map_" + mapName, regionName);
+
+    /// <summary>Same lookup keyed by the map's folder under <c>world/maps</c>.
+    /// The mood series is named after that folder: <c>map_world_fh_r1_1</c>
+    /// for the Kingdom of Ehb, <c>multiplayer_world_town_center_1</c> for the
+    /// Utraean Peninsula (whose folder has no <c>map_</c> prefix).</summary>
+    public static MoodSetting? FindRegionDefaultForMapFolder(
+        IReadOnlyDictionary<string, MoodSetting> moods,
+        string mapFolder,
+        string regionName)
     {
-        var prefix = $"map_{mapName.ToLowerInvariant()}_{regionName.ToLowerInvariant()}_";
+        var prefix = $"{mapFolder.ToLowerInvariant()}_{regionName.ToLowerInvariant()}_";
         MoodSetting? bestWithBed = null;
         int bestWithBedRank = int.MaxValue;
         MoodSetting? bestAny = null;

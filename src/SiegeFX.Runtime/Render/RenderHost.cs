@@ -271,7 +271,9 @@ public sealed partial class RenderHost : IDisposable
     // player's containing region changes. Map name (e.g. "world") is derived
     // off the launch region path.
     private IReadOnlyDictionary<string, SiegeFX.Core.Assets.MoodSetting>? _moodStore;
-    private string? _moodMapName;
+    // Map folder under world/maps ("map_world", "multiplayer_world"); the
+    // mood series is named after it.
+    private string? _moodMapFolder;
 
     // SC-WEATHER-C — mood-driven weather state (fog/rain/snow/wind/lightning).
     // Fed by region-default mood applies + mood_change trigger actions; read
@@ -14302,7 +14304,7 @@ void main()
                     {
                         var (moods, moodDiags) = SiegeFX.Core.Assets.MoodStore.Load(logicReader);
                         _moodStore = moods;
-                        _moodMapName = DeriveMapName(_regionPath);
+                        _moodMapFolder = DeriveMapFolder(_regionPath);
 
                         // SS-CUSTOM (ED-8) — a SiegeSmith map bundles its own moods at
                         // world/global/moods/<map>/moods.gas inside the MAP tank. Merge
@@ -14337,7 +14339,7 @@ void main()
                         }
                         Console.WriteLine($"  audio: mood store loaded — {moods.Count} moods, " +
                                           $"{regBeds} distinct ambient bed clip(s) registered " +
-                                          $"(map='{_moodMapName ?? "<unknown>"}')");
+                                          $"(map='{_moodMapFolder ?? "<unknown>"}')");
                         foreach (var d in moodDiags) Console.Error.WriteLine($"  mood: {d}");
 
                         // SC-WEATHER-F — the [global_voice] event table that
@@ -36516,6 +36518,21 @@ void main()
     /// <c>/world/maps/map_&lt;map&gt;/regions/&lt;region&gt;</c>. Returns null
     /// when the path doesn't match — the launch path always does, but the
     /// helper guards a custom-mod scenario where regionPath is freelance.</summary>
+    /// <summary>The map's folder under <c>world/maps</c> for any authored world:
+    /// "map_world" (Ehb), "multiplayer_world" (Utraea). <see cref="DeriveMapName"/>
+    /// only recognises the <c>map_</c>-prefixed form.</summary>
+    static string? DeriveMapFolder(string? regionPath)
+    {
+        if (string.IsNullOrEmpty(regionPath)) return null;
+        var norm = regionPath.Replace('\\', '/').TrimEnd('/');
+        const string token = "/maps/";
+        int idx = norm.IndexOf(token, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return null;
+        int start = idx + token.Length;
+        int end = norm.IndexOf('/', start);
+        return end > start ? norm[start..end] : null;
+    }
+
     static string? DeriveMapName(string? regionPath)
     {
         if (string.IsNullOrEmpty(regionPath)) return null;
@@ -36577,13 +36594,13 @@ void main()
     /// we don't yet honor mood_change() trigger actions.</summary>
     private void ApplyAmbientForRegion(string? regionPath)
     {
-        if (_audio is null || _moodStore is null || _moodMapName is null) return;
+        if (_audio is null || _moodStore is null || _moodMapFolder is null) return;
         var regionName = DeriveRegionName(regionPath);
         if (regionName is null) return;
         if (string.Equals(regionName, _activeBedRegion, StringComparison.OrdinalIgnoreCase))
             return;
 
-        var mood = SiegeFX.Core.Assets.MoodStore.FindRegionDefault(_moodStore, _moodMapName, regionName);
+        var mood = SiegeFX.Core.Assets.MoodStore.FindRegionDefaultForMapFolder(_moodStore, _moodMapFolder, regionName);
         _activeBedRegion = regionName;
         if (mood is null)
         {
