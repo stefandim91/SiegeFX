@@ -26451,13 +26451,20 @@ void main()
     /// actor from where the player stands? False when the actor is hidden
     /// with a faded-out layer OR standing a floor above/below.</summary>
     private bool PickableFromPlayerFloor(ActorRenderState s)
-    {
-        var p = s.CurrentTransform.Translation;
-        if (_player is not null
-            && MathF.Abs(p.Y - _player.CurrentTransform.Translation.Y) > PickSameFloorYBand)
-            return false;
-        return !IsActorInFadedSnode(s);
-    }
+        => OnPlayerFloor(s.CurrentTransform.Translation) && !IsActorInFadedSnode(s);
+
+    /// <summary>Same rule for world objects (breakables): a crate in the
+    /// cellar under the player's feet projects onto the screen right where
+    /// the grass is, so without it the hammer cursor and break-click owned
+    /// open ground above every hidden cellar.</summary>
+    private bool PickableFromPlayerFloor(StaticPropInstance prop)
+        => OnPlayerFloor(prop.World.Translation) && !prop.ForceNoRender
+           && !IsAbovePlayer(prop.RegionPath)
+           && !(prop.NodeGuid != 0 && _fadedSnodeCounts.ContainsKey(prop.NodeGuid));
+
+    private bool OnPlayerFloor(Vector3 p)
+        => _player is null
+           || MathF.Abs(p.Y - _player.CurrentTransform.Translation.Y) <= PickSameFloorYBand;
 
     /// <summary>SC-SCREEN-PICK — pick the actor whose SCREEN body the
     /// cursor is on: project the feet→head segment of every candidate to
@@ -30402,7 +30409,7 @@ void main()
         }
         foreach (var prop in _staticProps)
         {
-            if (!prop.IsBreakable || prop.IsDestroyed) continue;
+            if (!prop.IsBreakable || prop.IsDestroyed || !PickableFromPlayerFloor(prop)) continue;
             var self = prop;
             Consider(prop.World.Translation + new Vector3(0f, 0.45f, 0f), 26f,
                 () => { bestEnemy = null; bestProp = self; bestPile = null; });
@@ -30410,6 +30417,7 @@ void main()
         foreach (var pile in _lootPiles)
         {
             if (pile.Throw is not null && pile.Throw.Elapsed < pile.Throw.Duration) continue;
+            if (!OnPlayerFloor(pile.Position)) continue;
             var self = pile;
             Consider(pile.Position + new Vector3(0f, 0.15f, 0f), 22f,
                 () => { bestEnemy = null; bestProp = null; bestPile = self; });
@@ -30881,7 +30889,7 @@ void main()
         float bestDist = ClickBreakableRadius;
         foreach (var prop in _staticProps)
         {
-            if (!prop.IsBreakable || prop.IsDestroyed) continue;
+            if (!prop.IsBreakable || prop.IsDestroyed || !PickableFromPlayerFloor(prop)) continue;
             var pos = prop.World.Translation;
             float dx = pos.X - groundHit.X;
             float dz = pos.Z - groundHit.Z;
@@ -37176,7 +37184,7 @@ void main()
                 float bestPropDist = ClickAttackRadius;
                 foreach (var prop in _staticProps)
                 {
-                    if (!prop.IsBreakable || prop.IsDestroyed) continue;
+                    if (!prop.IsBreakable || prop.IsDestroyed || !PickableFromPlayerFloor(prop)) continue;
                     var pos = prop.World.Translation;
                     float dx = pos.X - groundHit.X;
                     float dz = pos.Z - groundHit.Z;
@@ -38624,7 +38632,7 @@ void main()
             for (int i = 0; i < _lootPiles.Count; i++)
             {
                 var pile = _lootPiles[i];
-                if (pile.Throw is not null) continue;
+                if (pile.Throw is not null || !OnPlayerFloor(pile.Position)) continue;
                 float dx = pile.Position.X - clickPos.X;
                 float dz = pile.Position.Z - clickPos.Z;
                 float d2 = dx * dx + dz * dz;
