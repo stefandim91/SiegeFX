@@ -264,6 +264,10 @@ public sealed class WorldStateSnapshot
     /// <summary>Opening direction of each open leaf. Missing on older saves;
     /// those leaves choose a direction from the restored actor position.</summary>
     public Dictionary<uint, float> DoorSwingSigns { get; set; } = new();
+    /// <summary>Numbered conversation steps each NPC has played, keyed
+    /// "SCID:conversation" (8 hex digits). Missing on older saves: every NPC
+    /// starts from its first visit again.</summary>
+    public Dictionary<string, int> ConversationVisits { get; set; } = new();
     /// <summary>SC-GEN-PERSIST — per-generator activation + remaining-wave
     /// state. Absent on older saves = generators re-arm from region data
     /// (the old behavior: cleared ambushes respawned on every load).</summary>

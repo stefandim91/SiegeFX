@@ -361,6 +361,20 @@ public sealed partial class RenderHost : IDisposable
     // dictionary (and without invalidating the IReadOnly view, which
     // points at this same dict instance).
     private Dictionary<string, SiegeFX.Core.Assets.ConversationDef>? _conversationsMutable;
+    // Each region's own conversations. DS1 conversations are region-local, and
+    // Utraea reuses names per town (every town authors its own
+    // zconversation_directions; conversation_guard_1 exists in three), so an
+    // NPC resolves against its own region before the merged pool.
+    private readonly Dictionary<string, IReadOnlyDictionary<string, SiegeFX.Core.Assets.ConversationDef>>
+        _conversationsByRegion = new(StringComparer.OrdinalIgnoreCase);
+    // Numbered conversation steps each NPC has played, keyed "SCID:conversation";
+    // saved with the world so a reload doesn't re-pitch quests.
+    private readonly Dictionary<string, int> _conversationVisits = new(StringComparer.OrdinalIgnoreCase);
+    // NPCs whose "Directions" button was pressed (job_talk_mp.skrit's GameAuditor
+    // d_0x<scid> flag): their next talk plays the region's zconversation_directions.
+    private readonly HashSet<uint> _directionsRequested = new();
+    // The open conversation authors choice = shop: trade waits for its Shop button.
+    private bool _lastTalkAuthorsShop;
     private readonly List<ActorRenderState> _actors = new();
     private readonly Dictionary<AspMesh, SkinnedMesh> _actorMeshCache = new();
     // Bind-pose bone array cached per unique mesh — reused every frame for zero-clip actors
@@ -14106,6 +14120,8 @@ void main()
         {
             var (convs, convDiags) = SiegeFX.Core.Assets.ConversationStore.Load(mapReader, regionPath);
             foreach (var d in convDiags) Console.WriteLine("  " + d);
+            _conversationsByRegion.Clear();
+            _conversationsByRegion[regionPath.TrimEnd('/')] = convs;
             // Build a mutable merged pool then assign (the field is IReadOnly).
             // First-loaded wins on key collisions: matches DS1's region-local
             // priority (cross-region dialogue goes through quest_state.gas).
@@ -14123,6 +14139,7 @@ void main()
                     {
                         var (nconvs, ndiags) = SiegeFX.Core.Assets.ConversationStore.Load(mapReader, path);
                         foreach (var d in ndiags) Console.WriteLine("  " + d);
+                        _conversationsByRegion[path.TrimEnd('/')] = nconvs;
                         foreach (var kv in nconvs)
                             if (merged.TryAdd(kv.Key, kv.Value)) neighborConvs++;
                     }
@@ -14900,6 +14917,7 @@ void main()
                 try
                 {
                     var (nconvs, _) = SiegeFX.Core.Assets.ConversationStore.Load(mapReader, rp);
+                    _conversationsByRegion[rp.TrimEnd('/')] = nconvs;
                     foreach (var kv in nconvs)
                         if (_conversationsMutable.TryAdd(kv.Key, kv.Value)) convsAdded++;
                 }
@@ -24632,6 +24650,11 @@ void main()
                 if (_dialogueWasOpen && !dlgOpenNow
                     && _lastTalkedActor is { AlignSwitchArmed: true, AlignSwitchOnTalkEnd: true } talked)
                     TriggerAlignmentSwitch(talked, "speech ended");
+                if (_dialogueWasOpen && !dlgOpenNow)
+                {
+                    OnDialogueVisitClosed();
+                    dlgOpenNow = _dialogue.IsOpen; // "Directions" reopens at once
+                }
                 _dialogueWasOpen = dlgOpenNow;
                 // SC-MOB-DOGPILE — rebuild the per-victim melee-attacker
                 // counts each tick; the quarry picker reads them to spread
@@ -29779,23 +29802,24 @@ void main()
         if (_player.IsDead) return false;
         if (_conversations is null || _conversations.Count == 0) return false;
 
-        ActorRenderState? best = null;
-        SiegeFX.Core.Assets.ConversationDef? bestConv = null;
-        SiegeFX.Core.Actors.VendorDefinition? bestVendor = null;
         // SC-SCREEN-PICK — only the talkable body under the cursor. The old
         // planar radius around NPC feet also opened talk from open ground
         // next to them, which the hover cursor (same pick) no longer shows.
         var screenPick = PickFriendlyActorAtCursor(cursorPx);
-        if (screenPick is not null)
-        {
-            var keysSp = SiegeFX.Core.Assets.ConversationStore.KeysFromInstance(screenPick.Actor.Instance.Node);
-            var vdefSp = ResolveVendor(screenPick.Actor.Template);
-            bool hireSp = vdefSp is null && ResolveHireable(screenPick.Actor.Template) is not null;
-            var convSp = PickConversation(keysSp, preferJoinOffer: hireSp);
-            if (convSp is not null || vdefSp is not null)
-            { best = screenPick; bestConv = convSp; bestVendor = vdefSp; }
-        }
-        if (best is null) return false;
+        return screenPick is not null && TalkTo(screenPick);
+    }
+
+    /// <summary>Open a conversation (or a vendor) with <paramref name="best"/>:
+    /// region-local conversation pick, job_talk_mp variants, and the visit the
+    /// NPC is on. Shared by the talk click and the "Directions" button.</summary>
+    private bool TalkTo(ActorRenderState best)
+    {
+        var keys = SiegeFX.Core.Assets.ConversationStore.KeysFromInstance(best.Actor.Instance.Node);
+        var bestVendor = ResolveVendor(best.Actor.Template);
+        bool hire = bestVendor is null && ResolveHireable(best.Actor.Template) is not null;
+        var bestConv = PickConversation(keys, preferJoinOffer: hire, best.Actor.Instance.RegionPath);
+        if (bestConv is null && bestVendor is null) return false;
+        if (bestConv is not null && !hire) bestConv = SelectTalkVariant(best, bestConv);
         // No dialogue tree but the actor is a vendor — open trade directly.
         if (bestConv is null && bestVendor is not null)
         {
@@ -29807,16 +29831,7 @@ void main()
         }
         if (bestConv is null) return false;
 
-        var screenName = _templateStore?.GetAttribute(best.Actor.Template, "common", "screen_name");
-        if (!string.IsNullOrWhiteSpace(screenName))
-        {
-            // common.screen_name comes through quoted in the gas; strip the
-            // wrapping pair if present so the title bar doesn't read "Edward".
-            screenName = screenName.Trim();
-            if (screenName.Length >= 2 && screenName[0] == '"' && screenName[^1] == '"')
-                screenName = screenName[1..^1];
-        }
-        if (string.IsNullOrWhiteSpace(screenName)) screenName = best.Actor.Template.Name;
+        var screenName = ActorScreenName(best);
         _lastTalkedTemplate = best.Actor.Template.Name;
         _lastTalkedActor = best;
         // SC-HIRE-STATS — retail shows the candidate's sheet before you pay:
@@ -29826,10 +29841,40 @@ void main()
             && ResolveHireable(best.Actor.Template) is not null
             && bestConv.Nodes.Any(n => n.IsRecruitOffer))
             bestConv = WithHireStats(bestConv, best);
-        _dialogue.Open(screenName, bestConv);
+        _conversationVisits.TryGetValue(VisitKey(best, bestConv.Key), out int played);
+        // A conversation owns the screen: close any open trade (its auto-opened
+        // inventory follows), so the shop can't sit under the dialog and take
+        // its clicks. A shopkeeper's trade reopens when the visit ends.
+        if (_vendor.IsOpen) _vendor.Close();
+        // Any of the NPC's own conversations, so the directions speech (no Shop
+        // button of its own) doesn't fall back to auto-opening Zabar's trade.
+        _lastTalkAuthorsShop = keys.Any(k =>
+            TryGetConversation(best.Actor.Instance.RegionPath, k, out var c)
+            && c.Nodes.Any(n => n.Choice == "shop"));
+        _dialogue.Open(screenName, bestConv, played);
         Console.WriteLine(
-            $"talk: opened '{bestConv.Key}' with {screenName} ({bestConv.Nodes.Count} node(s))");
+            $"talk: opened '{bestConv.Key}' with {screenName} ({bestConv.Nodes.Count} node(s), " +
+            $"{played} numbered step(s) played before)");
         return true;
+    }
+
+    /// <summary>After a visit closes: remember how far through the numbered steps
+    /// this NPC got, and act on a button value ("Directions" requests the region's
+    /// zconversation_directions, which plays immediately).</summary>
+    private void OnDialogueVisitClosed()
+    {
+        var npc = _lastTalkedActor;
+        if (_dialogue.ConsumeLastVisit() is { } visit && npc is not null)
+            _conversationVisits[VisitKey(npc, visit.Key)] = visit.NumberedStepsPlayed;
+        var value = _dialogue.ConsumePendingButtonValue();
+        if (value is null || !value.StartsWith("d_0x", StringComparison.OrdinalIgnoreCase)) return;
+        if (!uint.TryParse(value.AsSpan(4), System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out var scid)) return;
+        var speaker = _actors.FirstOrDefault(a => a.Actor.Instance.Scid == scid && !a.IsDead);
+        if (speaker is null) return;
+        _directionsRequested.Add(scid);
+        Console.WriteLine($"talk: directions requested from 0x{scid:X8}");
+        TalkTo(speaker);
     }
 
     /// <summary>SC-HIRE-STATS — clone the conversation with the candidate's
@@ -29863,6 +29908,7 @@ void main()
                 IsQuestDialog = n.IsQuestDialog,
                 IsNonInteractive = n.IsNonInteractive,
                 ButtonText = n.ButtonText,
+                ButtonValue = n.ButtonValue,
                 ScrollRate = n.ScrollRate,
             });
         return new SiegeFX.Core.Assets.ConversationDef { Key = conv.Key, Nodes = nodes };
@@ -29876,8 +29922,54 @@ void main()
     /// "...can I come along?" greeting. DS1 drives this with a per-actor
     /// job_talk skrit; without running it we approximate the first-meeting
     /// state, which is correct until a companion can leave and rejoin.</summary>
+    /// <summary>Region-local first (DS1 conversations live per region), then the
+    /// merged pool for actors without a region or cross-region references.</summary>
+    private bool TryGetConversation(string? regionPath, string key,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out SiegeFX.Core.Assets.ConversationDef? conv)
+    {
+        if (!string.IsNullOrEmpty(regionPath)
+            && _conversationsByRegion.TryGetValue(regionPath.TrimEnd('/'), out var local)
+            && local.TryGetValue(key, out conv))
+            return true;
+        conv = null;
+        return _conversations is not null && _conversations.TryGetValue(key, out conv);
+    }
+
+    /// <summary>job_talk_mp.skrit's choice on top of the selected conversation:
+    /// a pending "Directions" request plays the region's zconversation_directions;
+    /// an NPC with an authored [check_level] component switches to its
+    /// <c>_low</c>/<c>_high</c> variant by the player's overall (uber) level.
+    /// ("turn_world_red" isn't modelled yet.)</summary>
+    private SiegeFX.Core.Assets.ConversationDef SelectTalkVariant(
+        ActorRenderState npc, SiegeFX.Core.Assets.ConversationDef selected)
+    {
+        var region = npc.Actor.Instance.RegionPath;
+        if (_directionsRequested.Remove(npc.Actor.Instance.Scid)
+            && TryGetConversation(region, "zconversation_directions", out var directions)
+            && directions.Nodes.Count > 0)
+            return directions;
+        string? Comp(string attr) =>
+            SiegeFX.Core.Assets.TemplateStore.GetNodeAttribute(npc.Actor.Instance.Node, "check_level", attr)
+            ?? _templateStore?.GetAttribute(npc.Actor.Template, "check_level", attr);
+        if (_progression is not null
+            && string.Equals(Comp("check_level")?.Trim(), "true", StringComparison.OrdinalIgnoreCase))
+        {
+            static float F(string? s) => float.TryParse(s?.Trim().TrimEnd('f', 'F'),
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : 1f;
+            float level = _progression.Level, low = F(Comp("low_level")), high = F(Comp("high_level"));
+            string? variant = level < low ? selected.Key + "_low" : level > high ? selected.Key + "_high" : null;
+            if (variant is not null && TryGetConversation(region, variant, out var v) && v.Nodes.Count > 0)
+                return v;
+        }
+        return selected;
+    }
+
+    private static string VisitKey(ActorRenderState npc, string conversationKey) =>
+        $"{npc.Actor.Instance.Scid:X8}:{conversationKey}";
+
     private SiegeFX.Core.Assets.ConversationDef? PickConversation(
-        IReadOnlyList<string> keys, bool preferJoinOffer)
+        IReadOnlyList<string> keys, bool preferJoinOffer, string? regionPath = null)
     {
         if (_conversations is null) return null;
         if (preferJoinOffer)
@@ -29885,7 +29977,7 @@ void main()
             SiegeFX.Core.Assets.ConversationDef? joinHit = null, offerHit = null;
             foreach (var k in keys)
             {
-                if (!_conversations.TryGetValue(k, out var d) || d.Nodes.Count == 0) continue;
+                if (!TryGetConversation(regionPath, k, out var d) || d.Nodes.Count == 0) continue;
                 bool hasOffer = false;
                 foreach (var n in d.Nodes) if (n.IsRecruitOffer) { hasOffer = true; break; }
                 if (!hasOffer) continue;
@@ -29906,9 +29998,9 @@ void main()
             foreach (var k in keys)
             {
                 if (!k.EndsWith("_quest_complete", StringComparison.OrdinalIgnoreCase)) continue;
-                if (!_conversations.TryGetValue(k, out var qc) || qc.Nodes.Count == 0) continue;
+                if (!TryGetConversation(regionPath, k, out var qc) || qc.Nodes.Count == 0) continue;
                 var baseKey = k[..^"_quest_complete".Length];
-                if (!_conversations.TryGetValue(baseKey, out var baseConv)) continue;
+                if (!TryGetConversation(regionPath, baseKey, out var baseConv)) continue;
                 foreach (var n in baseConv.Nodes)
                 {
                     if (!string.IsNullOrWhiteSpace(n.ActivateQuest)
@@ -29918,7 +30010,7 @@ void main()
             }
         }
         foreach (var k in keys)
-            if (_conversations.TryGetValue(k, out var hit) && hit.Nodes.Count > 0) return hit;
+            if (TryGetConversation(regionPath, k, out var hit) && hit.Nodes.Count > 0) return hit;
         return null;
     }
 
@@ -29949,6 +30041,12 @@ void main()
     {
         if (_dialogue.IsOpen) return;
         if (_vendor.IsOpen) return;
+        // DS1's dialogue box has a Shop button on choice = shop steps
+        // (dialogue_shop); trade opens when it's pressed, not after every talk.
+        // Shopkeepers whose conversations never author choice = shop keep the
+        // old open-after-talk so their trade stays reachable.
+        bool shopPressed = _dialogue.ConsumePendingShop();
+        if (_lastTalkAuthorsShop && !shopPressed) return;
         if (string.IsNullOrEmpty(_lastTalkedTemplate)) return;
         var def = _templateStore is not null
                   && _templateStore.TryGet(_lastTalkedTemplate, out var tpl) && tpl is not null
@@ -32315,9 +32413,19 @@ void main()
         // party is addressed (level-up strip, hover readout, tooltips); the
         // template screen_name would read "Farm Boy".
         if (member.IsPlayer && !string.IsNullOrEmpty(_heroName)) return _heroName;
-        if (_templateStore is null) return member.Actor.Template.Name;
-        return _templateStore.GetAttribute(member.Actor.Template, "common", "screen_name")?.Trim().Trim('"')
-               ?? member.Actor.Template.Name;
+        return ActorScreenName(member);
+    }
+
+    /// <summary>An actor's display name: the placement's own [common] screen_name
+    /// first (Elddim's "Utraean Priestess Kelti" is authored on her instance of a
+    /// generic townsfolk template), then the template chain, then the template name.</summary>
+    private string ActorScreenName(ActorRenderState actor)
+    {
+        static string? Clean(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim().Trim('"');
+        return Clean(SiegeFX.Core.Assets.TemplateStore.GetNodeAttribute(actor.Actor.Instance.Node, "common", "screen_name"))
+               ?? (_templateStore is null ? null
+                   : Clean(_templateStore.GetAttribute(actor.Actor.Template, "common", "screen_name")))
+               ?? actor.Actor.Template.Name;
     }
 
     // Class title shown under the name on the sheet — the member template's
@@ -42387,6 +42495,8 @@ void main()
             world.OpenDoors.Add(d.Scid);
             world.DoorSwingSigns[d.Scid] = d.DoorSwingSign;
         }
+        // Conversation visits are world-global (keyed by NPC scid).
+        foreach (var kv in _conversationVisits) world.ConversationVisits[kv.Key] = kv.Value;
         // SC-GEN-PERSIST — every streamed generator's activation + remaining
         // wave; un-streamed rows merge from the loaded save below.
         foreach (var g in _generators)
@@ -43254,6 +43364,11 @@ void main()
         foreach (var snap in save.Actors)
             if (snap.IsDead && snap.Scid < 0xFD000000) _persistedDeadScids.Add(snap.Scid);
         _persistedWorldState = save.World;
+        // Conversation visits follow the save (older saves: everyone from visit 1).
+        _conversationVisits.Clear();
+        _directionsRequested.Clear();
+        if (save.World is { } wsVisits)
+            foreach (var kv in wsVisits.ConversationVisits) _conversationVisits[kv.Key] = kv.Value;
 
         /// <summary>SC-SAVE-AUDIT — one elevator row applied to a live lift.</summary>
         bool ApplyElevatorSnapshot(SiegeFX.Core.Save.ElevatorStopSnapshot es)

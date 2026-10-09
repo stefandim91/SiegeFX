@@ -20,13 +20,18 @@ public sealed class ActorInstance
     public uint Scid { get; }                 // hex-encoded in source; we hold the numeric form
     public NodePlacement Placement { get; }
     public GasNode Node { get; }
+    /// <summary>The region this placement was loaded from ("" for synthetic
+    /// actors). Region-scoped data (conversations) resolves against it first.</summary>
+    public string RegionPath { get; }
 
-    internal ActorInstance(string templateName, uint scid, NodePlacement placement, GasNode node)
+    internal ActorInstance(string templateName, uint scid, NodePlacement placement, GasNode node,
+        string regionPath = "")
     {
         TemplateName = templateName;
         Scid = scid;
         Placement = placement;
         Node = node;
+        RegionPath = regionPath;
     }
 
     /// <summary>Builds an ActorInstance for something not drawn from a region's
@@ -222,7 +227,8 @@ public static class RegionObjects
                 }
             }
 
-            list.Add(new ActorInstance(templateName, scid, new NodePlacement(orient, pos, nodeGuid), node));
+            list.Add(new ActorInstance(templateName, scid, new NodePlacement(orient, pos, nodeGuid), node,
+                regionPath.TrimEnd('/')));
         }
 
         return (list, diags);

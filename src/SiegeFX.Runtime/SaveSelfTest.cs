@@ -120,6 +120,10 @@ internal static class SaveSelfTest
                     [0x03200BF8] = 1f,
                     [0x03200BF9] = -1f,
                 },
+                ConversationVisits = new Dictionary<string, int>
+                {
+                    ["03200C26:conversation_blacksmith_zabar_treseck"] = 1,
+                },
             },
         };
 
@@ -147,6 +151,9 @@ internal static class SaveSelfTest
             foreach (var (scid, sign) in original.World!.DoorSwingSigns)
                 if (!loaded.World.DoorSwingSigns.TryGetValue(scid, out var got) || got != sign)
                     failures.Add($"World.DoorSwingSigns[0x{scid:X8}] did not survive the save");
+            foreach (var (key, played) in original.World!.ConversationVisits)
+                if (!loaded.World.ConversationVisits.TryGetValue(key, out var got) || got != played)
+                    failures.Add($"World.ConversationVisits[{key}] did not survive the save");
         }
         if (loaded.Player is null) failures.Add("Player block was null after round-trip");
         else

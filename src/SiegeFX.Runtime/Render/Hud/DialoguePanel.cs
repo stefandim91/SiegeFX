@@ -59,12 +59,37 @@ public sealed class DialoguePanel
     static readonly (int x0, int y0, int x1, int y1) RAccept   = (205, 145, 297, 161);
     static readonly (int x0, int y0, int x1, int y1) RDecline  = (308, 145, 400, 161);
     static readonly (int x0, int y0, int x1, int y1) RCloseBtn = (471, 165, 563, 181);
+    // button_shop (group shop): shown on choice = shop steps; opens the trade.
+    static readonly (int x0, int y0, int x1, int y1) RShop     = (364, 165, 461, 181);
+    // button_more / button_1 (generic_button_1) share the left slot.
+    static readonly (int x0, int y0, int x1, int y1) RLeftBtn  = (205, 145, 297, 161);
     static readonly (int x0, int y0, int x1, int y1) RCloseX   = (581,  10, 597,  26);
 
     private readonly MenuButton _accept   = new("Accept",   0, 0, 10, 10);
     private readonly MenuButton _decline  = new("Decline",  0, 0, 10, 10);
     private readonly MenuButton _more     = new("More...",  0, 0, 10, 10);
     private readonly MenuButton _continue = new("Continue", 0, 0, 10, 10);
+    private readonly MenuButton _shop     = new("Shop",     0, 0, 10, 10);
+    private readonly MenuButton _button1  = new("",         0, 0, 10, 10);
+
+    /// <summary>The visit ended with the Shop button (choice = shop); the host
+    /// opens the speaker's trade.</summary>
+    public bool PendingShop { get; private set; }
+
+    public bool ConsumePendingShop()
+    {
+        var v = PendingShop;
+        PendingShop = false;
+        return v;
+    }
+
+    // Which buttons a step shows (dialogue_box.gas): Accept/Decline on forks;
+    // More... or the authored button_1 in the left slot; Shop on choice = shop;
+    // Close on every non-fork step.
+    private static bool ShowsMore(DialogueNode n) => !n.IsChoiceFork && n.Choice == "more";
+    private static bool ShowsButton1(DialogueNode n) =>
+        !n.IsChoiceFork && n.Choice != "more" && n.ButtonText.Length > 0;
+    private static bool ShowsShop(DialogueNode n) => n.Choice == "shop";
     private readonly MenuButton _closeX   = new("X",        0, 0, 10, 10);
     // ALPHA-2H — retail's text panel carries a right-edge scrollbar (the
     // authored RText column stops at 545 inside a 564-wide RTextBg for
@@ -101,11 +126,16 @@ public sealed class DialoguePanel
     /// accepted for call-site compatibility but not drawn — DS1's
     /// dialogue_box.gas has no speaker-name control (the portrait/voice
     /// identifies the speaker).</summary>
-    public void Open(string speakerName, ConversationDef conv)
+    public void Open(string speakerName, ConversationDef conv, int numberedStepsPlayed = 0)
     {
         _ = speakerName;
         _conv = conv;
-        _index = 0;
+        // DS1 conversations are per visit: numbered steps play one visit at a
+        // time, then the unnumbered repeat line (see ConversationDef).
+        _numberedPlayed = Math.Max(0, numberedStepsPlayed);
+        _index = conv.StartIndexForVisit(_numberedPlayed);
+        PendingButtonValue = null;
+        PendingShop = false;
         _scroll = 0;
         PendingQuestActivation = null;
         PendingQuestCompletion = null;
@@ -137,16 +167,50 @@ public sealed class DialoguePanel
         return q;
     }
 
+    // Numbered steps this NPC has played across visits (shown, or for an
+    // Accept/Decline fork, accepted). A declined offer stays unplayed so the
+    // next visit offers it again.
+    private int _numberedPlayed;
+
+    /// <summary>Authored <c>button_1_value</c> of the button that ended the visit
+    /// (Utraea's "Directions": <c>d_0x&lt;scid&gt;</c>); the host consumes it.</summary>
+    public string? PendingButtonValue { get; private set; }
+
+    /// <summary>Conversation key and numbered-steps-played of the visit that just
+    /// closed; the host stores it per NPC so the next visit continues from there.</summary>
+    public (string Key, int NumberedStepsPlayed)? LastVisit { get; private set; }
+
+    public (string Key, int NumberedStepsPlayed)? ConsumeLastVisit()
+    {
+        var v = LastVisit;
+        LastVisit = null;
+        return v;
+    }
+
+    public string? ConsumePendingButtonValue()
+    {
+        var v = PendingButtonValue;
+        PendingButtonValue = null;
+        return v;
+    }
+
+    private void MarkPlayed(DialogueNode n)
+    {
+        if (n.Order >= 0) _numberedPlayed = Math.Max(_numberedPlayed, _index + 1);
+    }
+
     private void NoteNodeShown()
     {
         var n = CurrentNode;
         if (n is null) return;
+        if (!n.IsChoiceFork) MarkPlayed(n);
         if (!string.IsNullOrWhiteSpace(n.CompleteQuest))   PendingQuestCompletion   = n.CompleteQuest;
         if (!string.IsNullOrWhiteSpace(n.DeactivateQuest)) PendingQuestDeactivation = n.DeactivateQuest;
     }
 
     public void Close()
     {
+        if (_conv is not null) LastVisit = (_conv.Key, _numberedPlayed);
         IsOpen = false;
         _conv = null;
         CancelAllPresses();
@@ -174,24 +238,25 @@ public sealed class DialoguePanel
 
         Place(_accept,  Px(RAccept,   s, originX));
         Place(_decline, Px(RDecline,  s, originX));
-        var closeBtn = Px(RCloseBtn, s, originX);
-        Place(_more,     closeBtn);
-        Place(_continue, closeBtn);
+        Place(_more,     Px(RLeftBtn, s, originX));
+        Place(_button1,  Px(RLeftBtn, s, originX));
+        Place(_shop,     Px(RShop, s, originX));
+        Place(_continue, Px(RCloseBtn, s, originX));
         Place(_closeX,   Px(RCloseX, s, originX));
 
-        // Retail wording: mid-thread advance reads "More...", the final line
-        // reads "Close" (reference screenshot, conversation.bmp). Authored
-        // button_1_text overrides the advance label on its node (ella,
-        // ordus, tarish, torg, overseer author bespoke labels).
-        bool last = _conv is null || _index >= _conv.Nodes.Count - 1;
+        // Retail wording: "More..." in the left slot, "Close" bottom-right
+        // (reference screenshot, conversation.bmp); authored button_1_text
+        // labels its own left-slot button (Utraea's "Directions"; Ehb's ella,
+        // ordus, tarish, torg, overseer).
         var curNode = (_conv is not null && _index >= 0 && _index < _conv.Nodes.Count)
             ? _conv.Nodes[_index] : null;
-        string advanceLabel = curNode is { ButtonText.Length: > 0 } bn
-            ? bn.ButtonText : "More...";
-        _continue.Label = last
-            ? (curNode is { ButtonText.Length: > 0 } cn ? cn.ButtonText : "Close")
-            : advanceLabel;
-        _more.Label = advanceLabel;
+        // Close ends the visit, except on a narrator banner with lines still
+        // to come (only choice = more chains steps otherwise).
+        bool last = _conv is null || curNode is null || !curNode.IsNonInteractive
+                    || _index >= _conv.Nodes.Count - 1;
+        _continue.Label = last ? "Close" : "More...";
+        _more.Label = "More...";
+        _button1.Label = curNode?.ButtonText ?? "";
 
         // ALPHA-2H — scrollbar arrows hug the text panel's right column.
         var bg = Px(RTextBg, s, originX);
@@ -205,19 +270,16 @@ public sealed class DialoguePanel
         if (!IsOpen) return;
         _closeX.UpdateHover(px, py);
         var node = CurrentNode;
-        if (node is { IsChoiceFork: true })
+        if (node is null) return;
+        if (node.IsChoiceFork)
         {
             _accept.UpdateHover(px, py);
             _decline.UpdateHover(px, py);
         }
-        else if (node is { Choice: "more" })
-        {
-            _more.UpdateHover(px, py);
-        }
-        else
-        {
-            _continue.UpdateHover(px, py);
-        }
+        _continue.UpdateHover(px, py); // dialog_close: shown on every step
+        if (ShowsMore(node)) _more.UpdateHover(px, py);
+        if (ShowsButton1(node)) _button1.UpdateHover(px, py);
+        if (ShowsShop(node)) _shop.UpdateHover(px, py);
     }
 
     public bool OnMouseDown(int px, int py)
@@ -227,19 +289,16 @@ public sealed class DialoguePanel
         _scrollUp.TryPress(px, py);
         _scrollDown.TryPress(px, py);
         var node = CurrentNode;
-        if (node is { IsChoiceFork: true })
+        if (node is null) return true;
+        if (node.IsChoiceFork)
         {
             _accept.TryPress(px, py);
             _decline.TryPress(px, py);
         }
-        else if (node is { Choice: "more" })
-        {
-            _more.TryPress(px, py);
-        }
-        else
-        {
-            _continue.TryPress(px, py);
-        }
+        _continue.TryPress(px, py);
+        if (ShowsMore(node)) _more.TryPress(px, py);
+        if (ShowsButton1(node)) _button1.TryPress(px, py);
+        if (ShowsShop(node)) _shop.TryPress(px, py);
         return true;
     }
 
@@ -258,6 +317,7 @@ public sealed class DialoguePanel
         {
             if (_accept.Release(px, py))
             {
+                MarkPlayed(node);
                 PendingQuestActivation = node.ActivateQuest;
                 // Phase 26 — recruit offer accepted: flag it so the host adds
                 // the speaker to the party. A join node can also carry
@@ -276,13 +336,29 @@ public sealed class DialoguePanel
                 return true;
             }
         }
-        else if (node is { Choice: "more" })
+        if (node is not null && _continue.Release(px, py))
         {
-            if (_more.Release(px, py)) { Advance(); return true; }
+            // Close ends the visit (the next numbered step waits for the next
+            // visit). Narrator banners keep chaining through their lines.
+            if (node.IsNonInteractive) Advance();
+            else Close();
+            return true;
         }
-        else
+        if (node is null) return true;
+        if (ShowsMore(node) && _more.Release(px, py)) { Advance(); return true; }
+        if (ShowsButton1(node) && _button1.Release(px, py))
         {
-            if (_continue.Release(px, py)) { Advance(); return true; }
+            // dialogue_button_1: hand its authored value to the host
+            // (Utraea's "Directions": d_0x<speaker scid>).
+            if (node.ButtonValue.Length > 0) PendingButtonValue = node.ButtonValue;
+            Close();
+            return true;
+        }
+        if (ShowsShop(node) && _shop.Release(px, py))
+        {
+            PendingShop = true; // dialogue_shop
+            Close();
+            return true;
         }
         return true; // consume the up-event regardless so it doesn't fall through
     }
@@ -401,10 +477,10 @@ public sealed class DialoguePanel
             _accept.Draw(bars, text, icons, guiTex, viewportW, viewportH);
             _decline.Draw(bars, text, icons, guiTex, viewportW, viewportH);
         }
-        else if (node.Choice == "more")
-            _more.Draw(bars, text, icons, guiTex, viewportW, viewportH);
-        else
-            _continue.Draw(bars, text, icons, guiTex, viewportW, viewportH);
+        _continue.Draw(bars, text, icons, guiTex, viewportW, viewportH);
+        if (ShowsMore(node)) _more.Draw(bars, text, icons, guiTex, viewportW, viewportH);
+        if (ShowsButton1(node)) _button1.Draw(bars, text, icons, guiTex, viewportW, viewportH);
+        if (ShowsShop(node)) _shop.Draw(bars, text, icons, guiTex, viewportW, viewportH);
 
         // Corner X — the authored red-X raw (b_gui_cmn_button_x_*) when it
         // resolves, MenuButton chrome otherwise.
