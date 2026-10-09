@@ -49,6 +49,9 @@ public sealed class NavFollower
     /// within this much of the next triangle's centroid, it advances the path index.</summary>
     public float GoalRadius { get; set; } = 0.75f;
 
+    /// <summary>XZ distance at which an intermediate funnel corner counts as reached.</summary>
+    private const float CornerRadius = 0.02f;
+
     /// <summary>SC-NAV-STAIR-DIAG — when true, the follower emits a one-line
     /// log on every stuck-recovery attempt + perpendicular escape + give-up.
     /// Default false (the 347 NPC wanderers would drown the log). RenderHost
@@ -569,9 +572,13 @@ public sealed class NavFollower
             float dz = waypoint.Z - Position.Z;
             float distXZ = MathF.Sqrt(dx * dx + dz * dz);
 
-            if (distXZ <= GoalRadius)
+            // Only the goal gets the loose GoalRadius. Intermediate waypoints are
+            // funnel corners: advancing early cuts the corner, and at a ledge rim
+            // that shortcut runs over empty space and the walker stalls on the edge.
+            bool isGoal = _waypointIdx + 1 >= _waypoints.Count;
+            if (distXZ <= (isGoal ? GoalRadius : CornerRadius))
             {
-                if (_waypointIdx + 1 >= _waypoints.Count)
+                if (isGoal)
                 {
                     // Standing on the goal triangle and close to the target: done.
                     Position = new Vector3(Target.X, Mesh.SampleYOnTriangle(_path[^1], Target), Target.Z);
@@ -579,6 +586,10 @@ public sealed class NavFollower
                     ReachedGoal = true;
                     return;
                 }
+                // Stand exactly on the corner: the next leg often runs along a
+                // boundary edge, and starting it a hair off the corner puts the
+                // whole leg just outside the floor.
+                Position = new Vector3(waypoint.X, Position.Y, waypoint.Z);
                 _waypointIdx++;
                 continue;
             }
