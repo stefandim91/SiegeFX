@@ -12669,6 +12669,9 @@ void main()
     /// is on, so non-diag runs pay nothing.</summary>
     private void DiagRecordFrame(double dt)
     {
+        _perfFrames++;
+        _perfStepFrames[Math.Min(_perfSimSteps, _perfStepFrames.Length - 1)]++;
+        _perfSimSteps = 0;
         _diagFrameMs[_diagFrameRingHead] = dt * 1000.0;
         _diagFrameRingHead = (_diagFrameRingHead + 1) % FrameRingSize;
         if (_diagFrameRingFill < FrameRingSize) _diagFrameRingFill++;
@@ -12693,6 +12696,64 @@ void main()
 
         Console.WriteLine($"diag: frame avg={avg:F2}ms p50={p50:F2} p99={p99:F2} max={max:F2}  ({fps:F0} fps, " +
                           $"actors={_actors.Count}, regions={_loadedRegions.Count})");
+        DiagReportStages();
+    }
+
+    // Per-stage frame timing for --diag. PerfMark(stage) charges the time since
+    // the previous mark to that stage; the marks sit at the boundaries of the
+    // big blocks in OnUpdate and OnRender, so one line per stage shows where a
+    // frame goes. "present and wait" is everything between the end of one
+    // OnRender and the start of the next OnUpdate: buffer swap, GPU wait,
+    // the frame limiter and any GC pause.
+    private readonly System.Diagnostics.Stopwatch _perfClock = System.Diagnostics.Stopwatch.StartNew();
+    private long _perfLastTicks;
+    private readonly Dictionary<string, (double Sum, double Max)> _perfStages = new();
+    private readonly List<string> _perfStageOrder = new();
+    private int _perfFrames;
+    private int _perfSimSteps;
+    private readonly int[] _perfStepFrames = new int[4];
+    private int _perfGc0, _perfGc1, _perfGc2;
+    private long _perfAllocated;
+
+    // SIEGEFX_DIAG_SYNC=1 (with --diag) waits for the GPU at every render mark,
+    // so each stage's time includes the GPU work it queued instead of that cost
+    // landing wherever the driver next blocks. Slows the frame; diagnosis only.
+    private readonly bool _perfGpuSync = Environment.GetEnvironmentVariable("SIEGEFX_DIAG_SYNC") == "1";
+
+    private void PerfMark(string stage)
+    {
+        if (!_diagMode) return;
+        if (_perfGpuSync && stage.StartsWith("render:", StringComparison.Ordinal)) _gl?.Finish();
+        long now = _perfClock.ElapsedTicks;
+        double ms = (now - _perfLastTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        _perfLastTicks = now;
+        if (!_perfStages.TryGetValue(stage, out var acc)) _perfStageOrder.Add(stage);
+        _perfStages[stage] = (acc.Sum + ms, Math.Max(acc.Max, ms));
+    }
+
+    private void DiagReportStages()
+    {
+        if (_perfFrames == 0) return;
+        int gc0 = GC.CollectionCount(0), gc1 = GC.CollectionCount(1), gc2 = GC.CollectionCount(2);
+        long allocated = GC.GetTotalAllocatedBytes();
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"diag: stages over {_perfFrames} frames (avg ms / max ms):");
+        foreach (var stage in _perfStageOrder)
+        {
+            var (sum, max) = _perfStages[stage];
+            sb.Append($"\n  {stage,-36} {sum / _perfFrames,6:F2} / {max,6:F2}");
+        }
+        sb.Append($"\n  sim steps per frame: 0={_perfStepFrames[0]} 1={_perfStepFrames[1]} " +
+                  $"2={_perfStepFrames[2]} 3+={_perfStepFrames[3]}");
+        sb.Append($"\n  gc: gen0={gc0 - _perfGc0} gen1={gc1 - _perfGc1} gen2={gc2 - _perfGc2}, " +
+                  $"allocated {(allocated - _perfAllocated) / (1024.0 * 1024.0):F1} MB");
+        Console.WriteLine(sb.ToString());
+        _perfGc0 = gc0; _perfGc1 = gc1; _perfGc2 = gc2;
+        _perfAllocated = allocated;
+        _perfStages.Clear();
+        _perfStageOrder.Clear();
+        _perfFrames = 0;
+        Array.Clear(_perfStepFrames);
     }
 
     /// <summary>Phase 9a entry: load a rigged ASP + a skrit + N PRS clips, then let the
@@ -24176,6 +24237,7 @@ void main()
 
     private void OnUpdate(double dt)
     {
+        PerfMark("present and wait");
         // Re-apply the window/taskbar icon across the first frames of the live
         // loop. GLFW only pushes the icon to the Windows taskbar if events are
         // polled within ~500ms of SetWindowIcon (glfw#2753); OnLoad sets it
@@ -24531,6 +24593,7 @@ void main()
         // SC-COMMANDS — T's track/hold toggle: when holding, the chase snap
         // below is skipped entirely so the camera parks where it is while
         // the party walks away (DS1's [camera_track_toggle]).
+        PerfMark("update: input and small ticks");
         if (_cameraMode == CameraMode.Chase && _player is not null && _nisPhase == NisPhase.Off
             && _camTracking)
         {
@@ -24594,6 +24657,7 @@ void main()
         // 8d. After each tick, poll the host bridge's CurrentAnimIndex; a change means the
         // skrit picked a new sub-anim and we swap clips (reset _animTime so the new clip
         // starts from its first keyframe).
+        PerfMark("update: camera");
         if (_skritRuntime is not null && _skritHost is not null && _skritClips is not null)
         {
             const double stepSec = 1.0 / SkritInstance.FramesPerSecond;
@@ -24623,6 +24687,7 @@ void main()
         // (broadcasts, targeted self-sends) see the updated state. Per-actor AnimTime is
         // advanced by real dt (not step*stepsDone) to keep the visible anim smooth between
         // logic ticks — the skrit state only updates at 20 Hz, but the clip plays at render rate.
+        PerfMark("update: skrit");
         if (_actorRuntime is not null && _actorBus is not null && _actors.Count > 0)
         {
             const double stepSec = 1.0 / SkritInstance.FramesPerSecond;
@@ -24661,6 +24726,7 @@ void main()
             while (_actorTickAccumulator >= stepSec)
             {
                 _actorTickAccumulator -= stepSec;
+                _perfSimSteps++;
                 _actorRuntime.Tick(stepSec);
                 _actorBus.Deliver();
                 if (_triggerRuntime is not null && _triggerCtx is not null)
@@ -25304,6 +25370,7 @@ void main()
             }
         }
 
+        PerfMark("update: actor sim and anim");
         // Phase 21a-3 — periodic region-membership check. We scan only every
         // RegionCheckIntervalSec because the per-snode XZ scan is O(N) over
         // every loaded snode; firing it from every render frame would burn
@@ -25345,6 +25412,7 @@ void main()
                 }
             }
         }
+        PerfMark("update: region check");
     }
 
     // Phase 13a — spawn a single Farmboy PC at the NPC centroid (snapped to the
@@ -38895,6 +38963,7 @@ void main()
 
     private void OnRender(double dt)
     {
+        PerfMark("update-to-render gap");
         if (_gl is null) return;
         _frameStamp++; // ALPHA-PERF — gates once-per-frame uniform uploads
         if (_diagMode) DiagRecordFrame(dt);
@@ -39130,6 +39199,7 @@ void main()
         }
         // ALPHA-2 POINT LIGHTS — select this frame's nearest sources once;
         // every ApplyLightingUniforms call this frame uploads the same set.
+        PerfMark("render: world ticks");
         PickFramePointLights();
         // SC-WEATHER-D — with mood fog active, the void beyond loaded nodes
         // clears to the fog color (retail's linear fog fades the world edge
@@ -39258,6 +39328,7 @@ void main()
             _skinnedMesh.Draw();
         }
 
+        PerfMark("render: lights and clear");
         if (_skinShader is not null && _actors.Count > 0)
         {
             // One draw call per actor. The mesh cache keeps unique ASPs down (DS1 ships ~12
@@ -39616,6 +39687,7 @@ void main()
         // alpha-cutout single-sided quads; backface culling makes half the leaves
         // disappear). The fragment shader handles the alpha discard; no blend
         // state needed for hard cutout.
+        PerfMark("render: actors and equipment");
         if (_meshShader is not null && _staticProps.Count > 0)
         {
             _gl!.Disable(GLEnum.CullFace);
@@ -39742,6 +39814,7 @@ void main()
         // mirrors the skinned-body loop exactly so the club tracks the same
         // pose the body was skinned with; dead actors hold the die-clamp pose
         // with the weapon still in hand unless it dropped into the loot pile.
+        PerfMark("render: static props");
         if (_meshShader is not null)
         {
             bool npcGearShaderBound = false;
@@ -40189,6 +40262,7 @@ void main()
         // the text-overlay pass can draw "Spiked Club" / "Healing Potion" /
         // etc. above each pile (gold, red on hover) without re-resolving.
         _frameLootLabels.Clear();
+        PerfMark("render: npc gear and held items");
         if (_meshShader is not null && _lootPiles.Count > 0)
         {
             _meshShader.Use();
@@ -40390,6 +40464,7 @@ void main()
             }
         }
 
+        PerfMark("render: loot and debris");
         if (_meshShader is not null && _regionInstances.Count > 0)
         {
             _meshShader.Use();
@@ -40473,6 +40548,7 @@ void main()
             ResetAnimatedTextureBinding();
             _meshShader.SetInt("uUvOrient", 0);
         }
+        PerfMark("render: terrain");
 
         // SC-DECALS — projected decal layer (burnt-wood char on the farmhouse doors,
         // blood, ground scorch, drop shadows) over the finished world geometry, before
@@ -40481,6 +40557,7 @@ void main()
         // SC-DECAL-DIAG — F6 toggles the whole decal layer live (dev knob; strip
         // before v1.0). One keypress answers "is that floating thing a decal?".
         if (_decalsVisible) _decalRenderer?.Draw(vp);
+        PerfMark("render: decals");
 
         // ALPHA-2V — blob drop-shadows under actors (Options → Video →
         // Shadows: simple_party = party only, complex_party = everyone).
@@ -40516,8 +40593,10 @@ void main()
         }
 
         // SC-MOUSE-FX — selection rings + the fading destination marker,
+        PerfMark("render: blob shadows");
         // right above the shadows tier so actors still occlude them.
         DrawSelectionWorldFx(vp);
+        PerfMark("render: selection rings");
 
         // Phase 17-SC-E — billboard particles. Sit above the world scene
         // (depth-tested against actors + props) but below the HUD ortho
@@ -40545,9 +40624,11 @@ void main()
         // Cheap per-frame work (a few k-prop scans) and run before the HUD
         // pass so animated states get the same _terrainTime stride the
         // particle systems use.
+        PerfMark("render: particles");
         UpdateCursorState();
         EnsureOsCursorHidden();
 
+        PerfMark("render: cursor pick");
         if (_textRenderer is not null && _textRenderer.HasFont)
         {
             _textRenderer.BeginPass();
@@ -41429,6 +41510,7 @@ void main()
         // SC-SCREENSHOT — grab the completed back buffer as the very last
         // act of the frame, so the capture contains everything (HUD included)
         // exactly as presented.
+        PerfMark("render: hud");
         CaptureScreenshotIfPending();
 
         // SC-RECORD — recorder status lines are produced on encoder
