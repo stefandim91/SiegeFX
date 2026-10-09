@@ -26592,7 +26592,8 @@ void main()
     // quick-teleport list of every region in the map tank.
     // ====================================================================
     private bool _devConsoleOpen;
-    private bool _devGodMode;
+    // God mode = immortality. SIEGEFX_DEV_GOD=1 starts a dev session with it on.
+    private bool _devGodMode = DevHotkeys && Environment.GetEnvironmentVariable("SIEGEFX_DEV_GOD") == "1";
     private string _devItemText = "";
     private bool _devItemFocus;
     private int _devRegionScroll;
@@ -26643,7 +26644,10 @@ void main()
 
     private void TickDevGodMode()
     {
-        if (!_devGodMode || _player is null || _player.IsDead) return;
+        if (_player is null || _player.IsDead) return;
+        // Applied every tick: a load or respawn replaces the hero's combat state.
+        _player.Actor.Combat.Invulnerable = _devGodMode;
+        if (!_devGodMode) return;
         var st = _player.Actor.Stats;
         _player.Actor.Combat.Heal(st.MaxLife);
         _player.Actor.Combat.RestoreMana(st.MaxMana);
