@@ -29743,43 +29743,27 @@ void main()
     // Returns true if the click consumed by opening dialogue; caller then
     // skips the attack path. Hostile-aligned actors (alignment_evil) never
     // open dialogue even if a template author left a stub conversation block.
-    private const float ClickTalkRadius = 3f;
+    /// <summary>SC-SCREEN-PICK — the friendly body under the cursor; shared by
+    /// the talk click and the talk hover cursor so they agree.</summary>
+    private ActorRenderState? PickFriendlyActorAtCursor(Vector2 cursorPx) =>
+        PickActorAtCursor(cursorPx, s =>
+            !s.IsDead && !s.IsPlayer && !s.IsPartyMember && !s.IsEvilAligned && s.IsSelectable
+            && !s.Actor.Template.Name.Equals("norick", StringComparison.OrdinalIgnoreCase));
+
     private bool TryClickToTalk(Vector2 cursorPx)
     {
         if (_nisPhase != NisPhase.Off) return false; // SC-NIS input lockout
         if (_player is null || _window is null || _actors.Count == 0) return false;
         if (_player.IsDead) return false;
         if (_conversations is null || _conversations.Count == 0) return false;
-        var size = _window.FramebufferSize;
-        if (size.X <= 0 || size.Y <= 0) return false;
-
-        float ndcX = (cursorPx.X / size.X) * 2f - 1f;
-        float ndcY = 1f - (cursorPx.Y / size.Y) * 2f;
-        float aspect = (float)size.X / size.Y;
-        if (!Matrix4x4.Invert(_camera.GetViewProjection(aspect), out var invVp)) return false;
-
-        var nearH = Vector4.Transform(new Vector4(ndcX, ndcY, -1f, 1f), invVp);
-        var farH  = Vector4.Transform(new Vector4(ndcX, ndcY,  1f, 1f), invVp);
-        if (MathF.Abs(nearH.W) < 1e-6f || MathF.Abs(farH.W) < 1e-6f) return false;
-        var near = new Vector3(nearH.X / nearH.W, nearH.Y / nearH.W, nearH.Z / nearH.W);
-        var far_ = new Vector3(farH.X  / farH.W,  farH.Y  / farH.W,  farH.Z  / farH.W);
-        var dir  = far_ - near;
-        if (dir.LengthSquared() < 1e-8f || MathF.Abs(dir.Y) < 1e-4f) return false;
-
-        float planeY = _player.CurrentTransform.Translation.Y;
-        float t = (planeY - near.Y) / dir.Y;
-        if (t < 0f) return false;
-        var groundHit = near + dir * t;
 
         ActorRenderState? best = null;
         SiegeFX.Core.Assets.ConversationDef? bestConv = null;
         SiegeFX.Core.Actors.VendorDefinition? bestVendor = null;
-        // SC-SCREEN-PICK — the talkable body under the cursor wins before
-        // the planar radius scan (an NPC on a porch or slope was nearly
-        // unclickable through the plane-at-player-Y projection).
-        var screenPick = PickActorAtCursor(cursorPx, s =>
-            !s.IsDead && !s.IsPlayer && !s.IsPartyMember && !s.IsEvilAligned && s.IsSelectable
-            && !s.Actor.Template.Name.Equals("norick", StringComparison.OrdinalIgnoreCase));
+        // SC-SCREEN-PICK — only the talkable body under the cursor. The old
+        // planar radius around NPC feet also opened talk from open ground
+        // next to them, which the hover cursor (same pick) no longer shows.
+        var screenPick = PickFriendlyActorAtCursor(cursorPx);
         if (screenPick is not null)
         {
             var keysSp = SiegeFX.Core.Assets.ConversationStore.KeysFromInstance(screenPick.Actor.Instance.Node);
@@ -29788,61 +29772,6 @@ void main()
             var convSp = PickConversation(keysSp, preferJoinOffer: hireSp);
             if (convSp is not null || vdefSp is not null)
             { best = screenPick; bestConv = convSp; bestVendor = vdefSp; }
-        }
-        float bestDist = ClickTalkRadius;
-        foreach (var s in _actors)
-        {
-            if (best is not null) break;
-            if (s.IsDead) continue;
-            if (s.IsPlayer) continue;
-            if (s.IsPartyMember) continue;   // Phase 26b — already recruited
-            // SC-ALIGN-SWITCH — a switched (or plain hostile) actor is an
-            // attack target, never a talk target; the header comment always
-            // promised this but no gate existed, so post-speech Gom kept
-            // re-offering his monologue instead of fighting.
-            if (s.IsEvilAligned) continue;
-            // SC-NIS — Norick is the intro's dying storyteller: his monologue
-            // plays as narration during the bridge NIS (OnTalkBeginMessage),
-            // never a click-to-talk panel. DS1 never let the player interact
-            // with him; a test scaffold had him clickable + quest-giving. The
-            // quest still auto-grants from the narration (and on Esc-skip), so
-            // excluding him from the RMB path removes the scaffold cleanly.
-            if (s.Actor.Template.Name.Equals("norick", StringComparison.OrdinalIgnoreCase)) continue;
-            // Intro gizmos (the invisible narrator; the spent sleeping dog) are never
-            // clickable — they don't draw, so they can't be a talk target either.
-            if (s.Hidden) continue;
-            // SC-PICK-FADED + SC-PICK-YBAND — an NPC on a faded-out layer OR
-            // a floor above/below (the ground-floor NPC over the stairwell)
-            // must not swallow clicks as a talk target.
-            if (!PickableFromPlayerFloor(s)) continue;
-            // SC-SELECTABLE — authored is_selectable=false is the general
-            // form of the same rule (the narrator authors it explicitly).
-            if (!s.IsSelectable) continue;
-            // The "has a [conversation] block in the placement" check is a
-            // stronger talkable signal than Stats.IsCombatant: DS1's narrator
-            // template inherits combat stats but is meant to be a static
-            // talker outside NIS scenes, and would otherwise be filtered out.
-            var keys = SiegeFX.Core.Assets.ConversationStore.KeysFromInstance(s.Actor.Instance.Node);
-
-            // Phase 25b — vendors resolve from their template chain
-            // ([store] + store_pcontent). Shops with an empty
-            // [conversation] open trade directly; ones with dialogue get
-            // the trade panel after the conversation closes.
-            var vdef = ResolveVendor(s.Actor.Template);
-            // Phase 26 — a hireable companion ([store] can_sell_self) that
-            // is not yet in the party should greet with its `_join` offer
-            // (the `choice = potential_member` node), not whatever key the
-            // instance happens to list first. Everyone else takes the first
-            // non-empty conversation.
-            bool isHireable = vdef is null && ResolveHireable(s.Actor.Template) is not null;
-            var conv = PickConversation(keys, preferJoinOffer: isHireable);
-            if (conv is null && vdef is null) continue;
-
-            var pos = s.CurrentTransform.Translation;
-            float dx = pos.X - groundHit.X;
-            float dz = pos.Z - groundHit.Z;
-            float d  = MathF.Sqrt(dx * dx + dz * dz);
-            if (d < bestDist) { bestDist = d; best = s; bestConv = conv; bestVendor = vdef; }
         }
         if (best is null) return false;
         // No dialogue tree but the actor is a vendor — open trade directly.
@@ -34075,19 +34004,10 @@ void main()
         // 4) talkable NPC inside the wider talk radius → talk marker.
         if (_conversations is not null && _conversations.Count > 0)
         {
-            float t2 = ClickTalkRadius * ClickTalkRadius;
-            foreach (var s in _actors)
+            // Talk / no-talk marker for one friendly actor, or null when it
+            // shouldn't change the cursor.
+            CursorState? TalkCursorFor(ActorRenderState s)
             {
-                // Skip party members: a recruited companion keeps its conversation,
-                // so without this it still reads as a talkable NPC on hover (which
-                // looks like it "never joined") even though it's in the party.
-                if (s.IsDead || s.IsPlayer || s.IsPartyMember) continue;
-                // SC-SELECTABLE — is_selectable=false actors (the intro
-                // narrator) and hidden gizmos never flip the cursor at all.
-                if (!s.IsSelectable || s.Hidden) continue;
-                var pos = s.CurrentTransform.Translation;
-                float dx = pos.X - groundHit.X, dz = pos.Z - groundHit.Z;
-                if (dx * dx + dz * dz > t2) continue;
                 var keys = SiegeFX.Core.Assets.ConversationStore.KeysFromInstance(s.Actor.Instance.Node);
                 bool talkable = false;
                 foreach (var k in keys)
@@ -34095,13 +34015,18 @@ void main()
                 if (!talkable && ResolveVendor(s.Actor.Template) is not null) talkable = true;
                 // Phase 26b — hireable companions read as interactable too.
                 if (!talkable && !s.IsPartyMember && ResolveHireable(s.Actor.Template) is not null) talkable = true;
-                if (talkable) { _cursorState = CursorState.Talk; return; }
+                if (talkable) return CursorState.Talk;
                 // SC-CURSORS — cursors.gas cursor_initiate: a friendly
                 // non-combatant with nothing to say gets the no-talk marker
                 // instead of silently reading as bare ground.
-                if (!s.Actor.Stats.IsCombatant)
-                { _cursorState = CursorState.NoTalk; return; }
+                return s.Actor.Stats.IsCombatant ? null : CursorState.NoTalk;
             }
+            // SC-SCREEN-PICK — only the body actually under the cursor, exactly
+            // like TryClickToTalk. (A ground radius around the NPC's feet lit
+            // the talk cursor over open grass several pixels away.)
+            if (PickFriendlyActorAtCursor(cursorPx) is { } friendly
+                && TalkCursorFor(friendly) is { } onBody)
+            { _cursorState = onBody; return; }
         }
         // Closed door leaf under the cursor → use hand (TryClickToUseDoor's pick).
         if (PickDoorAtCursor(cursorPx) is not null)
