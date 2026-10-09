@@ -318,8 +318,13 @@ public sealed class ActorSpawner
     /// chore_stances order then leads, which is DS1's unarmed default.</summary>
     int? DeriveStanceFromEquipment(Assets.Template template)
     {
-        var weaponRef = _store.GetAttribute(template, "inventory", "equipment", "es_weapon_hand")?.Trim();
-        var shieldRef = _store.GetAttribute(template, "inventory", "equipment", "es_shield_hand")?.Trim();
+        // A spec naming one item ("#sd_g_c_st_1h_avg:o_avg") stands for that
+        // template; looking the raw spec up found nothing and dropped the
+        // sword-and-shield stance to shield-only.
+        static string? ItemName(string? r) =>
+            r is not null && PcontentResolver.IsSpec(r) ? PcontentResolver.ParseSpec(r).Class : r;
+        var weaponRef = ItemName(_store.GetAttribute(template, "inventory", "equipment", "es_weapon_hand")?.Trim());
+        var shieldRef = ItemName(_store.GetAttribute(template, "inventory", "equipment", "es_shield_hand")?.Trim());
         Assets.Template? weapon = null;
         if (!string.IsNullOrEmpty(weaponRef)) _store.TryGet(weaponRef, out weapon);
         bool shield = false;

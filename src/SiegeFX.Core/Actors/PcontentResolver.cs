@@ -91,6 +91,18 @@ public sealed class PcontentResolver
             }
         }
 
+        // "#<template>[:<modifier>]" names one concrete item rather than a
+        // class (Elddim's guards author #sd_g_c_st_1h_avg:o_avg). Class
+        // buckets and wildcards win when a name is both; the modifier
+        // suffix is not rolled yet, so this yields the plain base item.
+        bool isWildcard = parsed.Class.ToLowerInvariant() is "weapon" or "melee" or "armor" or "spell" or "*";
+        if (!isWildcard && !_byClass.ContainsKey(parsed.Class)
+            && _store.TryGet(parsed.Class, out var named) && named is not null)
+        {
+            templateName = named.Name;
+            return true;
+        }
+
         // Build the candidate bucket. Literal classes hit _byClass
         // directly; wildcards fold across the indexed entries.
         IEnumerable<Entry> candidates = parsed.Class.ToLowerInvariant() switch
@@ -221,9 +233,13 @@ public sealed class PcontentResolver
         var segments = body.Split('/');
         if (segments.Length == 0 || segments[0].Length == 0) return new Spec("", "", false, 0, 0, Rarity.Normal);
 
-        // Class segment: "weapon,r" -> ("weapon", "r")
+        // Class segment: "weapon,r" -> ("weapon", "r"). A ":<modifier>"
+        // suffix ("#sd_g_c_st_1h_avg:o_avg") qualifies a named item; it is
+        // not part of the class/template name.
         string cls, sub;
         var head = segments[0];
+        var colonIx = head.IndexOf(':');
+        if (colonIx >= 0) head = head[..colonIx];
         var commaIx = head.IndexOf(',');
         if (commaIx >= 0) { cls = head[..commaIx]; sub = head[(commaIx + 1)..]; }
         else              { cls = head;            sub = ""; }

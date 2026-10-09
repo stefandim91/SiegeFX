@@ -29251,12 +29251,13 @@ void main()
         string? shieldRef = FromInstanceEquipment("shield_hand")
             ?? store.GetAttribute(tpl, "inventory", "equipment", "es_shield_hand")?.Trim();
 
+        Random? tableRng = null;
         if (weaponRef is null || shieldRef is null)
         {
             var table = SiegeFX.Core.Actors.LootTable.FromTemplate(store, tpl, inst);
             if (table.Equipped.Count > 0)
             {
-                var rng = new Random(unchecked((int)s.Actor.Instance.Scid ^ 0x057EAB));
+                var rng = tableRng = new Random(unchecked((int)s.Actor.Instance.Scid ^ 0x057EAB));
                 void Walk(SiegeFX.Core.Actors.LootBucket bucket)
                 {
                     if (bucket.Entries.Count > 0)
@@ -29271,22 +29272,22 @@ void main()
                     foreach (var c in bucket.Children) Walk(c);
                 }
                 foreach (var b in table.Equipped) Walk(b);
-                // Resolve #club/2-3-style specs to a concrete template with the
-                // same scid rng so the pick is stable across sessions.
-                if (weaponRef is not null && SiegeFX.Core.Actors.PcontentResolver.IsSpec(weaponRef))
-                {
-                    _pcontentResolver ??= new SiegeFX.Core.Actors.PcontentResolver(store);
-                    weaponRef = _pcontentResolver.TryResolve(weaponRef, rng, out var rolled, out _)
-                        ? rolled : null;
-                }
-                if (shieldRef is not null && SiegeFX.Core.Actors.PcontentResolver.IsSpec(shieldRef))
-                {
-                    _pcontentResolver ??= new SiegeFX.Core.Actors.PcontentResolver(store);
-                    shieldRef = _pcontentResolver.TryResolve(shieldRef, rng, out var rolled, out _)
-                        ? rolled : null;
-                }
             }
         }
+        // Resolve #club/2-3-style specs to a concrete template with a per-scid
+        // rng so the pick is stable across sessions. Runs for directly authored
+        // [equipment] specs too ("#sd_g_c_st_1h_avg:o_avg" on Elddim's guards),
+        // which used to skip this and leave the NPC unarmed.
+        // Continuing the loot-table walk's sequence keeps those NPCs' rolls unchanged.
+        var specRng = tableRng ?? new Random(unchecked((int)s.Actor.Instance.Scid ^ 0x057EAB));
+        string? RollSpec(string? itemRef)
+        {
+            if (itemRef is null || !SiegeFX.Core.Actors.PcontentResolver.IsSpec(itemRef)) return itemRef;
+            _pcontentResolver ??= new SiegeFX.Core.Actors.PcontentResolver(store);
+            return _pcontentResolver.TryResolve(itemRef, specRng, out var rolled, out _) ? rolled : null;
+        }
+        weaponRef = RollSpec(weaponRef);
+        shieldRef = RollSpec(shieldRef);
         if (weaponRef is null && shieldRef is null) return;
 
         int FindBone(string name)
