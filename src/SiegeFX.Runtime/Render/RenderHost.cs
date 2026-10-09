@@ -40332,11 +40332,19 @@ void main()
                 if (partyOnly && !(a.IsPlayer || a.IsPartyMember)) continue;
                 var feet = a.CurrentTransform.Translation;
                 if (Vector3.DistanceSquared(feet, shadowEye) > 90f * 90f) continue;
-                // Actor scale rides the world matrix's X basis length.
+                // Actor scale rides the world matrix's X basis length; the
+                // authored scale_base/multiplier (Stats.RenderScale) is applied
+                // at draw time, so it multiplies in separately.
                 float sx = new Vector3(a.CurrentTransform.M11,
                                        a.CurrentTransform.M12,
                                        a.CurrentTransform.M13).Length();
-                _blobShadows.Add(feet, 0.55f * Math.Clamp(sx, 0.4f, 3f));
+                // Size the blob to the creature: its larger bind-pose dimension
+                // of height (Y) and length (Z), relative to a 1.78u human (the
+                // old fixed size). Width is skipped: biped T-pose arms inflate it.
+                // A rat no longer casts a man-sized shadow.
+                var ext = a.GlMesh.Max - a.GlMesh.Min;
+                float body = MathF.Max(ext.Y, ext.Z) / 1.78f;
+                _blobShadows.Add(feet, Math.Clamp(0.55f * sx * a.Actor.Stats.RenderScale * body, 0.1f, 3f));
             }
             _blobShadows.Draw(vp);
         }
