@@ -30383,6 +30383,23 @@ void main()
     /// <summary>Returns true when a combatant (or breakable prop) was under
     /// the click and an attack fired / a walk-up was queued — the LMB context
     /// dispatch uses that to decide between attack and move.</summary>
+    /// <summary>A body far across the map can still sit under the cursor on
+    /// screen. The per-tick chase gives such a target up at once
+    /// (<see cref="MeleeChaseGiveUp"/>), so when only the hero is selected the
+    /// click and the hover cursor treat it as ground: the click falls through
+    /// to move / use (doors, levers) instead of being spent on a dead order.</summary>
+    private bool IsBeyondHeroChase(ActorRenderState target, out SiegeFX.Core.Actors.ActorStats attackerStats,
+        out float reach, out Vector3 heroPos, out float distance)
+    {
+        attackerStats = GetPlayerAttackStats();
+        reach = PlayerEngageReach(attackerStats);
+        heroPos = _playerFollower?.Position ?? _player!.CurrentTransform.Translation;
+        var t = target.CurrentTransform.Translation;
+        distance = MathF.Sqrt((heroPos.X - t.X) * (heroPos.X - t.X) + (heroPos.Z - t.Z) * (heroPos.Z - t.Z));
+        return _selectedPartyIdx.Count == 1 && _selectedPartyIdx.Contains(0)
+            && !_player!.Actor.Combat.Downed && distance > MathF.Max(MeleeChaseGiveUp, reach);
+    }
+
     private bool TryClickToAttack(Vector2 cursorPx)
     {
         if (_nisPhase != NisPhase.Off) return false; // SC-NIS input lockout
@@ -30458,6 +30475,11 @@ void main()
         if (screenPick.Enemy is not null) best = screenPick.Enemy;
         else if (screenPick.Prop is not null) return TryClickToBreakProp(groundHit);
 
+        // A far body under the cursor is not an attack: fall through to move/use.
+        if (IsBeyondHeroChase(best, out var attackerStats, out float reach, out var pPos, out float playerDist))
+            return false;
+        var tPos = best.CurrentTransform.Translation;
+
         // SC-SELECT-MOVE — the enemy click is an attack order to the
         // SELECTION: selected members lock this target (force-attack); the
         // hero only engages when selected. Ordering members onto a foe
@@ -30477,13 +30499,6 @@ void main()
         // per-tick player block walks the follower up and fires the swing
         // when in range. SC-RANGED-PROJECTILE — a bow engages at its
         // authored attack_range so the archer stands off.
-        var attackerStats = GetPlayerAttackStats();
-        float reach = PlayerEngageReach(attackerStats);
-        var pPos = _playerFollower?.Position ?? _player.CurrentTransform.Translation;
-        var tPos = best.CurrentTransform.Translation;
-        float playerDist = MathF.Sqrt(
-            (pPos.X - tPos.X) * (pPos.X - tPos.X) +
-            (pPos.Z - tPos.Z) * (pPos.Z - tPos.Z));
         // SC-PATHING — melee "in reach" must also be UNOBSTRUCTED: an enemy
         // across a fence is close by XZ but the swing would pass through
         // blocked ground; walk up (the A* routes around) instead.
@@ -33899,7 +33914,7 @@ void main()
         // over wins, so a spell page inside a barrel cluster and the barrels
         // themselves are BOTH reachable — the player chooses by pointing.
         var pick = PickInteractiveAtCursor(_currentMousePos);
-        if (pick.Enemy is not null)
+        if (pick.Enemy is not null && (spellMode || !IsBeyondHeroChase(pick.Enemy, out _, out _, out _, out _)))
         {
             _cursorState = spellMode ? CursorState.CastAttack : CursorState.Attack;
             return;
