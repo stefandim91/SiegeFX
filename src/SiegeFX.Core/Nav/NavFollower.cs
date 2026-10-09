@@ -71,7 +71,11 @@ public sealed class NavFollower
 
     private readonly List<int> _path = new();
     private readonly List<Vector3> _waypoints = new();
-    private readonly NavPathfinder.Workspace _workspace = new();
+    // One A* workspace per thread, shared by every follower: a search runs to
+    // completion before the next starts, and each workspace grows to the whole
+    // mesh (~8 MB at 187k triangles), so one per actor cost GBs on streaming.
+    [ThreadStatic] private static NavPathfinder.Workspace? t_workspace;
+    private static NavPathfinder.Workspace SharedWorkspace => t_workspace ??= new NavPathfinder.Workspace();
     private int _pathIdx;
     private int _waypointIdx;
 
@@ -402,7 +406,7 @@ public sealed class NavFollower
             PathBlocked = true;
             return;
         }
-        if (!NavPathfinder.TryFindPath(Mesh, startTri, goalTri, _path, _workspace, Traversal))
+        if (!NavPathfinder.TryFindPath(Mesh, startTri, goalTri, _path, SharedWorkspace, Traversal))
         {
             if (TryPartialGoal(startTri)) return;
             PathBlocked = true;

@@ -5676,6 +5676,7 @@ public sealed partial class RenderHost : IDisposable
                         psi.ArgumentList.Add(asmPath);
                     else ok = false;
                 }
+                if (_diagMode) psi.ArgumentList.Add("--diag");
                 if (ok) System.Diagnostics.Process.Start(psi);
             }
         }
@@ -12754,6 +12755,70 @@ void main()
         _perfStages[stage] = (acc.Sum + ms, Math.Max(acc.Max, ms));
     }
 
+    // Region-change step timing for --diag: one line per step of
+    // OnPlayerRegionChanged, plus GC activity across the whole change.
+    private readonly System.Diagnostics.Stopwatch _regionStepClock = new();
+    private long _regionStepLast;
+    private int _regionGc0, _regionGc1, _regionGc2;
+    private long _regionAllocated;
+
+    private void RegionStepBegin()
+    {
+        if (!_diagMode) return;
+        _regionStepClock.Restart();
+        _regionStepLast = 0;
+        _regionGc0 = GC.CollectionCount(0);
+        _regionGc1 = GC.CollectionCount(1);
+        _regionGc2 = GC.CollectionCount(2);
+        _regionAllocated = GC.GetTotalAllocatedBytes();
+        _regionStepBytes = 0;
+        _subTimes.Clear();
+    }
+
+    private long _regionStepBytes;
+
+    private void RegionStep(string step)
+    {
+        if (!_diagMode || !_regionStepClock.IsRunning) return;
+        long now = _regionStepClock.ElapsedTicks;
+        double ms = (now - _regionStepLast) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        _regionStepLast = now;
+        long bytes = GC.GetTotalAllocatedBytes();
+        double mb = (bytes - (_regionStepBytes == 0 ? _regionAllocated : _regionStepBytes)) / (1024.0 * 1024.0);
+        _regionStepBytes = bytes;
+        Console.WriteLine($"  [region-time] {step,-38} {ms,8:F1} ms {mb,8:F0} MB");
+        foreach (var (label, (ticks, alloc, calls)) in _subTimes)
+            Console.WriteLine($"  [region-time]     {label,-34} {ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency,8:F1} ms " +
+                              $"{alloc / (1024.0 * 1024.0),8:F0} MB  ({calls} calls)");
+        _subTimes.Clear();
+    }
+
+    // Sub-step timing inside a region step: wrap a call with
+    // var t = SubBegin(); ...; SubEnd("label", t); it's charged to the
+    // next RegionStep line. No-op unless --diag.
+    private readonly Dictionary<string, (long Ticks, long Bytes, int Calls)> _subTimes = new();
+
+    private (long Ticks, long Bytes) SubBegin()
+        => _diagMode ? (System.Diagnostics.Stopwatch.GetTimestamp(), GC.GetTotalAllocatedBytes()) : default;
+
+    private void SubEnd(string label, (long Ticks, long Bytes) start)
+    {
+        if (!_diagMode) return;
+        _subTimes.TryGetValue(label, out var acc);
+        _subTimes[label] = (acc.Ticks + System.Diagnostics.Stopwatch.GetTimestamp() - start.Ticks,
+                            acc.Bytes + GC.GetTotalAllocatedBytes() - start.Bytes, acc.Calls + 1);
+    }
+
+    private void RegionStepEnd()
+    {
+        if (!_diagMode || !_regionStepClock.IsRunning) return;
+        _regionStepClock.Stop();
+        Console.WriteLine($"  [region-time] total {_regionStepClock.Elapsed.TotalMilliseconds:F1} ms; " +
+                          $"gc gen0={GC.CollectionCount(0) - _regionGc0} gen1={GC.CollectionCount(1) - _regionGc1} " +
+                          $"gen2={GC.CollectionCount(2) - _regionGc2}, allocated " +
+                          $"{(GC.GetTotalAllocatedBytes() - _regionAllocated) / (1024.0 * 1024.0):F0} MB");
+    }
+
     private void DiagReportStages()
     {
         if (_perfFrames == 0) return;
@@ -14554,7 +14619,9 @@ void main()
                 var meshIdx = navMapTank is not null
                     ? SnoMeshIndex.Build(new TankReader(navMapTank), terrainReader)
                     : SnoMeshIndex.Build(terrainReader);
-                var navCache = new Dictionary<uint, SnoModel?>();
+                // Fill the cache RebuildNavMesh shares, so the first region
+                // change after load doesn't parse every loaded SNO again.
+                var navCache = _navSnoCache;
                 SnoModel? ResolveNav(uint meshGuid)
                 {
                     if (navCache.TryGetValue(meshGuid, out var hit)) return hit;
@@ -14969,7 +15036,9 @@ void main()
         else
             Console.WriteLine($"[region] expanding ring around '{newRegion}' (anchor stays '{prev}')");
 
+        RegionStepBegin();
         var newlyLoaded = PreloadAroundRegion(newRegion);
+        RegionStep("preload terrain");
         if (newlyLoaded.Count == 0)
         {
             // Player walked into an already-loaded region — no streaming work to
@@ -15029,7 +15098,9 @@ void main()
         // newlyLoaded: an elevator parsed earlier but deferred because its
         // connect node hadn't streamed yet retries now (placed ones skip via
         // _elevatorsByScid).
+        RegionStep("actor + conversation load");
         LoadElevators(_worldRegionGraphs.Select(t => t.Path));
+        RegionStep("elevators");
 
         // Rebuild the nav mesh against the full unified scope so newly-loaded
         // floor tris weld to the original ring. Every live follower is
@@ -15037,7 +15108,9 @@ void main()
         // against outdated obstacle marks and froze); the player follower
         // is reseated below so the PC can walk onto the new terrain.
         var newNav = RebuildNavMesh();
+        RegionStep("nav mesh rebuild");
         if (newNav is not null) { _navMesh = newNav; RehomeAllFollowers(newNav); }
+        RegionStep("rehome followers");
         // SC-NAV-OBSTACLE-AVOID audit fold — re-mark obstacles
         // against the freshly-built navmesh BEFORE LoadStaticProps
         // adds the new region's props. After LoadStaticProps runs
@@ -15045,6 +15118,7 @@ void main()
         // means a brief window where the player could click toward
         // an old region's wall on the new mesh is closed.
         MarkAllObstacles();
+        RegionStep("mark obstacles");
 
         // SC-PERSIST-STREAM — actors the save (or this session) already killed
         // don't respawn when their region streams in.
@@ -15058,11 +15132,18 @@ void main()
 
         // Spawn new actors and attach them to the render/tick lists with the
         // new nav mesh so their wander followers see the freshly-streamed floor.
+        var spawnT = SubBegin();
         var newActors = _actorSpawner.Spawn(newInstances);
+        SubEnd("actors: spawn", spawnT);
         // SC-ACTOR-TRIGGERS — streamed actors register their embedded
         // trigger matrices too (matrix-less placements skip inside).
+        spawnT = SubBegin();
         _actorSpawner.SpawnTriggers(newInstances);
+        SubEnd("actors: triggers", spawnT);
+        spawnT = SubBegin();
         var (onMesh, offMesh) = AttachActorsToScene(newActors, newNav);
+        SubEnd("actors: attach to scene", spawnT);
+        RegionStep("spawn + attach actors");
         // SC-PENDING-ACTORS — apply saved ALIVE state (life/position/
         // hidden/pinned pose) to actors whose region streamed after the
         // load; without this a wounded enemy two regions from the save
@@ -15119,7 +15200,9 @@ void main()
         // Phase 21c — densify the freshly-streamed regions with their static
         // props too. Existing props from previously-loaded regions stay in
         // _staticProps untouched (world coords are pinned).
+        RegionStep("actor save state");
         LoadStaticProps(newlyLoaded);
+        RegionStep("static props");
         LoadWorldInventory(newlyLoaded);
         LoadGenerators(newlyLoaded);
         // SC-GEN-PERSIST — the freshly streamed regions' generators pick up
@@ -15151,6 +15234,7 @@ void main()
         LoadBlockingGizmos(newlyLoaded);
         LoadPointLights(newlyLoaded);
         AssignPatrolRoutes();
+        RegionStep("inventory, generators, gizmos, lights");
 
         // SC-DECALS-STREAM — extend the drape sampler with the new regions'
         // nodes and register their decals (after LoadStaticProps so wall
@@ -15173,6 +15257,7 @@ void main()
             }
         }
 
+        RegionStep("decals");
         // SC-PERSIST-STREAM — the streamed regions' fresh props re-apply the
         // loaded save's world history (looted chests stay open, broken
         // barrels stay broken — closes the reload-and-refarm loop).
@@ -15218,6 +15303,8 @@ void main()
                 if (nav is not null) { _navMesh = nav; MarkAllObstacles(); RehomeAllFollowers(nav); }
             }
         }
+        RegionStep("save ledgers");
+        RegionStepEnd();
     }
 
     /// <summary>Phase 21c — resolve and cache the albedo texture for an actor or
@@ -15686,7 +15773,9 @@ void main()
         // neighbor ring, regionPaths holds the newly-loaded NEIGHBORS, and
         // keying off .First() lit the world with a region the player isn't in.
         var lightRegion = _currentPlayerRegion ?? regionPaths.FirstOrDefault();
+        var lightT = SubBegin();
         if (lightRegion is not null) LoadRegionLighting(lightRegion);
+        SubEnd("props: region lighting", lightT);
 
         var mapReader = new TankReader(_playMapTank);
         int considered = 0, spawned = 0, missingTemplate = 0, missingModel = 0,
@@ -15707,8 +15796,10 @@ void main()
         {
             foreach (var fileName in SiegeFX.Core.Assets.RegionObjects.StaticPropFiles)
             {
+                var placeT = SubBegin();
                 var (placements, diags) =
                     SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, fileName, multiplayerContent: MultiplayerContent);
+                SubEnd("props: parse placement files", placeT);
                 foreach (var d in diags) Console.WriteLine("  " + d);
 
                 foreach (var p in placements)
@@ -15739,7 +15830,9 @@ void main()
                         continue;
                     }
 
+                    var subT = SubBegin();
                     var asp = GetOrLoadPropAsp(modelName);
+                    SubEnd("props: load asp", subT);
                     if (asp is null)
                     {
                         missingMesh++;
@@ -15749,14 +15842,18 @@ void main()
                     }
 
                     StaticMesh glMesh;
+                    subT = SubBegin();
                     if (!_propGlMeshCache.TryGetValue(asp, out glMesh!))
                     {
                         try { glMesh = new StaticMesh(_gl, asp); }
                         catch { parseFail++; continue; }
                         _propGlMeshCache[asp] = glMesh;
                     }
+                    SubEnd("props: gl mesh", subT);
 
+                    subT = SubBegin();
                     var tex = ResolveAspTexture(asp);
+                    SubEnd("props: texture", subT);
                     var nodeLocalWorld = ComposePlacementLocal(asp, p.Placement);
                     var world = ComposePlacementWorld(asp, p.Placement);
 
@@ -16102,7 +16199,12 @@ void main()
                         CenterY       = world.Translation.Y,
                         Source        = p.Node,
                     };
-                    if (isLever) ConfigureLeverPose(inst, template!, p);
+                    if (isLever)
+                    {
+                        subT = SubBegin();
+                        ConfigureLeverPose(inst, template!, p);
+                        SubEnd("props: lever pose", subT);
+                    }
                     _staticProps.Add(inst);
                     if (_elevatorNodeOverrides.ContainsKey(inst.NodeGuid))
                     {
@@ -16184,7 +16286,9 @@ void main()
         // region's props, so rolling-region rebuilds at
         // OnPlayerRegionChanged dropped every previously-marked
         // obstacle silently.
+        var markT = SubBegin();
         MarkAllObstacles();
+        SubEnd("props: mark obstacles", markT);
         Console.WriteLine($"  static props: {spawned}/{considered} placed " +
                           $"({_propGlMeshCache.Count} unique mesh(es); " +
                           $"skipped {missingTemplate} no-template, {missingModel} no-model, " +
@@ -23936,19 +24040,27 @@ void main()
     private SiegeFX.Core.Nav.NavMesh? RebuildNavMesh()
     {
         if (_regionTerrainTankPath is null || _regionLayout is null) return null;
+        TankFile? terrainTank = null, navMapTank = null;
         try
         {
-            using var terrainTank = TankFile.Open(_regionTerrainTankPath);
-            var terrainReader = new TankReader(terrainTank);
-            // SS-CUSTOM — index the map tank too so bundled custom .sno tiles contribute walkable nav on rebuild.
-            using var navMapTank = _regionMapTankPath is not null ? TankFile.Open(_regionMapTankPath) : null;
-            var meshIdx = navMapTank is not null
-                ? SnoMeshIndex.Build(new TankReader(navMapTank), terrainReader)
-                : SnoMeshIndex.Build(terrainReader);
-            var navCache = new Dictionary<uint, SnoModel?>();
+            // Parsed SNOs are immutable, so they're kept across rebuilds; only a
+            // piece not seen before (normally just the newly streamed region's)
+            // opens the tanks and builds the mesh index, once per rebuild.
+            SnoMeshIndex? meshIdx = null;
+            var navCache = _navSnoCache;
             SnoModel? ResolveNav(uint meshGuid)
             {
                 if (navCache.TryGetValue(meshGuid, out var hit)) return hit;
+                if (meshIdx is null)
+                {
+                    terrainTank = TankFile.Open(_regionTerrainTankPath);
+                    var terrainReader = new TankReader(terrainTank);
+                    // SS-CUSTOM — index the map tank too so bundled custom .sno tiles contribute walkable nav on rebuild.
+                    navMapTank = _regionMapTankPath is not null ? TankFile.Open(_regionMapTankPath) : null;
+                    meshIdx = navMapTank is not null
+                        ? SnoMeshIndex.Build(new TankReader(navMapTank), terrainReader)
+                        : SnoMeshIndex.Build(terrainReader);
+                }
                 SnoModel? m = null;
                 var b = meshIdx.LoadSnoBytes(meshGuid);
                 if (b is not null)
@@ -23984,7 +24096,9 @@ void main()
             // SC-ELEVATOR — car nodes bake at their current stop (not the BFS
             // pose) and carry their current-stop door pairing for the stitcher.
             navGraph = InjectElevatorDoorLinks(navGraph);
+            var buildT = SubBegin();
             var nav = SiegeFX.Core.Nav.NavMesh.BuildForRegion(navGraph, EffectiveNavLayout(), ResolveNav);
+            SubEnd("nav: build mesh (incl. sno loads)", buildT);
             // A fresh mesh starts with every triangle visible; live fade state
             // (fade-group hides, single-node fades, camera_fade) must carry
             // over or the pathfinder briefly routes across hidden upper floors
@@ -24006,7 +24120,16 @@ void main()
             Console.Error.WriteLine($"  !! nav mesh rebuild failed: {ex.Message}");
             return null;
         }
+        finally
+        {
+            navMapTank?.Dispose();
+            terrainTank?.Dispose();
+        }
     }
+
+    // Parsed nav SNOs by mesh guid, shared by every RebuildNavMesh (null =
+    // missing or unparsable, cached too so it isn't retried each rebuild).
+    private readonly Dictionary<uint, SnoModel?> _navSnoCache = new();
 
     /// <summary>Phase 21a-3 — attach a freshly-spawned batch of actors to the
     /// render/tick lists. Mirrors the per-actor work LoadPlayActors does in its
@@ -25988,6 +26111,7 @@ void main()
                 if (!string.IsNullOrEmpty(asmPath) && System.IO.File.Exists(asmPath))
                     psi.ArgumentList.Add(asmPath);
             }
+            if (_diagMode) psi.ArgumentList.Add("--diag");
             System.Diagnostics.Process.Start(psi);
             Console.WriteLine("[defeat] returning to main menu (relaunch)");
             _window.Close();
@@ -27137,6 +27261,7 @@ void main()
             psi.ArgumentList.Add(logic);
             psi.ArgumentList.Add(objects);
             psi.ArgumentList.Add(regionPath);
+            if (_diagMode) psi.ArgumentList.Add("--diag");
             psi.Environment["SIEGEFX_DIFFICULTY"] = _difficulty.ToString();
             psi.Environment["SIEGEFX_NOVIDEO"] = "1";
             psi.Environment["SIEGEFX_CREATOR"] = "0";

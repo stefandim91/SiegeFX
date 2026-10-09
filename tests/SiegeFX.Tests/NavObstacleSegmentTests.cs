@@ -60,3 +60,39 @@ public class NavObstacleSegmentTests
             LeafB + new Vector3(0, 10, 0), 0.15f, 10f, 12.5f, "door"));
     }
 }
+
+public class NavObstacleGridTests
+{
+    // 24×12 floor: the 4-unit lookup grid spans several cells each way, so a
+    // disc across a cell corner must still reach triangles in every cell.
+    private static NavMesh Field() => NavTestMeshes.FromCells(NavTestMeshes.Rect(0, 0, 23, 11));
+
+    [Theory]
+    [InlineData(8f, 4f, 1.5f)]   // centred on a grid corner
+    [InlineData(13.3f, 6.7f, 3f)]
+    [InlineData(0.2f, 0.2f, 2f)] // at the mesh edge
+    public void Disc_blocks_every_triangle_whose_centroid_it_covers(float x, float z, float r)
+    {
+        var mesh = Field();
+        mesh.MarkObstacle(x, z, r, 0f, 2f, "prop");
+        for (int t = 0; t < mesh.TriangleCount; t++)
+        {
+            var c = mesh.Centroids[t];
+            if (Vector2.Distance(new(c.X, c.Z), new(x, z)) <= r)
+                Assert.True(mesh.IsBlocked(t), $"triangle {t} at ({c.X:F2}, {c.Z:F2}) was missed");
+        }
+    }
+
+    [Fact]
+    public void Disc_leaves_triangles_far_away_alone()
+    {
+        var mesh = Field();
+        mesh.MarkObstacle(8f, 4f, 1.5f, 0f, 2f, "prop");
+        for (int t = 0; t < mesh.TriangleCount; t++)
+        {
+            var c = mesh.Centroids[t];
+            if (Vector2.Distance(new(c.X, c.Z), new(8f, 4f)) > 3f)
+                Assert.False(mesh.IsBlocked(t));
+        }
+    }
+}
