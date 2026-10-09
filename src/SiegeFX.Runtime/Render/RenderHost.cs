@@ -19923,20 +19923,23 @@ void main()
             bool closedDoor = prop.IsDoor && !prop.DoorTargetOpen;
             if (prop.IsDoor && !closedDoor) continue;
             if (!_templateStore.TryGet(prop.Template, out var tpl)) continue;
-            if (!closedDoor)
+            if (closedDoor)
             {
-                // SC-PATHING — the authored walk-blocking field is [aspect]
-                // does_block_path ("prevents another from walking through it"),
-                // set true on the base non_interactive chain with explicit
-                // opt-outs (the *_nonblocking family). The old is_collidable
-                // read was the PROJECTILE flag and explicit-only, so fences and
-                // walls never blocked the nav mesh — mobs and clicks pathed
-                // straight through their line while the visuals said otherwise.
-                var blockAttr = _templateStore.GetAttribute(tpl, "aspect", "does_block_path")
-                             ?? _templateStore.GetAttribute(tpl, "physics", "does_block_path");
-                var blockTrim = (blockAttr ?? "").Trim().Trim('"').ToLowerInvariant();
-                if (blockTrim != "true" && blockTrim != "1") continue;
+                int leafMarked = MarkClosedDoorLeaf(prop);
+                if (leafMarked > 0) { obstacles++; triangles += leafMarked; }
+                continue;
             }
+            // SC-PATHING — the authored walk-blocking field is [aspect]
+            // does_block_path ("prevents another from walking through it"),
+            // set true on the base non_interactive chain with explicit
+            // opt-outs (the *_nonblocking family). The old is_collidable
+            // read was the PROJECTILE flag and explicit-only, so fences and
+            // walls never blocked the nav mesh — mobs and clicks pathed
+            // straight through their line while the visuals said otherwise.
+            var blockAttr = _templateStore.GetAttribute(tpl, "aspect", "does_block_path")
+                         ?? _templateStore.GetAttribute(tpl, "physics", "does_block_path");
+            var blockTrim = (blockAttr ?? "").Trim().Trim('"').ToLowerInvariant();
+            if (blockTrim != "true" && blockTrim != "1") continue;
             // World-space XZ radius: transform the local AABB's 4
             // XZ corners (Y collapsed) by the placement matrix,
             // then take the max distance from the translation
@@ -20058,6 +20061,49 @@ void main()
             Console.WriteLine($"  nav obstacles: {obstacles} props blocked {triangles} triangles, " +
                               $"{_sightOccluders.Count} sight-occluder disc(s)");
     }
+
+    /// <summary>SC-DOORS-BLOCK — a closed door seals its doorway along the leaf
+    /// itself. The leaf is a thin board hinged at the placement origin, so the
+    /// old bounding disc (radius = leaf width, centred on the hinge) also
+    /// blocked the step or porch in front of the door and the hero couldn't
+    /// walk up to it. Returns the number of triangles blocked.</summary>
+    private int MarkClosedDoorLeaf(StaticPropInstance prop)
+    {
+        if (_navMesh is null) return 0;
+        // Plan-view footprint of the leaf: its two farthest-apart box corners
+        // run along the board whatever the mesh's local axis convention.
+        var min = prop.Mesh.Min;
+        var max = prop.Mesh.Max;
+        Span<Vector3> world = stackalloc Vector3[8];
+        float baseY = float.PositiveInfinity, topY = float.NegativeInfinity;
+        for (int i = 0; i < 8; i++)
+        {
+            var local = new Vector3((i & 1) == 0 ? min.X : max.X,
+                                    (i & 2) == 0 ? min.Y : max.Y,
+                                    (i & 4) == 0 ? min.Z : max.Z);
+            world[i] = Vector3.Transform(local, prop.World);
+            baseY = MathF.Min(baseY, world[i].Y);
+            topY = MathF.Max(topY, world[i].Y);
+        }
+        Vector3 a = world[0], b = world[0];
+        float best = -1f;
+        for (int i = 0; i < 8; i++)
+        for (int j = i + 1; j < 8; j++)
+        {
+            float dx = world[j].X - world[i].X, dz = world[j].Z - world[i].Z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 > best) { best = d2; a = world[i]; b = world[j]; }
+        }
+        if (best < 0.25f) return 0;
+        var mid = (a + b) * 0.5f;
+        if (topY - baseY >= SightOccluderMinHeight)
+            _sightOccluders.Add((new Vector2(mid.X, mid.Z), MathF.Sqrt(best) * 0.5f, topY));
+        return _navMesh.MarkObstacleSegment(a, b, DoorLeafHalfWidth, baseY, topY,
+            $"{prop.Template}#0x{prop.Scid:X8}");
+    }
+
+    // Half the thickness a closed door leaf blocks across its doorway.
+    private const float DoorLeafHalfWidth = 0.15f;
 
     /// <summary>SC-PATHING-LOS — true when a tall occluder crosses the
     /// eye-height sight line between two actors (feet positions in, eye

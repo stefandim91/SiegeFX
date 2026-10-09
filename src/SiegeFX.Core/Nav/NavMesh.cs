@@ -319,6 +319,54 @@ public sealed class NavMesh
     /// populations cleanly.</summary>
     private const float EdgeSealMaxAreaXZ = 0.6f;
 
+    /// <summary>Blocks the triangles a thin wall segment actually crosses: those
+    /// the XZ segment <paramref name="a"/>–<paramref name="b"/> passes through or
+    /// comes within <paramref name="halfWidth"/> of, inside the same vertical band
+    /// as <see cref="MarkObstacle(float, float, float, float, float, string?)"/>.
+    /// Any walk across the segment has to pass through one of those triangles, so
+    /// the line seals; unlike a bounding disc it leaves the floor on either side
+    /// open (a closed door leaf no longer blocks the step in front of it).</summary>
+    public int MarkObstacleSegment(Vector3 a, Vector3 b, float halfWidth, float baseY, float topY, string? tag)
+    {
+        Blocked ??= new bool[TriangleCount];
+        BlockedTag ??= new string?[TriangleCount];
+        float loY = baseY - ObstacleBelowFloorTol;
+        float hiY = topY + ObstacleAboveTopTol;
+        float hw2 = halfWidth * halfWidth;
+        int marked = 0;
+        for (int t = 0; t < TriangleCount; t++)
+        {
+            if (Blocked[t]) continue;
+            float cy = Centroids[t].Y;
+            if (cy < loY || cy > hiY) continue;
+            var v0 = Vertices[Indices[3 * t + 0]];
+            var v1 = Vertices[Indices[3 * t + 1]];
+            var v2 = Vertices[Indices[3 * t + 2]];
+            bool hit = PointInTriangleXZ(a, v0, v1, v2) || PointInTriangleXZ(b, v0, v1, v2)
+                || SegmentsCrossXZ(a, b, v0, v1) || SegmentsCrossXZ(a, b, v1, v2) || SegmentsCrossXZ(a, b, v2, v0)
+                || EdgeWithinDiskXZ(v0, v1, a.X, a.Z, hw2) || EdgeWithinDiskXZ(v1, v2, a.X, a.Z, hw2)
+                || EdgeWithinDiskXZ(v2, v0, a.X, a.Z, hw2) || EdgeWithinDiskXZ(v0, v1, b.X, b.Z, hw2)
+                || EdgeWithinDiskXZ(v1, v2, b.X, b.Z, hw2) || EdgeWithinDiskXZ(v2, v0, b.X, b.Z, hw2)
+                || EdgeWithinDiskXZ(a, b, v0.X, v0.Z, hw2) || EdgeWithinDiskXZ(a, b, v1.X, v1.Z, hw2)
+                || EdgeWithinDiskXZ(a, b, v2.X, v2.Z, hw2);
+            if (!hit) continue;
+            Blocked[t] = true;
+            BlockedTag[t] = $"{tag}|segment w={halfWidth:F2}";
+            marked++;
+        }
+        return marked;
+    }
+
+    private static bool SegmentsCrossXZ(Vector3 p0, Vector3 p1, Vector3 q0, Vector3 q1)
+    {
+        static float Orient(Vector3 o, Vector3 u, Vector3 w) =>
+            (u.X - o.X) * (w.Z - o.Z) - (u.Z - o.Z) * (w.X - o.X);
+        float d1 = Orient(q0, q1, p0), d2 = Orient(q0, q1, p1);
+        float d3 = Orient(p0, p1, q0), d4 = Orient(p0, p1, q1);
+        return ((d1 > 0f && d2 < 0f) || (d1 < 0f && d2 > 0f))
+            && ((d3 > 0f && d4 < 0f) || (d3 < 0f && d4 > 0f));
+    }
+
     private static bool EdgeWithinDiskXZ(Vector3 e0, Vector3 e1, float cx, float cz, float r2)
     {
         float dx = e1.X - e0.X, dz = e1.Z - e0.Z;
