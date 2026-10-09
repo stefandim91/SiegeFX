@@ -809,6 +809,8 @@ public sealed partial class RenderHost : IDisposable
     // dungeon. Stable across player Y changes inside a region — only
     // updates on region rebuild.
     private readonly Dictionary<string, float> _regionMeanY = new();
+    // Lowest terrain point per region (same instances as _regionMeanY).
+    private readonly Dictionary<string, float> _regionMinY = new();
     private readonly Dictionary<string, AspMesh?> _propAspCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<AspMesh, StaticMesh> _propGlMeshCache = new();
 
@@ -3812,6 +3814,7 @@ public sealed partial class RenderHost : IDisposable
     private void RecomputeRegionMeanY()
     {
         _regionMeanY.Clear();
+        _regionMinY.Clear();
         var sums = new Dictionary<string, (double Sum, int Count)>();
         foreach (var inst in _regionInstances)
         {
@@ -3819,6 +3822,8 @@ public sealed partial class RenderHost : IDisposable
             float centerY = 0.5f * (inst.WorldAabbMin.Y + inst.WorldAabbMax.Y);
             sums.TryGetValue(inst.RegionPath, out var entry);
             sums[inst.RegionPath] = (entry.Sum + centerY, entry.Count + 1);
+            _regionMinY[inst.RegionPath] = _regionMinY.TryGetValue(inst.RegionPath, out var lo)
+                ? MathF.Min(lo, inst.WorldAabbMin.Y) : inst.WorldAabbMin.Y;
         }
         foreach (var kv in sums) _regionMeanY[kv.Key] = (float)(kv.Value.Sum / kv.Value.Count);
     }
@@ -3934,6 +3939,9 @@ public sealed partial class RenderHost : IDisposable
     // place of retail's blackness ("seeing the underside of the trees").
     private readonly HashSet<string> _upperHiddenRegions = new(StringComparer.OrdinalIgnoreCase);
     private const float UpperRegionMarginY = 5.0f;
+    // A hidden "upper" region's lowest terrain must also clear the player
+    // by this much (roughly head height), i.e. sit entirely overhead.
+    private const float UpperRegionClearanceY = 2.0f;
     private int _lastUpperHiddenCount;
 
     private void RecomputeUpperHiddenRegions(bool logChange)
@@ -3944,10 +3952,19 @@ public sealed partial class RenderHost : IDisposable
         if (_isUnderground && !string.IsNullOrEmpty(playerRegion)
             && _regionMeanY.TryGetValue(playerRegion!, out float mine))
         {
+            // The WHOLE region must be overhead, not just its average: a cliff
+            // or plateau region stitched to a valley town (Elddim's forest and
+            // mines path) has a high mean but meets the town at ground level.
+            // Region-majority occludes_camera also flags such towns as
+            // "underground", so this gate is what keeps them visible.
+            float playerY = _playerFollower?.Position.Y ?? mine;
             foreach (var kv in _regionMeanY)
             {
                 if (string.Equals(kv.Key, playerRegion, StringComparison.OrdinalIgnoreCase)) continue;
-                if (kv.Value > mine + UpperRegionMarginY) _upperHiddenRegions.Add(kv.Key);
+                if (kv.Value > mine + UpperRegionMarginY
+                    && _regionMinY.TryGetValue(kv.Key, out float lowest)
+                    && lowest > playerY + UpperRegionClearanceY)
+                    _upperHiddenRegions.Add(kv.Key);
             }
         }
         if ((logChange || _upperHiddenRegions.Count != _lastUpperHiddenCount)
