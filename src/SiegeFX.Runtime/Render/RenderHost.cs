@@ -1392,6 +1392,9 @@ public sealed partial class RenderHost : IDisposable
     // Disposed with the actor mesh cache on region teardown.
     private readonly Dictionary<string, (StaticMesh Mesh, GlTexture? Tex)> _npcGearCache =
         new(StringComparer.OrdinalIgnoreCase);
+    // Each cached gear mesh's ASP bind inverse (the player's attach path
+    // applies it as AttachedItem.BindInv; NPC shields need the same).
+    private readonly Dictionary<StaticMesh, Matrix4x4> _npcGearBindInv = new();
     // SC-RANGED-PROJECTILE — the player's ranged-weapon profile, resolved on
     // equip by TryLoadPlayerWeapon. is_projectile weapons (ac_bow, ac_minigun)
     // fire ammo GOs from the FIRE note instead of resolving a melee hit:
@@ -1941,6 +1944,9 @@ public sealed partial class RenderHost : IDisposable
         public StaticMesh? ShieldMesh;
         public GlTexture? ShieldTexture;
         public int ShieldBoneIdx = -1;
+        // True when the shield-hand item is a real shield (not a krug rock): it
+        // then draws with the player's shield grip chain.
+        public bool ShieldIsShield;
         public string? WieldedWeaponRef;
         public bool WeaponDroppedOnDeath;
         // SC-ALIGNMENT — actor_evil in the specializes chain = a valid
@@ -29319,6 +29325,8 @@ void main()
                 s.ShieldMesh = sVis.Mesh;
                 s.ShieldTexture = sVis.Tex;
                 s.ShieldBoneIdx = idx;
+                s.ShieldIsShield = store.TryGet(shieldRef, out var shTpl)
+                    && SiegeFX.Core.Actors.WeaponStance.IsShield(shTpl);
             }
         }
 
@@ -29422,7 +29430,7 @@ void main()
         if (_templateStore is null) return;
         var dict = GetEquipmentDict(partyIndex);
         s.WeaponMesh = null; s.WeaponTexture = null; s.WeaponBoneIdx = -1; s.WieldedWeaponRef = null;
-        s.ShieldMesh = null; s.ShieldTexture = null; s.ShieldBoneIdx = -1;
+        s.ShieldMesh = null; s.ShieldTexture = null; s.ShieldBoneIdx = -1; s.ShieldIsShield = false;
         int FindBone(string name)
         {
             var bones = s.Actor.Mesh.BoneNames;
@@ -29449,6 +29457,8 @@ void main()
             if (idx >= 0)
             {
                 s.ShieldMesh = sVis.Mesh; s.ShieldTexture = sVis.Tex; s.ShieldBoneIdx = idx;
+                s.ShieldIsShield = _templateStore.TryGet(ResolveItemRef(sref), out var shTpl)
+                    && SiegeFX.Core.Actors.WeaponStance.IsShield(shTpl);
             }
         }
     }
@@ -29504,6 +29514,8 @@ void main()
         }
         visual = (mesh, tex);
         _npcGearCache[modelName!] = visual;
+        _npcGearBindInv[mesh] = asp.InverseBindMatrices.Length > 0
+            ? asp.InverseBindMatrices[0] : Matrix4x4.Identity;
         return true;
     }
 
@@ -39593,7 +39605,7 @@ void main()
                 var actorModel = npcScale == 1f
                     ? s.CurrentTransform
                     : Matrix4x4.CreateScale(npcScale) * s.CurrentTransform;
-                void DrawGear(StaticMesh? gearMesh, GlTexture? gearTex, int boneIdx)
+                void DrawGear(StaticMesh? gearMesh, GlTexture? gearTex, int boneIdx, bool isShield = false)
                 {
                     if (gearMesh is null || boneIdx < 0 || boneIdx >= npcBones) return;
                     if (!npcGearShaderBound)
@@ -39605,7 +39617,19 @@ void main()
                         ApplyLightingUniforms(_meshShader);
                         npcGearShaderBound = true;
                     }
-                    _meshShader.SetMatrix4("uModel", _boneWorldsScratch[boneIdx] * actorModel);
+                    var gearModel = _boneWorldsScratch[boneIdx] * actorModel;
+                    // A shield needs the same chain as the player's attached
+                    // shield (bind inverse + shield tilt + SiegeMax grip
+                    // prerotation); bone-only left it hanging behind the arm.
+                    // Weapons keep the bone-only pose they were tuned with.
+                    if (isShield)
+                        gearModel = (_npcGearBindInv.TryGetValue(gearMesh, out var bindInv) ? bindInv : Matrix4x4.Identity)
+                            * Matrix4x4.CreateFromQuaternion(s_shieldExtraRot)
+                            * Matrix4x4.CreateTranslation(s_shieldExtraTrans)
+                            * Matrix4x4.CreateFromQuaternion(s_gripPreRot)
+                            * Matrix4x4.CreateTranslation(s_gripPreTrans)
+                            * gearModel;
+                    _meshShader.SetMatrix4("uModel", gearModel);
                     if (gearTex is not null)
                     {
                         gearTex.Bind(TextureUnit.Texture0);
@@ -39615,7 +39639,7 @@ void main()
                     gearMesh.Draw();
                 }
                 if (!s.WeaponDroppedOnDeath) DrawGear(s.WeaponMesh, s.WeaponTexture, s.WeaponBoneIdx);
-                DrawGear(s.ShieldMesh, s.ShieldTexture, s.ShieldBoneIdx);
+                DrawGear(s.ShieldMesh, s.ShieldTexture, s.ShieldBoneIdx, isShield: s.ShieldIsShield);
                 // SC-TORCH-FLAME — a held torch burns: sparse small flame
                 // motes at the torch head (weapon bone + up). Built — needs
                 // eyes for size/height tuning.
@@ -42058,6 +42082,7 @@ void main()
             gear.Tex?.Dispose();
         }
         _npcGearCache.Clear();
+        _npcGearBindInv.Clear();
         _actorIdentityBones.Clear();
         _actors.Clear();
         _roamAuditLastPos.Clear();   // SC-MOB-ROAM-AUDIT — indices are per-load
