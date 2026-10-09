@@ -24258,6 +24258,66 @@ void main()
         Console.WriteLine($"resolved {hits}/{unique.Count} SNO textures from tank '{tankPath}'");
     }
 
+    /// <summary>Places the chase camera on the hero. Runs after the actor
+    /// simulation and the hero's render interpolation, so it frames where the
+    /// body is drawn this frame; run before them, it trailed the body by one
+    /// frame and judders against it while turning or walking.</summary>
+    private void UpdateChaseCamera(double dt)
+    {
+        if (_cameraMode == CameraMode.Chase && _player is not null && _nisPhase == NisPhase.Off
+            && _camTracking)
+        {
+            // SC-MEGAMAP wire-up — the overview pose lived only in
+            // ComputeChasePose, which the LIVE camera never calls (only the
+            // NIS return path does); Tab toggled state that nothing read.
+            // Route the live pose through it while the map is up.
+            if (_megaMapActive && !_devFreeCamera)
+            {
+                ComputeChasePose(out var mmPos, out var mmYaw, out var mmPitch);
+                _camera.Position = mmPos;
+                _camera.Yaw = mmYaw;
+                _camera.Pitch = mmPitch;
+            }
+            else
+            {
+            float horiz, height, camDist;
+            Vector3 target;
+            if (_devFreeCamera)
+            {
+                // SC-DEVMODE — the pre-authentic camera, preserved verbatim
+                // as a testing option: legacy slope framing by default, RMB
+                // pitch drag when the user tilts, no bounds constraints.
+                target = _player.CurrentTransform.Translation + new Vector3(0, ChaseLookTargetY, 0);
+                if (_devCamUnclampedPitch)
+                {
+                    horiz = _chaseDistance * MathF.Cos(_chasePitch);
+                    height = _chaseDistance * MathF.Sin(_chasePitch);
+                }
+                else
+                {
+                    horiz = _chaseDistance;
+                    height = _chaseDistance * ChasePitchSlope;
+                }
+            }
+            else
+            {
+                // SC-CAMERA-GAS — authored framing: azimuth 14.2° at 8.38m,
+                // tracking the torso at +1.51m, with the bounds_camera
+                // avoid/tilt dynamics steering through interiors.
+                target = _player.CurrentTransform.Translation + new Vector3(0, _camTrackHeight, 0);
+                camDist = TickCameraBounds(target, _chasePitch, (float)dt, out float pitch);
+                horiz = camDist * MathF.Cos(pitch);
+                height = camDist * MathF.Sin(pitch);
+            }
+            var offset = new Vector3(MathF.Sin(_chaseYaw), 0f, MathF.Cos(_chaseYaw)) * horiz;
+            _camera.Position = target + offset + new Vector3(0, height, 0);
+            var dir = Vector3.Normalize(target - _camera.Position);
+            _camera.Yaw   = MathF.Atan2(dir.X, -dir.Z);
+            _camera.Pitch = MathF.Asin(Math.Clamp(dir.Y, -0.999f, 0.999f));
+            }
+        }
+    }
+
     private void OnUpdate(double dt)
     {
         PerfMark("present and wait");
@@ -24617,58 +24677,6 @@ void main()
         // below is skipped entirely so the camera parks where it is while
         // the party walks away (DS1's [camera_track_toggle]).
         PerfMark("update: input and small ticks");
-        if (_cameraMode == CameraMode.Chase && _player is not null && _nisPhase == NisPhase.Off
-            && _camTracking)
-        {
-            // SC-MEGAMAP wire-up — the overview pose lived only in
-            // ComputeChasePose, which the LIVE camera never calls (only the
-            // NIS return path does); Tab toggled state that nothing read.
-            // Route the live pose through it while the map is up.
-            if (_megaMapActive && !_devFreeCamera)
-            {
-                ComputeChasePose(out var mmPos, out var mmYaw, out var mmPitch);
-                _camera.Position = mmPos;
-                _camera.Yaw = mmYaw;
-                _camera.Pitch = mmPitch;
-            }
-            else
-            {
-            float horiz, height, camDist;
-            Vector3 target;
-            if (_devFreeCamera)
-            {
-                // SC-DEVMODE — the pre-authentic camera, preserved verbatim
-                // as a testing option: legacy slope framing by default, RMB
-                // pitch drag when the user tilts, no bounds constraints.
-                target = _player.CurrentTransform.Translation + new Vector3(0, ChaseLookTargetY, 0);
-                if (_devCamUnclampedPitch)
-                {
-                    horiz = _chaseDistance * MathF.Cos(_chasePitch);
-                    height = _chaseDistance * MathF.Sin(_chasePitch);
-                }
-                else
-                {
-                    horiz = _chaseDistance;
-                    height = _chaseDistance * ChasePitchSlope;
-                }
-            }
-            else
-            {
-                // SC-CAMERA-GAS — authored framing: azimuth 14.2° at 8.38m,
-                // tracking the torso at +1.51m, with the bounds_camera
-                // avoid/tilt dynamics steering through interiors.
-                target = _player.CurrentTransform.Translation + new Vector3(0, _camTrackHeight, 0);
-                camDist = TickCameraBounds(target, _chasePitch, (float)dt, out float pitch);
-                horiz = camDist * MathF.Cos(pitch);
-                height = camDist * MathF.Sin(pitch);
-            }
-            var offset = new Vector3(MathF.Sin(_chaseYaw), 0f, MathF.Cos(_chaseYaw)) * horiz;
-            _camera.Position = target + offset + new Vector3(0, height, 0);
-            var dir = Vector3.Normalize(target - _camera.Position);
-            _camera.Yaw   = MathF.Atan2(dir.X, -dir.Z);
-            _camera.Pitch = MathF.Asin(Math.Clamp(dir.Y, -0.999f, 0.999f));
-            }
-        }
 
         if (_anim is not null && _anim.AnimLength > 0f)
             _animTime += dt;
@@ -24680,7 +24688,6 @@ void main()
         // 8d. After each tick, poll the host bridge's CurrentAnimIndex; a change means the
         // skrit picked a new sub-anim and we swap clips (reset _animTime so the new clip
         // starts from its first keyframe).
-        PerfMark("update: camera");
         if (_skritRuntime is not null && _skritHost is not null && _skritClips is not null)
         {
             const double stepSec = 1.0 / SkritInstance.FramesPerSecond;
@@ -25394,6 +25401,8 @@ void main()
         }
 
         PerfMark("update: actor sim and anim");
+        UpdateChaseCamera(dt);
+        PerfMark("update: camera");
         // Phase 21a-3 — periodic region-membership check. We scan only every
         // RegionCheckIntervalSec because the per-snode XZ scan is O(N) over
         // every loaded snode; firing it from every render frame would burn
