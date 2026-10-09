@@ -49,6 +49,9 @@ public sealed class NavFollower
     /// within this much of the next triangle's centroid, it advances the path index.</summary>
     public float GoalRadius { get; set; } = 0.75f;
 
+    /// <summary>XZ distance at which an intermediate funnel corner counts as reached.</summary>
+    private const float CornerRadius = 0.02f;
+
     /// <summary>SC-NAV-STAIR-DIAG — when true, the follower emits a one-line
     /// log on every stuck-recovery attempt + perpendicular escape + give-up.
     /// Default false (the 347 NPC wanderers would drown the log). RenderHost
@@ -188,6 +191,10 @@ public sealed class NavFollower
     /// Safe to call mid-traversal; the follower will replan from wherever it is now.</summary>
     public void SetTarget(Vector3 target)
     {
+        // The car's old floor is unavailable during a ride. Replanning from
+        // its in-between pose could bind to the shaft bottom, so orders wait
+        // until the rider has arrived on a real nav floor.
+        if (MovementSuspended) return;
         Target = target;
         ReachedGoal = false;
         PathBlocked = false;
@@ -243,6 +250,14 @@ public sealed class NavFollower
         CurrentTriangle = -1;
     }
 
+    public bool MovementSuspended { get; private set; }
+
+    public void SetMovementSuspended(bool suspended)
+    {
+        if (suspended && !MovementSuspended) Teleport(Position);
+        MovementSuspended = suspended;
+    }
+
     // SC-NAV-PARTIAL-PATH — DS1 walks you AS FAR AS IT CAN toward an
     // unreachable click (across a chasm, onto a roof) instead of refusing
     // the order. When the goal can't be resolved or pathed, retarget to the
@@ -272,6 +287,7 @@ public sealed class NavFollower
         for (int t = 0; t < triCount; t++)
         {
             if (Mesh.ComponentOf(t) != comp) continue;
+            if (Mesh.IsUnavailable(t)) continue;
             if (Mesh.IsBlocked(t)) continue;
             if (!Traversal.CanEnter(Mesh.Kinds[t])) continue;
             var pt = Mesh.NearestPointInTriangleXZ(t, Target);
@@ -301,6 +317,7 @@ public sealed class NavFollower
     /// tick's standing resolution / drift handling re-glues the walker.</summary>
     public void Nudge(float dx, float dz)
     {
+        if (MovementSuspended) return;
         var cand = new Vector3(Position.X + dx, Position.Y, Position.Z + dz);
         if (!TryFindStandTriangle(cand, out var tri)) return;
         float y = Mesh.SampleYOnTriangle(tri, cand);
@@ -406,8 +423,16 @@ public sealed class NavFollower
     /// already reached the goal or is blocked.</summary>
     public void Tick(float dt)
     {
+        if (MovementSuspended) return;
         if (ReachedGoal || PathBlocked || _path.Count == 0 || _waypoints.Count == 0) return;
         if (dt <= 0f) return;
+        // A moving terrain node can invalidate a route planned before it
+        // departed. Drop that route before the follower takes another step.
+        if (Mesh.HasUnavailable)
+        {
+            for (int i = _pathIdx; i < _path.Count; i++)
+                if (Mesh.IsUnavailable(_path[i])) { Teleport(Position); return; }
+        }
 
         // Stuck detection (multi-stage recovery, SC-NAV-STUCK-RECOVERY
         // fold). When the follower has an open path but isn't making
@@ -547,9 +572,13 @@ public sealed class NavFollower
             float dz = waypoint.Z - Position.Z;
             float distXZ = MathF.Sqrt(dx * dx + dz * dz);
 
-            if (distXZ <= GoalRadius)
+            // Only the goal gets the loose GoalRadius. Intermediate waypoints are
+            // funnel corners: advancing early cuts the corner, and at a ledge rim
+            // that shortcut runs over empty space and the walker stalls on the edge.
+            bool isGoal = _waypointIdx + 1 >= _waypoints.Count;
+            if (distXZ <= (isGoal ? GoalRadius : CornerRadius))
             {
-                if (_waypointIdx + 1 >= _waypoints.Count)
+                if (isGoal)
                 {
                     // Standing on the goal triangle and close to the target: done.
                     Position = new Vector3(Target.X, Mesh.SampleYOnTriangle(_path[^1], Target), Target.Z);
@@ -557,6 +586,10 @@ public sealed class NavFollower
                     ReachedGoal = true;
                     return;
                 }
+                // Stand exactly on the corner: the next leg often runs along a
+                // boundary edge, and starting it a hair off the corner puts the
+                // whole leg just outside the floor.
+                Position = new Vector3(waypoint.X, Position.Y, waypoint.Z);
                 _waypointIdx++;
                 continue;
             }
@@ -733,6 +766,7 @@ public sealed class NavFollower
         {
             int far = _path[k];
             if (far < 0 || far == CurrentTriangle) continue;
+            if (Mesh.IsUnavailable(far)) continue;
             bool linked = false;
             for (int slot = 0; slot < 3; slot++)
             {

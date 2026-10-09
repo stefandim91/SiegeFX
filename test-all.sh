@@ -2084,6 +2084,12 @@ T104() {
 T105() {
     echo
     printf '%s\n' "--- SC-ELEVATOR: farmhouse grate lift ride (hc_r1, closest lift to spawn) ---"
+    "$RUN" --selftest-elevator-interaction; ERRORLEVEL=$?
+    if [ "$ERRORLEVEL" -ge 1 ]; then printf '%s\n' "*** ELEVATOR-INTERACTION SELFTEST FAILED ***"; else printf '%s\n' "elevator-interaction: PASS"; fi
+    "$RUN" --selftest-lever-pose "${DS1}"; ERRORLEVEL=$?
+    if [ "$ERRORLEVEL" -ge 1 ]; then printf '%s\n' "*** LEVER-POSE SELFTEST FAILED ***"; else printf '%s\n' "lever-pose: PASS"; fi
+    "$RUN" --selftest-door-interaction "${DS1}"; ERRORLEVEL=$?
+    if [ "$ERRORLEVEL" -ge 1 ]; then printf '%s\n' "*** DOOR-INTERACTION SELFTEST FAILED ***"; else printf '%s\n' "door-interaction: PASS"; fi
     printf '%s\n' "[Same basement house as the stair/cutaway tests - besides the stairs it"
     printf '%s\n' " has a METAL GRATE floor section that is a working lift now. Spawn ="
     printf '%s\n' " top of its shaft (world ~76,-4,-72; hc_r1 streams as fh_r1 neighbor)."
@@ -2101,6 +2107,12 @@ T105() {
     printf '%s\n' "   cutaway fades swap surface/basement sections mid-ride."
     printf '%s\n' " - Ordinary move-clicks on the floor NEAR the winch must NOT pull it"
     printf '%s\n' "   (the old bug: elevator left without you + player froze topside)."
+    printf '%s\n' " - If a lever does send the EMPTY car away, the landing must stay"
+    printf '%s\n' "   visible and walkable; this matches retail Dungeon Siege behavior."
+    printf '%s\n' " - While the car moves, walking onto its old floor must be refused."
+    printf '%s\n' " - Save at a parked stop, start a ride, then load that save while the"
+    printf '%s\n' "   car is moving: the car and player return to the saved stop, and a"
+    printf '%s\n' "   fresh walk click still works."
     printf '%s\n' " - If you somehow stand over the open shaft when the car is away, a"
     printf '%s\n' "   [nav-rescue] line nudges you to the landing edge instead of freezing."
     printf '%s\n' " - At the bottom: walk OFF onto the cellar floor (nav rebuilds on"

@@ -138,7 +138,7 @@ public sealed partial class RenderHost : IDisposable
         {
             foreach (var c in _chestProps) c.ChestOpened = ws.OpenedChests.Contains(c.Scid);
             foreach (var lu in _lockedUsables) lu.Unlocked = ws.UnlockedUsables.Contains(lu.Prop.Scid);
-            foreach (var lv in _leverProps) lv.LeverOn = ws.LeversOn.Contains(lv.Scid);
+            foreach (var lv in _leverProps) SetLeverState(lv, ws.LeversOn.Contains(lv.Scid), snap: true);
             foreach (var kv in _breakingByScid)
             {
                 bool destroyed = ws.BrokenProps.Contains(kv.Key);
@@ -161,7 +161,7 @@ public sealed partial class RenderHost : IDisposable
                     if (lu.Prop.Scid == scid) { lu.Unlocked = true; break; }
             foreach (var scid in ws.LeversOn)
                 foreach (var lv in _leverProps)
-                    if (lv.Scid == scid) { lv.LeverOn = true; break; }
+                    if (lv.Scid == scid) { if (!lv.LeverOn) SetLeverState(lv, true, snap: true); break; }
             foreach (var scid in ws.BrokenProps)
                 if (_breakingByScid.TryGetValue(scid, out var bp) && !bp.IsDestroyed)
                 { bp.IsDestroyed = true; structural = true; }
@@ -178,6 +178,11 @@ public sealed partial class RenderHost : IDisposable
         {
             bool shouldOpen = ws.OpenDoors.Contains(d.Scid);
             if (!authoritative && !shouldOpen) continue;
+            if (shouldOpen && (authoritative || !d.DoorTargetOpen)
+                && ws.DoorSwingSigns.TryGetValue(d.Scid, out float savedSign))
+                d.DoorSwingSign = savedSign < 0f ? -1f : 1f;
+            else if (shouldOpen && !d.DoorTargetOpen)
+                d.DoorSwingSign = d.DoorIsFlip ? ComputeFlipSwingSign(d) : ComputeDoorSwingSign(d);
             if (d.DoorTargetOpen == shouldOpen) continue;
             d.DoorTargetOpen = shouldOpen;
             d.DoorOpenFrac = shouldOpen ? 1f : 0f;
@@ -266,7 +271,9 @@ public sealed partial class RenderHost : IDisposable
     // player's containing region changes. Map name (e.g. "world") is derived
     // off the launch region path.
     private IReadOnlyDictionary<string, SiegeFX.Core.Assets.MoodSetting>? _moodStore;
-    private string? _moodMapName;
+    // Map folder under world/maps ("map_world", "multiplayer_world"); the
+    // mood series is named after it.
+    private string? _moodMapFolder;
 
     // SC-WEATHER-C — mood-driven weather state (fog/rain/snow/wind/lightning).
     // Fed by region-default mood applies + mood_change trigger actions; read
@@ -354,6 +361,20 @@ public sealed partial class RenderHost : IDisposable
     // dictionary (and without invalidating the IReadOnly view, which
     // points at this same dict instance).
     private Dictionary<string, SiegeFX.Core.Assets.ConversationDef>? _conversationsMutable;
+    // Each region's own conversations. DS1 conversations are region-local, and
+    // Utraea reuses names per town (every town authors its own
+    // zconversation_directions; conversation_guard_1 exists in three), so an
+    // NPC resolves against its own region before the merged pool.
+    private readonly Dictionary<string, IReadOnlyDictionary<string, SiegeFX.Core.Assets.ConversationDef>>
+        _conversationsByRegion = new(StringComparer.OrdinalIgnoreCase);
+    // Numbered conversation steps each NPC has played, keyed "SCID:conversation";
+    // saved with the world so a reload doesn't re-pitch quests.
+    private readonly Dictionary<string, int> _conversationVisits = new(StringComparer.OrdinalIgnoreCase);
+    // NPCs whose "Directions" button was pressed (job_talk_mp.skrit's GameAuditor
+    // d_0x<scid> flag): their next talk plays the region's zconversation_directions.
+    private readonly HashSet<uint> _directionsRequested = new();
+    // The open conversation authors choice = shop: trade waits for its Shop button.
+    private bool _lastTalkAuthorsShop;
     private readonly List<ActorRenderState> _actors = new();
     private readonly Dictionary<AspMesh, SkinnedMesh> _actorMeshCache = new();
     // Bind-pose bone array cached per unique mesh — reused every frame for zero-clip actors
@@ -390,12 +411,19 @@ public sealed partial class RenderHost : IDisposable
     // interactive/emitter .gas. No skrit, no animation, no nav — just transform +
     // mesh + (optional) texture, drawn through the static-mesh pipeline.
     private readonly List<StaticPropInstance> _staticProps = new();
+    // Props placed on a moving elevator node retain their node-local pose;
+    // only these small groups need a world-matrix update during a ride.
+    private readonly Dictionary<uint, List<StaticPropInstance>> _movingPropsByNode = new();
     // SC-DOORS-OPEN (audit fold — finding #7) — parallel list of
     // door-only props so TickDoors doesn't scan 5810 props/frame to
     // find ~20 doors. Populated alongside _staticProps.Add at
     // LoadStaticProps; cleared when _staticProps clears on region
     // unload.
     private readonly List<StaticPropInstance> _doorProps = new();
+    private StaticPropInstance? _pendingDoorUse;
+    private ActorRenderState? _pendingDoorActor;
+    private Vector3 _pendingDoorPoint;
+    private bool _pendingDoorHasAuthoredPoint;
 
     // SC-TORCH-FLAME — one continuous fire plume per AP_light socket on placed
     // light props (torch_activate, candlestands). Each socket's world position
@@ -492,6 +520,7 @@ public sealed partial class RenderHost : IDisposable
         public float T;                // ride progress 0..1
         public int CarInstanceIdx = -1;
         public Vector3 PrevCarPos;
+        public Vector3 DepartedCarMin, DepartedCarMax;
         public readonly List<ActorRenderState> Riders = new();
     }
     // Delayed fade tuples from movingN_actioninfo's optional 6th field
@@ -796,6 +825,8 @@ public sealed partial class RenderHost : IDisposable
     // dungeon. Stable across player Y changes inside a region — only
     // updates on region rebuild.
     private readonly Dictionary<string, float> _regionMeanY = new();
+    // Lowest terrain point per region (same instances as _regionMeanY).
+    private readonly Dictionary<string, float> _regionMinY = new();
     private readonly Dictionary<string, AspMesh?> _propAspCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<AspMesh, StaticMesh> _propGlMeshCache = new();
 
@@ -1375,6 +1406,9 @@ public sealed partial class RenderHost : IDisposable
     // Disposed with the actor mesh cache on region teardown.
     private readonly Dictionary<string, (StaticMesh Mesh, GlTexture? Tex)> _npcGearCache =
         new(StringComparer.OrdinalIgnoreCase);
+    // Each cached gear mesh's ASP bind inverse (the player's attach path
+    // applies it as AttachedItem.BindInv; NPC shields need the same).
+    private readonly Dictionary<StaticMesh, Matrix4x4> _npcGearBindInv = new();
     // SC-RANGED-PROJECTILE — the player's ranged-weapon profile, resolved on
     // equip by TryLoadPlayerWeapon. is_projectile weapons (ac_bow, ac_minigun)
     // fire ammo GOs from the FIRE note instead of resolving a melee hit:
@@ -1924,12 +1958,17 @@ public sealed partial class RenderHost : IDisposable
         public StaticMesh? ShieldMesh;
         public GlTexture? ShieldTexture;
         public int ShieldBoneIdx = -1;
+        // True when the shield-hand item is a real shield (not a krug rock): it
+        // then draws with the player's shield grip chain.
+        public bool ShieldIsShield;
         public string? WieldedWeaponRef;
         public bool WeaponDroppedOnDeath;
         // SC-ALIGNMENT — actor_evil in the specializes chain = a valid
         // player attack target. DS1 never lets you attack good/neutral
         // NPCs (Norick, guards, kings) — no attack cursor, no swing.
         public bool IsEvilAligned;
+        // actor_ambient chain (rats, birds): no talk or no-talk cursor.
+        public bool IsAmbient;
         // SC-ALIGN-SWITCH — [alignment_switcher] (Gom): the actor spawns
         // friendly/talkable and flips hostile when the authored trigger
         // fires (speech ending / taking damage).
@@ -2842,7 +2881,9 @@ public sealed partial class RenderHost : IDisposable
                 {
                     float ogx = before.X - orderDest.X, ogz = before.Z - orderDest.Z;
                     float ogap2 = ogx * ogx + ogz * ogz;
-                    const float arriveR = 0.7f;
+                    float arriveR = ReferenceEquals(m, _pendingDoorActor)
+                        ? MathF.Min(0.2f, MathF.Max(0.1f, _pendingDoorUse?.DoorUseRange ?? 0.2f) * 0.5f)
+                        : 0.7f;
                     if (ogap2 <= arriveR * arriveR)
                     {
                         m.MoveOrder = null;   // arrived — hold this ground
@@ -3797,6 +3838,7 @@ public sealed partial class RenderHost : IDisposable
     private void RecomputeRegionMeanY()
     {
         _regionMeanY.Clear();
+        _regionMinY.Clear();
         var sums = new Dictionary<string, (double Sum, int Count)>();
         foreach (var inst in _regionInstances)
         {
@@ -3804,6 +3846,8 @@ public sealed partial class RenderHost : IDisposable
             float centerY = 0.5f * (inst.WorldAabbMin.Y + inst.WorldAabbMax.Y);
             sums.TryGetValue(inst.RegionPath, out var entry);
             sums[inst.RegionPath] = (entry.Sum + centerY, entry.Count + 1);
+            _regionMinY[inst.RegionPath] = _regionMinY.TryGetValue(inst.RegionPath, out var lo)
+                ? MathF.Min(lo, inst.WorldAabbMin.Y) : inst.WorldAabbMin.Y;
         }
         foreach (var kv in sums) _regionMeanY[kv.Key] = (float)(kv.Value.Sum / kv.Value.Count);
     }
@@ -3919,6 +3963,9 @@ public sealed partial class RenderHost : IDisposable
     // place of retail's blackness ("seeing the underside of the trees").
     private readonly HashSet<string> _upperHiddenRegions = new(StringComparer.OrdinalIgnoreCase);
     private const float UpperRegionMarginY = 5.0f;
+    // A hidden "upper" region's lowest terrain must also clear the player
+    // by this much (roughly head height), i.e. sit entirely overhead.
+    private const float UpperRegionClearanceY = 2.0f;
     private int _lastUpperHiddenCount;
 
     private void RecomputeUpperHiddenRegions(bool logChange)
@@ -3929,10 +3976,19 @@ public sealed partial class RenderHost : IDisposable
         if (_isUnderground && !string.IsNullOrEmpty(playerRegion)
             && _regionMeanY.TryGetValue(playerRegion!, out float mine))
         {
+            // The WHOLE region must be overhead, not just its average: a cliff
+            // or plateau region stitched to a valley town (Elddim's forest and
+            // mines path) has a high mean but meets the town at ground level.
+            // Region-majority occludes_camera also flags such towns as
+            // "underground", so this gate is what keeps them visible.
+            float playerY = _playerFollower?.Position.Y ?? mine;
             foreach (var kv in _regionMeanY)
             {
                 if (string.Equals(kv.Key, playerRegion, StringComparison.OrdinalIgnoreCase)) continue;
-                if (kv.Value > mine + UpperRegionMarginY) _upperHiddenRegions.Add(kv.Key);
+                if (kv.Value > mine + UpperRegionMarginY
+                    && _regionMinY.TryGetValue(kv.Key, out float lowest)
+                    && lowest > playerY + UpperRegionClearanceY)
+                    _upperHiddenRegions.Add(kv.Key);
             }
         }
         if ((logChange || _upperHiddenRegions.Count != _lastUpperHiddenCount)
@@ -4443,10 +4499,27 @@ public sealed partial class RenderHost : IDisposable
         return _fadedSnodeCounts.ContainsKey(_navMesh.SourceSnodeGuid[tri]);
     }
 
+    private bool IsActorInFadedSnode(ActorRenderState actor)
+    {
+        if (_fadedSnodeCounts.Count == 0) return false;
+        foreach (var elevator in _elevators)
+            if (elevator.Moving && elevator.Riders.Contains(actor))
+                return _fadedSnodeCounts.ContainsKey(elevator.Def.CarNodeGuid);
+        return IsPosInFadedSnode(actor.CurrentTransform.Translation);
+    }
+
     private bool TryGetPlayerSnodeGuid(out uint snodeGuid)
     {
         snodeGuid = 0;
         if (_playerFollower is null || _navMesh is null) return false;
+        // The baked departure floor is unavailable during a ride, but the
+        // carried player still physically occupies the moving car node.
+        foreach (var elevator in _elevators)
+            if (elevator.Moving && _player is not null && elevator.Riders.Contains(_player))
+            {
+                snodeGuid = elevator.Def.CarNodeGuid;
+                return true;
+            }
         int tri = _playerFollower.CurrentTriangle;
         if (tri < 0 && !_navMesh.TryFindTriangle(_playerFollower.Position, out tri)) return false;
         if (tri < 0 || tri >= _navMesh.SourceSnodeGuid.Length) return false;
@@ -4472,6 +4545,7 @@ public sealed partial class RenderHost : IDisposable
         public StaticMesh Mesh = null!;
         public GlTexture? Texture;
         public Matrix4x4 World;
+        public Matrix4x4 NodeLocalWorld;
         public string Template = "";
         // SC-PROP-INVISIBLE — DS1 authors logic objects (life/mana shrines,
         // blocking_object) with a dev-marker [aspect] model PLUS
@@ -4516,6 +4590,8 @@ public sealed partial class RenderHost : IDisposable
         public float DoorUseRange = 1.5f;
         public bool  DoorTargetOpen;
         public float DoorSwingSign = 1f;
+        public uint DoorSecondScid;
+        public uint[] DoorUsePointScids = Array.Empty<uint>();
         // SC-DOORS-HINGE-AXIS — bulkhead/storm doors (e.g. door_glb_stormdoor)
         // are a different mesh convention from wall doors: the leaf lies in the
         // local X-Y plane (thin along Z, tall along Y) and is placed tilted, so
@@ -4531,6 +4607,12 @@ public sealed partial class RenderHost : IDisposable
         // at the elevator gizmo from BOTH states (a call button in effect).
         public bool   IsLever;
         public bool   LeverOn;
+        public UsableTransitionPose? LeverPose;
+        public SkinnedMesh? LeverPoseMesh;
+        public bool LeverPoseApplied;
+        public bool LeverStartsPosed;
+        public Matrix4x4 LeverPosedLocalWorld;
+        public Matrix4x4 LeverUnposedLocalWorld;
         public float  LeverUseRange = 2f;
         // SC-LEVER-MULTISEND — DS1 authors numbered send pairs
         // (on_scid/on_message, on_scid_2/on_message_2, …): cr_r1's stairwell
@@ -4636,7 +4718,7 @@ public sealed partial class RenderHost : IDisposable
     // happen per render frame via a ground-plane raycast through the
     // mouse, mirroring TryClickToAttack / TryClickToBreakProp / TryClickToTalk
     // so cursor visual tracks 1:1 with what a click actually picks.
-    private enum CursorState { Pointer, Attack, CastAttack, Smash, Grab, Talk, NoGo, NoTalk }
+    private enum CursorState { Pointer, Attack, CastAttack, Smash, Grab, UseDoor, UseLever, Talk, NoGo, NoTalk }
     private CursorState _cursorState = CursorState.Pointer;
     // Phase 22 — hover + walk-up pickup state. _hoverPile feeds the
     // bottom-center item readout; gold/spells also get the flat blue hover
@@ -10195,6 +10277,12 @@ void main()
                     // Authored [stop]: halt the SELECTION — the hero's walk +
                     // pendings when selected, and every selected member's
                     // explicit orders (SC-SELECT-MOVE).
+                    if (_pendingDoorActor is { } doorActor
+                        && _selectedPartyIdx.Contains(doorActor.PartyIndex))
+                    {
+                        _pendingDoorUse = null;
+                        _pendingDoorActor = null;
+                    }
                     if (_selectedPartyIdx.Contains(0))
                     {
                         _playerFollower?.SetTarget(_playerFollower.Position);
@@ -10203,6 +10291,8 @@ void main()
                         _pendingCastProp = null;
                         _pendingBreakProp = null;
                         _pendingPickupPile = null;
+                        _pendingDoorUse = null;
+                        _pendingDoorActor = null;
                     }
                     foreach (var sm in _party)
                     {
@@ -10683,6 +10773,18 @@ void main()
                 // Latches a Buy/Sell press on LMB-down; RMB is swallowed so a
                 // stray right-click behind the panel can't retarget the camera
                 // mid-trade.
+                // A click on the world (outside the store frame and the co-open
+                // inventory) ends the trade and carries on as a normal click, so
+                // the player walks away from the shop like in the original.
+                if (_vendor.IsOpen && (btn == MouseButton.Left || btn == MouseButton.Right)
+                    && !_vendor.IsPointInFrame((int)m.Position.X, (int)m.Position.Y, _window.Size.X, _window.Size.Y)
+                    && !(_inventoryOpen && _inventoryPanel.IsPointInPanel((int)m.Position.X, (int)m.Position.Y,
+                                                                          _window.Size.X, _window.Size.Y)))
+                {
+                    _vendor.Close();
+                    ReconcileTradeInventory();
+                    Console.WriteLine("trade: closed by a world click");
+                }
                 if (_vendor.IsOpen && (btn == MouseButton.Left || btn == MouseButton.Right))
                 {
                     if (btn == MouseButton.Left)
@@ -11615,7 +11717,10 @@ void main()
                     _lmbWorldDownPos = m.Position;
                     _lmbDownAtMs = Environment.TickCount64;
                     _marqueeActive = false;
-                    if (!TryClickToTalk(m.Position) && !DispatchAbilityClick(m.Position))
+                    _pendingDoorUse = null;
+                    _pendingDoorActor = null;
+                    if (!TryClickToTalk(m.Position) && !TryClickToUseDoor(m.Position)
+                        && !DispatchAbilityClick(m.Position))
                     {
                         TryClickToMove(m.Position);
                         // SC-HOLD-MOVE — keep steering while held.
@@ -14027,6 +14132,8 @@ void main()
         {
             var (convs, convDiags) = SiegeFX.Core.Assets.ConversationStore.Load(mapReader, regionPath);
             foreach (var d in convDiags) Console.WriteLine("  " + d);
+            _conversationsByRegion.Clear();
+            _conversationsByRegion[regionPath.TrimEnd('/')] = convs;
             // Build a mutable merged pool then assign (the field is IReadOnly).
             // First-loaded wins on key collisions: matches DS1's region-local
             // priority (cross-region dialogue goes through quest_state.gas).
@@ -14044,6 +14151,7 @@ void main()
                     {
                         var (nconvs, ndiags) = SiegeFX.Core.Assets.ConversationStore.Load(mapReader, path);
                         foreach (var d in ndiags) Console.WriteLine("  " + d);
+                        _conversationsByRegion[path.TrimEnd('/')] = nconvs;
                         foreach (var kv in nconvs)
                             if (merged.TryAdd(kv.Key, kv.Value)) neighborConvs++;
                     }
@@ -14233,7 +14341,7 @@ void main()
                     {
                         var (moods, moodDiags) = SiegeFX.Core.Assets.MoodStore.Load(logicReader);
                         _moodStore = moods;
-                        _moodMapName = DeriveMapName(_regionPath);
+                        _moodMapFolder = DeriveMapFolder(_regionPath);
 
                         // SS-CUSTOM (ED-8) — a SiegeSmith map bundles its own moods at
                         // world/global/moods/<map>/moods.gas inside the MAP tank. Merge
@@ -14268,7 +14376,7 @@ void main()
                         }
                         Console.WriteLine($"  audio: mood store loaded — {moods.Count} moods, " +
                                           $"{regBeds} distinct ambient bed clip(s) registered " +
-                                          $"(map='{_moodMapName ?? "<unknown>"}')");
+                                          $"(map='{_moodMapFolder ?? "<unknown>"}')");
                         foreach (var d in moodDiags) Console.Error.WriteLine($"  mood: {d}");
 
                         // SC-WEATHER-F — the [global_voice] event table that
@@ -14821,6 +14929,7 @@ void main()
                 try
                 {
                     var (nconvs, _) = SiegeFX.Core.Assets.ConversationStore.Load(mapReader, rp);
+                    _conversationsByRegion[rp.TrimEnd('/')] = nconvs;
                     foreach (var kv in nconvs)
                         if (_conversationsMutable.TryAdd(kv.Key, kv.Value)) convsAdded++;
                 }
@@ -14891,7 +15000,7 @@ void main()
                     }
                     var pp = rowPend.Position.ToVector3();
                     if (s.Brain is not null) s.Brain.Teleport(pp);
-                    s.CurrentTransform = Matrix4x4.CreateTranslation(pp);
+                    ApplyRestoredPose(s, s.Actor.WorldTransform, pp, rowPend.Facing);
                     appliedPend++;
                     return true;
                 }
@@ -14915,14 +15024,7 @@ void main()
             // after the next click resolved against a meshless gap — reversing.
             var pendingTarget = !_playerFollower.ReachedGoal && !_playerFollower.PathBlocked
                 ? _playerFollower.Target : (Vector3?)null;
-            _playerFollower = new SiegeFX.Core.Nav.NavFollower(newNav, pos, speed)
-            {
-                // Phase 24-NAV-LOGICAL-FLAGS — player respects the
-                // lf_human_player gate; computer-only zones are
-                // rejected as paths.
-                Traversal = SiegeFX.Core.Nav.NavTraversal.Player,
-                DiagnosticLogging = true,
-            };
+            RebuildPlayerFollower(newNav, pos, speed);
             if (pendingTarget is { } tgt) _playerFollower.SetTarget(tgt);
         }
 
@@ -15571,6 +15673,7 @@ void main()
                     }
 
                     var tex = ResolveAspTexture(asp);
+                    var nodeLocalWorld = ComposePlacementLocal(asp, p.Placement);
                     var world = ComposePlacementWorld(asp, p.Placement);
 
                     // Phase 17-SC-J — DS1 lets the placement override `aspect.scale_multiplier`
@@ -15581,9 +15684,12 @@ void main()
                     var scale = ResolveScaleMultiplier(template, p.Node);
                     if (scale != 1f)
                     {
+                        nodeLocalWorld = Matrix4x4.CreateScale(scale) * nodeLocalWorld;
                         world = Matrix4x4.CreateScale(scale) * world;
                         scaledPlacements++;
                     }
+                    if (_elevatorNodeOverrides.TryGetValue(p.Placement.NodeGuid, out var carPose))
+                        world = ComposeAttachedPropWorld(nodeLocalWorld, carPose);
 
                     // Phase 21c-1 — barrel-render investigation. Dump per-corner data
                     // for the first placement of any "barrel" template so we can verify
@@ -15697,9 +15803,12 @@ void main()
                         }
                         if (isDoor)
                         {
-                            var ur = _templateStore.GetAttribute(template, "aspect", "use_range");
+                            var ur = SiegeFX.Core.Assets.TemplateStore.GetNodeAttribute(
+                                p.Node, "aspect", "use_range")
+                                ?? ts.GetAttribute(template, "aspect", "use_range");
                             if (ur is not null &&
-                                float.TryParse(ur, System.Globalization.NumberStyles.Float,
+                                float.TryParse(ur.Trim().TrimEnd('f', 'F'),
+                                               System.Globalization.NumberStyles.Float,
                                                System.Globalization.CultureInfo.InvariantCulture, out var urv))
                                 useRange = urv;
                         }
@@ -15712,22 +15821,23 @@ void main()
                     // lives in [messages][locked].
                     bool doorUseToggle = false, doorOneShot = false;
                     string doorLockedText = "";
-                    uint doorMsgOpening = 0;
+                    uint doorMsgOpening = 0, doorSecondScid = 0;
+                    uint[] doorUsePoints = Array.Empty<uint>();
                     if (isDoor)
                     {
                         static bool GasTrue(string? v) =>
                             v is not null && (v.Trim().Equals("true", StringComparison.OrdinalIgnoreCase) || v.Trim() == "1");
-                        doorUseToggle = GasTrue(ts.GetAttribute(template!, "door_basic", "use_toggle"));
-                        doorOneShot = GasTrue(ts.GetAttribute(template!, "door_basic", "oneshot"));
+                        string? DoorAttr(string name) =>
+                            SiegeFX.Core.Assets.TemplateStore.GetNodeAttribute(p.Node, "door_basic", name)
+                            ?? ts.GetAttribute(template!, "door_basic", name);
+                        doorUseToggle = GasTrue(DoorAttr("use_toggle"));
+                        doorOneShot = GasTrue(DoorAttr("oneshot"));
                         doorLockedText = (ts.GetAttribute(template!, "messages", "locked", "screen_text") ?? "").Trim().Trim('"');
-                        foreach (var c in p.Node.Children)
-                        {
-                            if (!string.Equals(c.Header, "door_basic", StringComparison.OrdinalIgnoreCase)) continue;
-                            foreach (var attr in c.Attributes)
-                                if (string.Equals(attr.Name, "msg_scid_opening", StringComparison.OrdinalIgnoreCase))
-                                    doorMsgOpening = ParseHexScid(attr.Value);
-                            break;
-                        }
+                        doorMsgOpening = ParseHexScid(DoorAttr("msg_scid_opening"));
+                        doorSecondScid = ParseHexScid(DoorAttr("second_door"));
+                        doorUsePoints = ParseScidList(
+                            SiegeFX.Core.Assets.TemplateStore.GetNodeAttribute(
+                                p.Node, "placement", "use_point_scids"));
                     }
 
                     // ALPHA-2C — chests open on use; never classify them as
@@ -15875,6 +15985,7 @@ void main()
                         Mesh          = glMesh,
                         Texture       = tex,
                         World         = world,
+                        NodeLocalWorld = nodeLocalWorld,
                         Asp           = asp,
                         Template      = p.TemplateName,
                         ForceNoRender = forceNoRender,
@@ -15886,6 +15997,8 @@ void main()
                         IsDoor        = isDoor,
                         DoorIsFlip    = doorIsFlip,
                         DoorUseRange  = useRange,
+                        DoorSecondScid = doorSecondScid,
+                        DoorUsePointScids = doorUsePoints,
                         IsLever         = isLever,
                         LeverUseRange   = levUseRange,
                         LeverOnSends    = levOnSends.ToArray(),
@@ -15905,7 +16018,14 @@ void main()
                         CenterY       = world.Translation.Y,
                         Source        = p.Node,
                     };
+                    if (isLever) ConfigureLeverPose(inst, template!, p);
                     _staticProps.Add(inst);
+                    if (_elevatorNodeOverrides.ContainsKey(inst.NodeGuid))
+                    {
+                        if (!_movingPropsByNode.TryGetValue(inst.NodeGuid, out var attached))
+                            _movingPropsByNode[inst.NodeGuid] = attached = new List<StaticPropInstance>();
+                        attached.Add(inst);
+                    }
                     if (isDoor)
                     {
                         _doorProps.Add(inst);
@@ -19803,20 +19923,23 @@ void main()
             bool closedDoor = prop.IsDoor && !prop.DoorTargetOpen;
             if (prop.IsDoor && !closedDoor) continue;
             if (!_templateStore.TryGet(prop.Template, out var tpl)) continue;
-            if (!closedDoor)
+            if (closedDoor)
             {
-                // SC-PATHING — the authored walk-blocking field is [aspect]
-                // does_block_path ("prevents another from walking through it"),
-                // set true on the base non_interactive chain with explicit
-                // opt-outs (the *_nonblocking family). The old is_collidable
-                // read was the PROJECTILE flag and explicit-only, so fences and
-                // walls never blocked the nav mesh — mobs and clicks pathed
-                // straight through their line while the visuals said otherwise.
-                var blockAttr = _templateStore.GetAttribute(tpl, "aspect", "does_block_path")
-                             ?? _templateStore.GetAttribute(tpl, "physics", "does_block_path");
-                var blockTrim = (blockAttr ?? "").Trim().Trim('"').ToLowerInvariant();
-                if (blockTrim != "true" && blockTrim != "1") continue;
+                int leafMarked = MarkClosedDoorLeaf(prop);
+                if (leafMarked > 0) { obstacles++; triangles += leafMarked; }
+                continue;
             }
+            // SC-PATHING — the authored walk-blocking field is [aspect]
+            // does_block_path ("prevents another from walking through it"),
+            // set true on the base non_interactive chain with explicit
+            // opt-outs (the *_nonblocking family). The old is_collidable
+            // read was the PROJECTILE flag and explicit-only, so fences and
+            // walls never blocked the nav mesh — mobs and clicks pathed
+            // straight through their line while the visuals said otherwise.
+            var blockAttr = _templateStore.GetAttribute(tpl, "aspect", "does_block_path")
+                         ?? _templateStore.GetAttribute(tpl, "physics", "does_block_path");
+            var blockTrim = (blockAttr ?? "").Trim().Trim('"').ToLowerInvariant();
+            if (blockTrim != "true" && blockTrim != "1") continue;
             // World-space XZ radius: transform the local AABB's 4
             // XZ corners (Y collapsed) by the placement matrix,
             // then take the max distance from the translation
@@ -19939,6 +20062,49 @@ void main()
                               $"{_sightOccluders.Count} sight-occluder disc(s)");
     }
 
+    /// <summary>SC-DOORS-BLOCK — a closed door seals its doorway along the leaf
+    /// itself. The leaf is a thin board hinged at the placement origin, so the
+    /// old bounding disc (radius = leaf width, centred on the hinge) also
+    /// blocked the step or porch in front of the door and the hero couldn't
+    /// walk up to it. Returns the number of triangles blocked.</summary>
+    private int MarkClosedDoorLeaf(StaticPropInstance prop)
+    {
+        if (_navMesh is null) return 0;
+        // Plan-view footprint of the leaf: its two farthest-apart box corners
+        // run along the board whatever the mesh's local axis convention.
+        var min = prop.Mesh.Min;
+        var max = prop.Mesh.Max;
+        Span<Vector3> world = stackalloc Vector3[8];
+        float baseY = float.PositiveInfinity, topY = float.NegativeInfinity;
+        for (int i = 0; i < 8; i++)
+        {
+            var local = new Vector3((i & 1) == 0 ? min.X : max.X,
+                                    (i & 2) == 0 ? min.Y : max.Y,
+                                    (i & 4) == 0 ? min.Z : max.Z);
+            world[i] = Vector3.Transform(local, prop.World);
+            baseY = MathF.Min(baseY, world[i].Y);
+            topY = MathF.Max(topY, world[i].Y);
+        }
+        Vector3 a = world[0], b = world[0];
+        float best = -1f;
+        for (int i = 0; i < 8; i++)
+        for (int j = i + 1; j < 8; j++)
+        {
+            float dx = world[j].X - world[i].X, dz = world[j].Z - world[i].Z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 > best) { best = d2; a = world[i]; b = world[j]; }
+        }
+        if (best < 0.25f) return 0;
+        var mid = (a + b) * 0.5f;
+        if (topY - baseY >= SightOccluderMinHeight)
+            _sightOccluders.Add((new Vector2(mid.X, mid.Z), MathF.Sqrt(best) * 0.5f, topY));
+        return _navMesh.MarkObstacleSegment(a, b, DoorLeafHalfWidth, baseY, topY,
+            $"{prop.Template}#0x{prop.Scid:X8}");
+    }
+
+    // Half the thickness a closed door leaf blocks across its doorway.
+    private const float DoorLeafHalfWidth = 0.15f;
+
     /// <summary>SC-PATHING-LOS — true when a tall occluder crosses the
     /// eye-height sight line between two actors (feet positions in, eye
     /// offsets applied here). Circle-vs-segment in XZ; a crossing only
@@ -20055,6 +20221,7 @@ void main()
     private void TickDoors(float dt)
     {
         if (dt <= 0f || _doorProps.Count == 0) return;
+        TryCompletePendingDoorUse();
         const float OpenRate  = 1f / 0.4f;   // 0 → 1 in 0.4s
         const float CloseRate = 1f / 0.5f;   // 1 → 0 in 0.5s
         // DS1 doors open on use (a click), not on proximity — so the frac
@@ -20093,6 +20260,13 @@ void main()
             System.Globalization.CultureInfo.InvariantCulture, out var u) ? u : 0;
     }
 
+    private static uint[] ParseScidList(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return Array.Empty<uint>();
+        return value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(ParseHexScid).Where(scid => scid != 0).ToArray();
+    }
+
     /// <summary>Layout used for nav-mesh builds: the unified region layout
     /// with elevator car nodes overridden to their CURRENT stop, so the
     /// walkable mesh always reflects where the platform actually is.</summary>
@@ -20114,39 +20288,89 @@ void main()
     /// vertical re-bind gate refuses it, and every click is then rejected
     /// from a permanently off-mesh start. A ring search snaps them to the
     /// nearest real floor instead (the landing edge, in practice ≤1u away).</summary>
-    private void RescueOffMeshAfterRebuild(SiegeFX.Core.Nav.NavMesh nav)
+    private void RescueOffMeshAfterRebuild(SiegeFX.Core.Nav.NavMesh nav, ElevatorRuntime? departedElevator = null)
     {
+        bool IsRidingAnotherMovingPlatform(ActorRenderState actor)
+        {
+            foreach (var elevator in _elevators)
+                if (elevator.Moving && elevator.Riders.Contains(actor)) return true;
+            foreach (var stairwell in _stairwells)
+                if (stairwell.Moving)
+                    foreach (var segment in stairwell.Segments)
+                        if (segment.Riders.Contains(actor)) return true;
+            return false;
+        }
+        uint landingGuid = departedElevator is null ? 0
+            : departedElevator.AtStop == 1 ? departedElevator.Def.Connect2Guid : departedElevator.Def.Connect1Guid;
+        bool TryDepartedLanding(Vector3 pos, out Vector3 dest)
+        {
+            dest = default;
+            if (departedElevator is null || landingGuid == 0) return false;
+            var lo = departedElevator.DepartedCarMin;
+            var hi = departedElevator.DepartedCarMax;
+            if (pos.X < lo.X - 1f || pos.X > hi.X + 1f ||
+                pos.Z < lo.Z - 1f || pos.Z > hi.Z + 1f ||
+                pos.Y < lo.Y - 2f || pos.Y > hi.Y + 2f) return false;
+            float width = hi.X - lo.X, depth = hi.Z - lo.Z;
+            float maxLandingDistance = MathF.Max(8f, MathF.Sqrt(width * width + depth * depth) + 3f);
+            float best = float.PositiveInfinity;
+            for (int tri = 0; tri < nav.TriangleCount; tri++)
+            {
+                if (nav.SourceSnodeGuid[tri] != landingGuid || nav.IsBlocked(tri) ||
+                    nav.IsUnavailable(tri) || nav.IsFadeHidden(tri) ||
+                    !SiegeFX.Core.Nav.NavTraversal.Player.CanEnter(nav.Kinds[tri])) continue;
+                if (nav.Flags is not null && !nav.Flags.CanEnter(
+                    nav.SourceSnodeGuid[tri], (byte)nav.SourceLnodeIndex[tri],
+                    SiegeFX.Core.Nav.NavTraversal.Player.Actor)) continue;
+                var candidate = nav.NearestPointInTriangleXZ(tri, pos);
+                if (MathF.Abs(candidate.Y - pos.Y) > 3f) continue;
+                float dx = candidate.X - pos.X, dz = candidate.Z - pos.Z;
+                float d2 = dx * dx + dz * dz;
+                if (d2 >= best || d2 > maxLandingDistance * maxLandingDistance) continue;
+                best = d2;
+                dest = candidate;
+            }
+            return best < float.PositiveInfinity;
+        }
         bool StandableAt(Vector3 p, out float y)
         {
             y = p.Y;
             if (!nav.TryFindTriangle(p, out var tri, includeFadeHidden: true)) return false;
+            if (nav.IsUnavailable(tri)) return false;
             y = nav.SampleYOnTriangle(tri, p);
             return MathF.Abs(y - p.Y) <= 2.0f;
         }
         void Rescue(ActorRenderState s, SiegeFX.Core.Nav.NavFollower? follower)
         {
+            if (IsRidingAnotherMovingPlatform(s)) return;
             var pos = s.CurrentTransform.Translation;
             if (StandableAt(pos, out _)) return;
-            for (float r = 0.5f; r <= 3.01f; r += 0.5f)
+            Vector3? rescue = null;
+            for (float r = 0.5f; r <= 3.01f && rescue is null; r += 0.5f)
             {
                 for (int i = 0; i < 16; i++)
                 {
                     float a = i * MathF.PI * 2f / 16f;
                     var probe = new Vector3(pos.X + MathF.Cos(a) * r, pos.Y, pos.Z + MathF.Sin(a) * r);
                     if (!StandableAt(probe, out float y)) continue;
-                    var dest = probe with { Y = y };
-                    var t = s.CurrentTransform;
-                    t.Translation = dest;
-                    s.CurrentTransform = t;
-                    follower?.Teleport(dest);
-                    if (ReferenceEquals(s, _player)) _playerRenderInit = false;
-                    else s.PartyRenderInit = false;
-                    Console.WriteLine($"[nav-rescue] {(ReferenceEquals(s, _player) ? "player" : s.Actor.Template)} " +
-                        $"off-floor at ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) -> ({dest.X:F1},{dest.Y:F1},{dest.Z:F1})");
-                    return;
+                    rescue = probe with { Y = y };
+                    break;
                 }
             }
-            Console.WriteLine($"[nav-rescue] no floor within 3u of ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) — actor left in place");
+            if (rescue is null && TryDepartedLanding(pos, out var landing)) rescue = landing;
+            if (rescue is not { } dest)
+            {
+                Console.WriteLine($"[nav-rescue] no safe floor near ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) — actor left in place");
+                return;
+            }
+            var t = s.CurrentTransform;
+            t.Translation = dest;
+            s.CurrentTransform = t;
+            follower?.Teleport(dest);
+            if (ReferenceEquals(s, _player)) _playerRenderInit = false;
+            else s.PartyRenderInit = false;
+            Console.WriteLine($"[nav-rescue] {(ReferenceEquals(s, _player) ? "player" : s.Actor.Template)} " +
+                $"off-floor at ({pos.X:F1},{pos.Y:F1},{pos.Z:F1}) -> ({dest.X:F1},{dest.Y:F1},{dest.Z:F1})");
         }
         if (_player is not null && !_player.IsDead) Rescue(_player, _playerFollower);
         foreach (var m in _party)
@@ -20411,6 +20635,7 @@ void main()
     /// <see cref="UpdateElevatorCarInstance"/>.</summary>
     private void UpdateStairSegmentInstance(StairwellRuntime.Seg seg, Matrix4x4 pose)
     {
+        UpdatePropsOnMovingNode(seg.NodeGuid, pose);
         int idx = seg.InstanceIdx;
         if (idx < 0 || idx >= _regionInstances.Count || _regionInstances[idx].SnodeGuid != seg.NodeGuid)
         {
@@ -20425,11 +20650,26 @@ void main()
         _regionInstances[idx] = inst with { World = pose, WorldAabbMin = mn, WorldAabbMax = mx };
     }
 
+    /// <summary>Keep props attached to a moving SNO in its current world
+    /// pose, including while the terrain node is between stops.</summary>
+    private void UpdatePropsOnMovingNode(uint nodeGuid, Matrix4x4 pose)
+    {
+        _elevatorNodeOverrides[nodeGuid] = pose;
+        if (!_movingPropsByNode.TryGetValue(nodeGuid, out var attached))
+        {
+            attached = _staticProps.Where(p => p.NodeGuid == nodeGuid).ToList();
+            _movingPropsByNode[nodeGuid] = attached;
+        }
+        foreach (var prop in attached)
+            prop.World = ComposeAttachedPropWorld(prop.NodeLocalWorld, pose);
+    }
+
     /// <summary>Write <paramref name="pose"/> into the car node's render
     /// instance (found by snode guid, index cached). AABB recomputed so
     /// culling follows the platform.</summary>
     private void UpdateElevatorCarInstance(ElevatorRuntime el, Matrix4x4 pose)
     {
+        UpdatePropsOnMovingNode(el.Def.CarNodeGuid, pose);
         int idx = el.CarInstanceIdx;
         if (idx < 0 || idx >= _regionInstances.Count || _regionInstances[idx].SnodeGuid != el.Def.CarNodeGuid)
         {
@@ -20494,22 +20734,60 @@ void main()
         el.T = 0f;
         el.PrevCarPos = (el.AtStop == 1 ? el.Stop1 : el.Stop2).Translation;
         CaptureElevatorRiders(el);
+        SetElevatorRiderMovementSuspended(el, true);
+        if (el.CarInstanceIdx >= 0 && el.CarInstanceIdx < _regionInstances.Count)
+        {
+            var car = _regionInstances[el.CarInstanceIdx];
+            el.DepartedCarMin = car.WorldAabbMin;
+            el.DepartedCarMax = car.WorldAabbMax;
+        }
+        _navMesh?.SetUnavailableForSnode(el.Def.CarNodeGuid, true);
         var def = el.Def;
         bool departing1 = el.AtStop == 1;
         var info = departing1 ? def.Moving1ActionInfo : def.Moving2ActionInfo;
         var msg = departing1 ? def.Moving1Message : def.Moving2Message;
         var msgScid = departing1 ? def.Moving1Scid : def.Moving2Scid;
-        if (info.Length > 0) ApplyElevatorActionInfo(info);
+        // The authored fades describe the rider's view during travel. A
+        // remotely called empty car leaves the player on a visible landing.
+        if (info.Length > 0 && _player is not null && el.Riders.Contains(_player))
+            ApplyElevatorActionInfo(info);
         if (msgScid != 0 && msgScid != def.Scid) PostTriggerWorldMessage(msg, def.Scid, msgScid);
         Console.WriteLine($"[elevator] 0x{def.Scid:X8} departing stop{el.AtStop} -> stop{el.TargetStop} " +
             $"({def.DurationSeconds:F1}s, {el.Riders.Count} rider(s))");
     }
 
+    /// <summary>Replace the player's follower after a nav rebuild. A rider's
+    /// elevator suspension carries over so the rebuilt follower cannot walk
+    /// the hero off a moving car.</summary>
+    private void RebuildPlayerFollower(SiegeFX.Core.Nav.NavMesh nav, Vector3 pos, float speed)
+    {
+        bool wasSuspended = _playerFollower?.MovementSuspended == true;
+        // Phase 24-NAV-LOGICAL-FLAGS — player respects the lf_human_player
+        // gate; computer-only zones are rejected as paths.
+        _playerFollower = new SiegeFX.Core.Nav.NavFollower(nav, pos, speed)
+        {
+            Traversal = SiegeFX.Core.Nav.NavTraversal.Player,
+            DiagnosticLogging = true,
+        };
+        if (wasSuspended) _playerFollower.SetMovementSuspended(true);
+    }
+
+    private void SetElevatorRiderMovementSuspended(ElevatorRuntime el, bool suspended)
+    {
+        foreach (var rider in el.Riders)
+        {
+            var follower = ReferenceEquals(rider, _player)
+                ? _playerFollower : rider.Brain?.Wander?.Follower;
+            follower?.SetMovementSuspended(suspended);
+        }
+    }
+
     /// <summary>movingN_actioninfo — semicolon-joined fade_nodes tuples
     /// "region,section,level,object,mode[,delaySeconds]" routed through the
     /// same handler trigger fade_nodes actions use.</summary>
-    private void ApplyElevatorActionInfo(string info)
+    private void ApplyElevatorActionInfo(string info, bool immediate = false)
     {
+        if (info.Length == 0) return;
         foreach (var piece in info.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             var parts = piece.Split(',', StringSplitOptions.TrimEntries);
@@ -20523,7 +20801,7 @@ void main()
             if (parts.Length >= 6)
                 float.TryParse(parts[5].TrimEnd('f', 'F'), System.Globalization.NumberStyles.Float,
                     System.Globalization.CultureInfo.InvariantCulture, out delay);
-            if (delay > 0f) _elevatorDelayedFades.Add((delay, args));
+            if (delay > 0f && !immediate) _elevatorDelayedFades.Add((delay, args));
             else OnTriggerFadeNodes("fade_nodes", args);
         }
     }
@@ -20788,7 +21066,13 @@ void main()
         ActorRenderState? atk = null;
         foreach (var a in _actors)
             if (ReferenceEquals(a.Brain, brain)) { atk = a; break; }
-        if (atk is not null) PerformPropBreak(best, atk.Actor.Stats);
+        if (atk is null) return;
+        // The brain already plays the smasher's own chore_attack. Resolve the
+        // break directly: PerformPropBreak is the PLAYER's swing (it turns
+        // the hero and starts the hero's attack), so routing a monster's
+        // fidget through it made the hero swing at random while walking.
+        Console.WriteLine($"[fidget] {atk.Actor.Template.Name} smashes {best.Template}");
+        ResolveSwingHitOnProp(best, atk.Actor.Stats);
     }
 
     // ── SC-MOB-PARTIES (blindspot Phase B) ────────────────────────────────
@@ -21394,7 +21678,7 @@ void main()
                 }
                 else
                 {
-                    var lp = lever.World.Translation;
+                    var lp = LeverPosition(lever);
                     float dx = pp.X - lp.X, dz = pp.Z - lp.Z;
                     // XZ range only + generous vertical: wall-mounted levers
                     // sit ~chest height above the floor the player stands on.
@@ -21499,6 +21783,7 @@ void main()
 
             if (el.T >= 1f)
             {
+                SetElevatorRiderMovementSuspended(el, false);
                 el.Moving = false;
                 el.AtStop = el.TargetStop;
                 var final = el.AtStop == 1 ? el.Stop1 : el.Stop2;
@@ -21516,11 +21801,7 @@ void main()
                     {
                         var pos = _player.CurrentTransform.Translation;
                         var speed = _playerFollower.Speed;
-                        _playerFollower = new SiegeFX.Core.Nav.NavFollower(nav, pos, speed)
-                        {
-                            Traversal = SiegeFX.Core.Nav.NavTraversal.Player,
-                            DiagnosticLogging = true,
-                        };
+                        RebuildPlayerFollower(nav, pos, speed);
                     }
                     // Party riders get a fresh follower on the new mesh at
                     // their ridden position (their old follower still holds
@@ -21539,7 +21820,7 @@ void main()
                     // this the follower's vertical re-bind gate correctly
                     // refuses the shaft bottom 12u below — and the player
                     // freezes over the hole with every click refused.
-                    RescueOffMeshAfterRebuild(nav);
+                    RescueOffMeshAfterRebuild(nav, el);
                 }
                 el.Riders.Clear();
                 Console.WriteLine($"[elevator] 0x{el.Def.Scid:X8} arrived at stop{el.AtStop}");
@@ -21599,11 +21880,7 @@ void main()
                     {
                         var pos = _player.CurrentTransform.Translation;
                         var speed = _playerFollower.Speed;
-                        _playerFollower = new SiegeFX.Core.Nav.NavFollower(nav, pos, speed)
-                        {
-                            Traversal = SiegeFX.Core.Nav.NavTraversal.Player,
-                            DiagnosticLogging = true,
-                        };
+                        RebuildPlayerFollower(nav, pos, speed);
                     }
                     foreach (var seg in sw.Segments)
                     foreach (var r in seg.Riders)
@@ -21653,10 +21930,35 @@ void main()
     /// <paramref name="refPos"/>. False when the lever authors none (or none
     /// resolve) — callers fall back to plain lever-origin range.</summary>
     private bool TryNearestLeverUsePoint(StaticPropInstance lever, Vector3 refPos, out Vector3 world)
+        => TryNearestUsePoint(lever.LeverUsePointScids, refPos, out world);
+
+    private bool TryLeverApproachPoint(StaticPropInstance lever, out Vector3 point, out int triangle)
+    {
+        point = default;
+        triangle = -1;
+        if (_navMesh is null || _playerFollower is null) return false;
+        var actorPos = ActingCharacter()?.CurrentTransform.Translation ?? _playerFollower.Position;
+        if (TryNearestLeverUsePoint(lever, actorPos, out var authored)
+            && _navMesh.TryFindTriangle(authored, out triangle)
+            && !PlayerCannotStandOn(triangle))
+        {
+            point = authored;
+            return true;
+        }
+        var center = LeverPosition(lever);
+        if (!_navMesh.TryFindNearestEnterable(center,
+            MathF.Max(2f, lever.LeverUseRange), 3.5f,
+            SiegeFX.Core.Nav.NavTraversal.Player, out triangle, out point)) return false;
+        float dx = point.X - center.X, dz = point.Z - center.Z;
+        return dx * dx + dz * dz <= lever.LeverUseRange * lever.LeverUseRange
+            && !PlayerCannotStandOn(triangle);
+    }
+
+    private bool TryNearestUsePoint(uint[] scids, Vector3 refPos, out Vector3 world)
     {
         world = default;
         float best = float.MaxValue;
-        foreach (var s in lever.LeverUsePointScids)
+        foreach (var s in scids)
         {
             if (!TryGetUsePointWorld(s, out var w)) continue;
             float d = Vector3.DistanceSquared(w, refPos);
@@ -21669,49 +21971,94 @@ void main()
     /// the click ray must pass within a hand's width of the lever PROP —
     /// clicking the floor near a lever is just a move (the old floor-point
     /// radius turned ordinary walk clicks by the farm winch into "send the
-    /// elevator away", stranding the player topside). Floor-mounted levers
-    /// keep a tight floor-hit fallback for clicks at their base. The pull
+    /// elevator away", stranding the player topside). The pull
     /// fires from TickElevators once the player reaches the lever's authored
     /// use point (or plain use range when none authored).</summary>
     private void RequestLeverUseNear(Vector3 rayOrigin, Vector3 rayDir, Vector3 floorHit)
     {
-        if (_leverProps.Count == 0) return;
+        _pendingLeverUse = PickLeverOnRay(rayOrigin, rayDir, floorHit);
+    }
+
+    /// <summary>Shared lever probe for hover and click. A control only owns
+    /// the cursor when its pick volume is reached before the clicked floor.</summary>
+    private StaticPropInstance? PickLeverOnRay(Vector3 rayOrigin, Vector3 rayDir,
+        Vector3? floorHit, float floorAllowance = 0f, bool posedOnly = false)
+    {
+        if (_leverProps.Count == 0) return null;
         var dir = rayDir;
         float dlen = dir.Length();
-        if (dlen > 1e-6f) dir /= dlen;
+        if (dlen <= 1e-6f) return null;
+        dir /= dlen;
+        // A wall control can be visible even when its ray has no walkable
+        // floor behind it. Only posed controls get that floorless fallback;
+        // their visible mesh or its tightly bounded pick volume must be hit.
+        float floorDistance = floorHit is { } floor
+            ? Vector3.Dot(floor - rayOrigin, dir) + floorAllowance : 120f;
         StaticPropInstance? best = null;
         float bestScore = float.MaxValue;
         foreach (var l in _leverProps)
         {
-            if (l.IsDestroyed) continue;
+            if (l.IsDestroyed || l.ForceNoRender || IsAbovePlayer(l.RegionPath)
+                || (l.NodeGuid != 0 && _fadedSnodeCounts.ContainsKey(l.NodeGuid))) continue;
+            if (l.LeverPoseApplied && l.LeverPose is { } pose)
+            {
+                pose.Update(_terrainTime);
+                float limit = Math.Min(120f, floorDistance + 0.05f);
+                if (pose.TryRayHit(rayOrigin, dir, l.World, limit, out float distance)
+                    && distance < bestScore) { bestScore = distance; best = l; }
+                else
+                {
+                    // Thin buttons sit flush with authored floor/wall meshes.
+                    // A tight volume around the POSED shape covers tiny gaps
+                    // between visible triangles and the nav ray, without the
+                    // old broad floor-point proximity pick.
+                    var center = LeverPosition(l);
+                    float scale = MathF.Max(
+                        Vector3.TransformNormal(Vector3.UnitX, l.World).Length(),
+                        MathF.Max(Vector3.TransformNormal(Vector3.UnitY, l.World).Length(),
+                                  Vector3.TransformNormal(Vector3.UnitZ, l.World).Length()));
+                    float radius = Math.Clamp((pose.Max - pose.Min).Length() * 0.5f * scale + 0.08f,
+                        0.18f, 0.55f);
+                    if (LeverRayHitBeforeFloor(rayOrigin, dir, floorDistance, center,
+                            out distance, radius) && distance < bestScore)
+                    { bestScore = distance; best = l; }
+                }
+                continue;
+            }
+            if (floorHit is null || posedOnly) continue;
             var lp = l.World.Translation;
             // Primary: click ray passes close to the lever prop itself
             // (covers wall/ceiling mounts like the winch — the nav-mesh hit
             // under them is meaningless for selection).
-            var toL = lp - rayOrigin;
-            float t = Vector3.Dot(toL, dir);
-            if (t > 0f && t < 120f)
-            {
-                float rd = Vector3.Distance(rayOrigin + dir * t, lp);
-                if (rd <= 0.9f && rd < bestScore) { bestScore = rd; best = l; continue; }
-            }
-            // Fallback: floor-mounted levers whose origin sits at the hit.
-            float dx = lp.X - floorHit.X, dz = lp.Z - floorHit.Z;
-            float dxz = MathF.Sqrt(dx * dx + dz * dz);
-            if (dxz <= 1.0f && MathF.Abs(lp.Y - floorHit.Y) <= 2.0f && dxz < bestScore)
-            { bestScore = dxz; best = l; }
+            if (LeverRayHitBeforeFloor(rayOrigin, dir, floorDistance, lp, out float rd)
+                && rd < bestScore) { bestScore = rd; best = l; }
         }
-        _pendingLeverUse = best;
+        return best;
+    }
+
+    internal static bool LeverRayHitBeforeFloor(Vector3 origin, Vector3 unitDir,
+        float floorDistance, Vector3 lever, out float rayDistance, float pickRadius = 0.9f)
+    {
+        float t = Vector3.Dot(lever - origin, unitDir);
+        float radialDistance = Vector3.Distance(origin + unitDir * t, lever);
+        rayDistance = 0f;
+        if (t <= 0f || t >= 120f || radialDistance > pickRadius) return false;
+        // Compare the FIRST intersection with the lever's pick volume, not
+        // its origin: an oblique click can hit the upper part of a floor
+        // lever before the floor while its origin lies slightly beyond it.
+        float entry = t - MathF.Sqrt(pickRadius * pickRadius - radialDistance * radialDistance);
+        rayDistance = MathF.Max(0f, entry);
+        return entry <= floorDistance + 0.05f;
     }
 
     private void PullLever(StaticPropInstance lever)
     {
-        lever.LeverOn = !lever.LeverOn;
+        SetLeverState(lever, !lever.LeverOn);
         // SC-MATERIAL-MATRIX — the lever's authored material picks its pull
         // sound (winch chain, metal crank, wooden handle — 12 authored
         // lever_start rows).
         PlayMaterialEvent(MaterialOfRef(lever.Template), "generic", "lever_start",
-            lever.World.Translation);
+            LeverPosition(lever));
         // SC-LEVER-MULTISEND — every authored send pair fires on the pull.
         var sends = lever.LeverOn ? lever.LeverOnSends : lever.LeverOffSends;
         Console.WriteLine($"[lever] 0x{lever.Scid:X8} pulled -> {(lever.LeverOn ? "on" : "off")}: " +
@@ -22088,70 +22435,145 @@ void main()
             Console.WriteLine($"  auto-traps: {added} armed ({_autoTraps.Count} total)");
     }
 
-    // SC-DOORS-OPEN — a left-click that lands on/near a door opens it (DS1
-    // doors are click-to-use, not proximity). The click ray is resolved
-    // against the navmesh, so a tall door's base sits at ~hit; the door's
-    // World.Translation is its hinge (the asp origin), and the leaf reaches
-    // ~1.6u from there, so a ~2u radius covers a click anywhere on the leaf.
-    private void OpenDoorNear(Vector3 worldPoint)
+    /// <summary>Hit the visible closed leaf, not a broad circle on the floor.
+    /// Hover and activation call this same ray/mesh-bounds test.</summary>
+    private StaticPropInstance? PickDoorAtCursor(Vector2 cursorPx)
     {
-        if (_doorProps.Count == 0) return;
+        if (_doorProps.Count == 0 || _window is null) return null;
+        var size = _window.FramebufferSize;
+        if (size.X <= 0 || size.Y <= 0) return null;
+        float ndcX = cursorPx.X / size.X * 2f - 1f;
+        float ndcY = 1f - cursorPx.Y / size.Y * 2f;
+        if (!Matrix4x4.Invert(_camera.GetViewProjection((float)size.X / size.Y), out var invVp))
+            return null;
+        var nearH = Vector4.Transform(new Vector4(ndcX, ndcY, -1f, 1f), invVp);
+        var farH = Vector4.Transform(new Vector4(ndcX, ndcY, 1f, 1f), invVp);
+        if (MathF.Abs(nearH.W) < 1e-6f || MathF.Abs(farH.W) < 1e-6f) return null;
+        var near = new Vector3(nearH.X / nearH.W, nearH.Y / nearH.W, nearH.Z / nearH.W);
+        var far = new Vector3(farH.X / farH.W, farH.Y / farH.W, farH.Z / farH.W);
         StaticPropInstance? best = null;
-        float bestD2 = 2.0f * 2.0f;
-        foreach (var d in _doorProps)
+        float bestT = float.MaxValue;
+        foreach (var door in _doorProps)
         {
-            if (d.IsDestroyed || d.DoorTargetOpen) continue;
-            var dp = d.World.Translation;
-            float dx = dp.X - worldPoint.X, dz = dp.Z - worldPoint.Z;
-            float dd = dx * dx + dz * dz;
-            if (dd < bestD2) { bestD2 = dd; best = d; }
+            if (door.IsDestroyed || door.DoorTargetOpen || door.ForceNoRender
+                || IsAbovePlayer(door.RegionPath)
+                || (door.NodeGuid != 0 && _fadedSnodeCounts.ContainsKey(door.NodeGuid))) continue;
+            if (!DoorInteractionGeometry.TryPick(near, far, door.World,
+                    door.Mesh.Min, door.Mesh.Max, out float t) || t >= bestT) continue;
+            best = door;
+            bestT = t;
         }
-        if (best is null) return;
+        return best;
+    }
 
-        // ALPHA-2E — use_toggle doors are scripted gates: clicking shows the
-        // authored stuck/locked line; only a quest message opens them.
-        if (best.DoorUseToggle)
+    private bool TryClickToUseDoor(Vector2 cursorPx)
+    {
+        if (_nisPhase != NisPhase.Off || _player is null || _player.IsDead) return false;
+        // Keep the click result consistent with the hover priority: an item,
+        // enemy, or breakable visibly under the cursor owns that pixel.
+        var other = PickInteractiveAtCursor(cursorPx);
+        if (other.Enemy is not null || other.Prop is not null || other.Pile is not null)
+            return false;
+        var door = PickDoorAtCursor(cursorPx);
+        if (door is null) return false;
+        var actor = ActingCharacter();
+        if (actor is null || actor.IsDead) return false;
+        _pendingDoorUse = door;
+        _pendingDoorActor = actor;
+        _pendingAttackTarget = null;
+        _pendingCastTarget = null;
+        _pendingCastProp = null;
+        _pendingBreakProp = null;
+        _pendingPickupPile = null;
+        _pendingLeverUse = null;
+        _pendingChestUse = null;
+        _pendingLockedUse = null;
+        _forceAttackArmed = false;
+        _forceCastArmed = false;
+        var target = DoorUseTarget(door, actor.CurrentTransform.Translation,
+            out _pendingDoorHasAuthoredPoint);
+        _pendingDoorPoint = target;
+        bool heroSelected = ReferenceEquals(actor, _player);
+        if (heroSelected) _playerFollower?.SetTarget(target);
+        IssueSelectedMemberMoveOrders(target, heroSelected);
+        // The interacting companion must reach the authored stand point;
+        // formation offsets can sit outside the narrow use range.
+        if (!heroSelected && actor.Brain is not null)
+            actor.MoveOrder = SnapToNavmesh(target, target);
+        TryCompletePendingDoorUse();
+        return true;
+    }
+
+    private Vector3 DoorUseTarget(StaticPropInstance door, Vector3 actorPos, out bool authoredPoint)
+    {
+        if (TryNearestUsePoint(door.DoorUsePointScids, actorPos, out var point))
+        { authoredPoint = true; return point; }
+        authoredPoint = false;
+        return Vector3.Transform((door.Mesh.Min + door.Mesh.Max) * 0.5f, door.World);
+    }
+
+    private void TryCompletePendingDoorUse()
+    {
+        var door = _pendingDoorUse;
+        if (door is null) return;
+        if (door.IsDestroyed || door.DoorTargetOpen || !_doorProps.Contains(door))
+        { _pendingDoorUse = null; _pendingDoorActor = null; return; }
+        var actor = _pendingDoorActor;
+        if (actor is null || actor.IsDead || !ReferenceEquals(actor, ActingCharacter()))
+        { _pendingDoorUse = null; _pendingDoorActor = null; return; }
+        var pos = actor.CurrentTransform.Translation;
+        var point = _pendingDoorPoint;
+        float dx = pos.X - point.X, dz = pos.Z - point.Z;
+        float range = _pendingDoorHasAuthoredPoint ? MathF.Max(0.1f, door.DoorUseRange)
+                                    : MathF.Max(0.8f, door.DoorUseRange);
+        if (dx * dx + dz * dz > range * range || MathF.Abs(pos.Y - point.Y) > 2.5f)
+            return;
+        _pendingDoorUse = null;
+        _pendingDoorActor = null;
+        OpenDoorByUse(door);
+    }
+
+    private StaticPropInstance? LinkedDoor(StaticPropInstance door)
+        => door.DoorSecondScid != 0 && _doorsByScid.TryGetValue(door.DoorSecondScid, out var other)
+            && other.IsDoor && !other.IsDestroyed ? other : null;
+
+    private void SetDoorOpen(StaticPropInstance door, bool open)
+    {
+        door.DoorTargetOpen = open;
+        if (!open) return;
+        door.DoorSwingSign = door.DoorIsFlip ? ComputeFlipSwingSign(door) : ComputeDoorSwingSign(door);
+        LogDoorDiag(door);
+    }
+
+    private void OpenDoorByUse(StaticPropInstance door)
+    {
+        var partner = LinkedDoor(door);
+        var locked = door.DoorUseToggle ? door : partner is { DoorUseToggle: true } ? partner : null;
+        if (locked is not null)
         {
-            var line = best.DoorLockedText.Length > 0 ? best.DoorLockedText : "It won't budge.";
-            AddFloatingText(line, best.World.Translation + new Vector3(0f, 2.0f, 0f),
-                            new Vector4(0.95f, 0.92f, 0.75f, 1f));
-            Console.WriteLine($"[door] 0x{best.Scid:X8} use_toggle refused click: \"{line}\"");
+            var line = locked.DoorLockedText.Length > 0 ? locked.DoorLockedText : "It won't budge.";
+            AddFloatingText(line, door.World.Translation + new Vector3(0f, 2f, 0f),
+                new Vector4(0.95f, 0.92f, 0.75f, 1f));
             return;
         }
-
-        if (best.DoorIsFlip)
+        SetDoorOpen(door, true);
+        if (partner is not null && !ReferenceEquals(partner, door)) SetDoorOpen(partner, true);
+        else if (door.DoorIsFlip)
         {
-            // Bulkhead/storm doors come as a pair that opens together — open
-            // every flip door near the click, not just the nearest leaf. Each
-            // leaf swings around its local-Y seam hinge with a geometry-based
-            // sign that lifts its outer edge up.
-            var seed = best.World.Translation;
-            foreach (var d in _doorProps)
+            // Old bulkhead content has nearby paired leaves without an
+            // explicit second_door SCID. Preserve its geometric pairing.
+            foreach (var other in _doorProps)
             {
-                if (d.IsDestroyed || d.DoorTargetOpen || !d.DoorIsFlip) continue;
-                var dp = d.World.Translation;
-                float ex = dp.X - seed.X, ez = dp.Z - seed.Z;
-                if (ex * ex + ez * ez > 3.0f * 3.0f) continue;
-                d.DoorTargetOpen = true;
-                d.DoorSwingSign = ComputeFlipSwingSign(d);
-                LogDoorDiag(d);
+                if (ReferenceEquals(other, door) || other.IsDestroyed || other.DoorTargetOpen
+                    || !other.DoorIsFlip) continue;
+                var delta = other.World.Translation - door.World.Translation;
+                if (delta.X * delta.X + delta.Z * delta.Z <= 9f)
+                    SetDoorOpen(other, true);
             }
-            // SC-MATERIAL-MATRIX — the door's authored material picks its
-            // open sound (21 authored rows); the creak stays the fallback.
-            if (!PlayMaterialEvent(MaterialOfRef(best.Template), "generic", "door_open", seed))
-                _audio?.PlayAt(SfxDoorOpen, seed);
-            // SC-DOORS-BLOCK — opened doors free their doorway triangles.
-            MarkAllObstacles();
-            return;
         }
-
-        best.DoorTargetOpen = true;
-        best.DoorSwingSign = ComputeDoorSwingSign(best);
-        if (!PlayMaterialEvent(MaterialOfRef(best.Template), "generic", "door_open", best.World.Translation))
-            _audio?.PlayAt(SfxDoorOpen, best.World.Translation);
-        NotifyDoorOpened(best);
-        LogDoorDiag(best);
-        // SC-DOORS-BLOCK — opened doors free their doorway triangles.
+        if (!PlayMaterialEvent(MaterialOfRef(door.Template), "generic", "door_open", door.World.Translation))
+            _audio?.PlayAt(SfxDoorOpen, door.World.Translation);
+        NotifyDoorOpened(door);
         MarkAllObstacles();
     }
 
@@ -22170,10 +22592,12 @@ void main()
         if (door.IsDestroyed) return;
         bool opening = !door.DoorTargetOpen;
         if (!opening && door.DoorOneShot) return; // oneshot gates stay open
-        door.DoorTargetOpen = opening;
+        SetDoorOpen(door, opening);
+        var partner = LinkedDoor(door);
+        if (partner is not null && !ReferenceEquals(partner, door)
+            && (opening || !partner.DoorOneShot)) SetDoorOpen(partner, opening);
         if (opening)
         {
-            door.DoorSwingSign = door.DoorIsFlip ? ComputeFlipSwingSign(door) : ComputeDoorSwingSign(door);
             _audio?.PlayAt(SfxDoorOpen, door.World.Translation);
             NotifyDoorOpened(door);
         }
@@ -22202,8 +22626,7 @@ void main()
             {
                 var pos = _playerFollower.Position;
                 var speed = _playerFollower.Speed;
-                _playerFollower = new SiegeFX.Core.Nav.NavFollower(nav, pos, speed)
-                { Traversal = SiegeFX.Core.Nav.NavTraversal.Player, DiagnosticLogging = true };
+                RebuildPlayerFollower(nav, pos, speed);
             }
         }
     }
@@ -22323,17 +22746,15 @@ void main()
         return xCenter >= 0f ? -1f : 1f;
     }
 
-    // Swing the leaf AWAY from the player: transform the player into the
-    // door's local (raw Z-up) frame — where Y is the thin thickness axis —
-    // and pick the sign so the free edge sweeps to the opposite side.
-    // CreateRotationZ(+) sends the -X free edge toward -Y, so a player on
-    // the +Y side wants +sign (door opens to -Y, away from them).
+    // Swing the free edge away from the player. Paired leaves extend in
+    // opposite local X directions, so the leaf geometry matters as well as
+    // which side of the doorway the player stands on.
     private float ComputeDoorSwingSign(StaticPropInstance door)
     {
-        if (_player is null) return 1f;
-        if (!Matrix4x4.Invert(door.World, out var inv)) return 1f;
-        var pLocal = Vector3.Transform(_player.CurrentTransform.Translation, inv);
-        return pLocal.Y >= 0f ? 1f : -1f;
+        var actor = ActingCharacter() ?? _player;
+        if (actor is null) return 1f;
+        return DoorInteractionGeometry.SwingSign(door.World, door.Mesh.Min,
+            door.Mesh.Max, actor.CurrentTransform.Translation);
     }
 
     /// <summary>Phase 21c-1 barrel investigation: one-shot per-template dump of the
@@ -23294,12 +23715,19 @@ void main()
         return false;
     }
 
-    private Matrix4x4 ComposePlacementWorld(AspMesh asp, SiegeFX.Core.Assets.NodePlacement p)
+    private static Matrix4x4 ComposePlacementLocal(AspMesh asp, SiegeFX.Core.Assets.NodePlacement p)
     {
         var bindRoot = ComputeRootBindPose(asp);
-        var local = bindRoot *
-                    Matrix4x4.CreateFromQuaternion(p.Orientation) *
-                    Matrix4x4.CreateTranslation(p.LocalPosition);
+        return bindRoot * Matrix4x4.CreateFromQuaternion(p.Orientation) *
+               Matrix4x4.CreateTranslation(p.LocalPosition);
+    }
+
+    internal static Matrix4x4 ComposeAttachedPropWorld(Matrix4x4 nodeLocalWorld, Matrix4x4 nodePose)
+        => nodeLocalWorld * nodePose;
+
+    private Matrix4x4 ComposePlacementWorld(AspMesh asp, SiegeFX.Core.Assets.NodePlacement p)
+    {
+        var local = ComposePlacementLocal(asp, p);
         if (_regionLayout is null) return local;
         if (!_regionLayout.TryGetTransform(p.NodeGuid, out var nodeWorld)) return local;
         return local * nodeWorld;
@@ -23358,7 +23786,7 @@ void main()
     /// Z-up — the torch cantilevering off the wall. The correct test is whether
     /// any GEOMETRY binds past bone 0: attach bones carry no verts, so a rigid
     /// prop reads max-geometry-bone 0 regardless of how many sockets it has.</summary>
-    private static Matrix4x4 ComputeRootBindPose(AspMesh asp)
+    internal static Matrix4x4 ComputeRootBindPose(AspMesh asp)
     {
         if (asp.BindPose.Length == 0) return Matrix4x4.Identity;
         if (!IsRigidRootProp(asp)) return Matrix4x4.Identity;
@@ -23479,6 +23907,10 @@ void main()
             // and TryFindTriangle re-glues actors to them. All fade writers
             // are whole-snode, so the snode ref-count map is the full truth.
             nav.SetFadeHiddenForSnodes(new HashSet<uint>(_fadedSnodeCounts.Keys), true);
+            // A rebuild during travel must not resurrect the departing car's
+            // baked floor before the arrival pose is committed.
+            foreach (var moving in _elevators)
+                if (moving.Moving) nav.SetUnavailableForSnode(moving.Def.CarNodeGuid, true);
             Console.WriteLine($"  nav mesh rebuild: {nav.TriangleCount} tri(s), " +
                               $"{nav.Vertices.Length} welded vert(s), " +
                               $"{nav.SourceSnodeCount} snode(s), " +
@@ -24276,6 +24708,11 @@ void main()
                 if (_dialogueWasOpen && !dlgOpenNow
                     && _lastTalkedActor is { AlignSwitchArmed: true, AlignSwitchOnTalkEnd: true } talked)
                     TriggerAlignmentSwitch(talked, "speech ended");
+                if (_dialogueWasOpen && !dlgOpenNow)
+                {
+                    OnDialogueVisitClosed();
+                    dlgOpenNow = _dialogue.IsOpen; // "Directions" reopens at once
+                }
                 _dialogueWasOpen = dlgOpenNow;
                 // SC-MOB-DOGPILE — rebuild the per-victim melee-attacker
                 // counts each tick; the quarry picker reads them to spread
@@ -26128,13 +26565,20 @@ void main()
     /// actor from where the player stands? False when the actor is hidden
     /// with a faded-out layer OR standing a floor above/below.</summary>
     private bool PickableFromPlayerFloor(ActorRenderState s)
-    {
-        var p = s.CurrentTransform.Translation;
-        if (_player is not null
-            && MathF.Abs(p.Y - _player.CurrentTransform.Translation.Y) > PickSameFloorYBand)
-            return false;
-        return !IsPosInFadedSnode(p);
-    }
+        => OnPlayerFloor(s.CurrentTransform.Translation) && !IsActorInFadedSnode(s);
+
+    /// <summary>Same rule for world objects (breakables): a crate in the
+    /// cellar under the player's feet projects onto the screen right where
+    /// the grass is, so without it the hammer cursor and break-click owned
+    /// open ground above every hidden cellar.</summary>
+    private bool PickableFromPlayerFloor(StaticPropInstance prop)
+        => OnPlayerFloor(prop.World.Translation) && !prop.ForceNoRender
+           && !IsAbovePlayer(prop.RegionPath)
+           && !(prop.NodeGuid != 0 && _fadedSnodeCounts.ContainsKey(prop.NodeGuid));
+
+    private bool OnPlayerFloor(Vector3 p)
+        => _player is null
+           || MathF.Abs(p.Y - _player.CurrentTransform.Translation.Y) <= PickSameFloorYBand;
 
     /// <summary>SC-SCREEN-PICK — pick the actor whose SCREEN body the
     /// cursor is on: project the feet→head segment of every candidate to
@@ -26382,7 +26826,8 @@ void main()
     // quick-teleport list of every region in the map tank.
     // ====================================================================
     private bool _devConsoleOpen;
-    private bool _devGodMode;
+    // God mode = immortality. SIEGEFX_DEV_GOD=1 starts a dev session with it on.
+    private bool _devGodMode = DevHotkeys && Environment.GetEnvironmentVariable("SIEGEFX_DEV_GOD") == "1";
     private string _devItemText = "";
     private bool _devItemFocus;
     private int _devRegionScroll;
@@ -26433,7 +26878,10 @@ void main()
 
     private void TickDevGodMode()
     {
-        if (!_devGodMode || _player is null || _player.IsDead) return;
+        if (_player is null || _player.IsDead) return;
+        // Applied every tick: a load or respawn replaces the hero's combat state.
+        _player.Actor.Combat.Invulnerable = _devGodMode;
+        if (!_devGodMode) return;
         var st = _player.Actor.Stats;
         _player.Actor.Combat.Heal(st.MaxLife);
         _player.Actor.Combat.RestoreMana(st.MaxMana);
@@ -28892,12 +29340,13 @@ void main()
         string? shieldRef = FromInstanceEquipment("shield_hand")
             ?? store.GetAttribute(tpl, "inventory", "equipment", "es_shield_hand")?.Trim();
 
+        Random? tableRng = null;
         if (weaponRef is null || shieldRef is null)
         {
             var table = SiegeFX.Core.Actors.LootTable.FromTemplate(store, tpl, inst);
             if (table.Equipped.Count > 0)
             {
-                var rng = new Random(unchecked((int)s.Actor.Instance.Scid ^ 0x057EAB));
+                var rng = tableRng = new Random(unchecked((int)s.Actor.Instance.Scid ^ 0x057EAB));
                 void Walk(SiegeFX.Core.Actors.LootBucket bucket)
                 {
                     if (bucket.Entries.Count > 0)
@@ -28912,22 +29361,22 @@ void main()
                     foreach (var c in bucket.Children) Walk(c);
                 }
                 foreach (var b in table.Equipped) Walk(b);
-                // Resolve #club/2-3-style specs to a concrete template with the
-                // same scid rng so the pick is stable across sessions.
-                if (weaponRef is not null && SiegeFX.Core.Actors.PcontentResolver.IsSpec(weaponRef))
-                {
-                    _pcontentResolver ??= new SiegeFX.Core.Actors.PcontentResolver(store);
-                    weaponRef = _pcontentResolver.TryResolve(weaponRef, rng, out var rolled, out _)
-                        ? rolled : null;
-                }
-                if (shieldRef is not null && SiegeFX.Core.Actors.PcontentResolver.IsSpec(shieldRef))
-                {
-                    _pcontentResolver ??= new SiegeFX.Core.Actors.PcontentResolver(store);
-                    shieldRef = _pcontentResolver.TryResolve(shieldRef, rng, out var rolled, out _)
-                        ? rolled : null;
-                }
             }
         }
+        // Resolve #club/2-3-style specs to a concrete template with a per-scid
+        // rng so the pick is stable across sessions. Runs for directly authored
+        // [equipment] specs too ("#sd_g_c_st_1h_avg:o_avg" on Elddim's guards),
+        // which used to skip this and leave the NPC unarmed.
+        // Continuing the loot-table walk's sequence keeps those NPCs' rolls unchanged.
+        var specRng = tableRng ?? new Random(unchecked((int)s.Actor.Instance.Scid ^ 0x057EAB));
+        string? RollSpec(string? itemRef)
+        {
+            if (itemRef is null || !SiegeFX.Core.Actors.PcontentResolver.IsSpec(itemRef)) return itemRef;
+            _pcontentResolver ??= new SiegeFX.Core.Actors.PcontentResolver(store);
+            return _pcontentResolver.TryResolve(itemRef, specRng, out var rolled, out _) ? rolled : null;
+        }
+        weaponRef = RollSpec(weaponRef);
+        shieldRef = RollSpec(shieldRef);
         if (weaponRef is null && shieldRef is null) return;
 
         int FindBone(string name)
@@ -28959,6 +29408,8 @@ void main()
                 s.ShieldMesh = sVis.Mesh;
                 s.ShieldTexture = sVis.Tex;
                 s.ShieldBoneIdx = idx;
+                s.ShieldIsShield = store.TryGet(shieldRef, out var shTpl)
+                    && SiegeFX.Core.Actors.WeaponStance.IsShield(shTpl);
             }
         }
 
@@ -29003,8 +29454,13 @@ void main()
     {
         if (_templateStore is null) return;
         for (var t = s.Actor.Template; t is not null; t = t.Specializes)
+        {
             if (t.Name.Equals("actor_evil", StringComparison.OrdinalIgnoreCase))
             { s.IsEvilAligned = true; break; }
+            // Ambient life (rats, birds) is scenery: never a talk partner.
+            if (t.Name.Equals("actor_ambient", StringComparison.OrdinalIgnoreCase))
+            { s.IsAmbient = true; break; }
+        }
         var sel = _templateStore.GetAttribute(s.Actor.Template, "common", "is_selectable");
         if (!string.IsNullOrEmpty(sel)
             && sel.Trim().Trim('"').Equals("false", StringComparison.OrdinalIgnoreCase))
@@ -29062,7 +29518,7 @@ void main()
         if (_templateStore is null) return;
         var dict = GetEquipmentDict(partyIndex);
         s.WeaponMesh = null; s.WeaponTexture = null; s.WeaponBoneIdx = -1; s.WieldedWeaponRef = null;
-        s.ShieldMesh = null; s.ShieldTexture = null; s.ShieldBoneIdx = -1;
+        s.ShieldMesh = null; s.ShieldTexture = null; s.ShieldBoneIdx = -1; s.ShieldIsShield = false;
         int FindBone(string name)
         {
             var bones = s.Actor.Mesh.BoneNames;
@@ -29089,6 +29545,8 @@ void main()
             if (idx >= 0)
             {
                 s.ShieldMesh = sVis.Mesh; s.ShieldTexture = sVis.Tex; s.ShieldBoneIdx = idx;
+                s.ShieldIsShield = _templateStore.TryGet(ResolveItemRef(sref), out var shTpl)
+                    && SiegeFX.Core.Actors.WeaponStance.IsShield(shTpl);
             }
         }
     }
@@ -29144,6 +29602,8 @@ void main()
         }
         visual = (mesh, tex);
         _npcGearCache[modelName!] = visual;
+        _npcGearBindInv[mesh] = asp.InverseBindMatrices.Length > 0
+            ? asp.InverseBindMatrices[0] : Matrix4x4.Identity;
         return true;
     }
 
@@ -29192,31 +29652,56 @@ void main()
         // edge from a shallow camera angle).
         Vector3 hit;
         int tri;
+        StaticPropInstance? leverWithoutFloor = null;
         if (!_navMesh.TryRaycast(near, dir, dir.Length(), out tri, out hit))
         {
-            float planeY = _playerFollower.Position.Y;
-            if (MathF.Abs(dir.Y) < 1e-4f) return;
-            float t = (planeY - near.Y) / dir.Y;
-            if (t < 0f) return;
-            hit = near + dir * t;
-            if (TryClickPickupAt(hit)) return;
-            if (!_navMesh.TryFindTriangle(hit, out tri)) return;
+            leverWithoutFloor = PickLeverOnRay(near, dir, null);
+            if (leverWithoutFloor is not null && TryLeverApproachPoint(leverWithoutFloor, out hit, out tri))
+            {
+                // A visible wall button is an interaction even if the cursor
+                // ray passes beyond every walkable triangle.
+            }
+            else
+            {
+                leverWithoutFloor = null;
+                float planeY = _playerFollower.Position.Y;
+                if (MathF.Abs(dir.Y) < 1e-4f) return;
+                float t = (planeY - near.Y) / dir.Y;
+                if (t < 0f) return;
+                hit = near + dir * t;
+                if (TryClickPickupAt(hit)) return;
+                if (!_navMesh.TryFindTriangle(hit, out tri)) return;
+            }
         }
         else
         {
-            // Phase 21-SC-SCROLL-CLICKLOOT — DS1 has no walk-over auto-pickup;
-            // items must be clicked to be looted. If the click landed near a
-            // settled loot pile (within 1.0u tolerance), pick it up and
-            // suppress click-to-move so the player doesn't ALSO walk past
-            // the now-empty pile spot.
-            if (TryClickPickupAt(hit)) return;
-            // Parity fallback: a pile at a walkable border can sit >1u in XZ
-            // from the nearest ray-mesh hit while the old plane projection
-            // landed right on it — keep those clicks lootable.
-            if (MathF.Abs(dir.Y) >= 1e-4f)
+            // A flush wall button can sit just behind a non-walkable nav
+            // surface. Allow only a small depth overlap around that surface;
+            // blocked foreground ground must still occlude distant controls.
+            if (PlayerCannotStandOn(tri)
+                && PickLeverOnRay(near, dir, hit, 0.55f, posedOnly: true) is { } directLever
+                && TryLeverApproachPoint(directLever, out var stand, out var standTri))
             {
-                float tPlane = (_playerFollower.Position.Y - near.Y) / dir.Y;
-                if (tPlane >= 0f && TryClickPickupAt(near + dir * tPlane)) return;
+                leverWithoutFloor = directLever;
+                hit = stand;
+                tri = standTri;
+            }
+            else
+            {
+                // Phase 21-SC-SCROLL-CLICKLOOT — DS1 has no walk-over auto-pickup;
+                // items must be clicked to be looted. If the click landed near a
+                // settled loot pile (within 1.0u tolerance), pick it up and
+                // suppress click-to-move so the player doesn't ALSO walk past
+                // the now-empty pile spot.
+                if (TryClickPickupAt(hit)) return;
+                // Parity fallback: a pile at a walkable border can sit >1u in XZ
+                // from the nearest ray-mesh hit while the old plane projection
+                // landed right on it — keep those clicks lootable.
+                if (MathF.Abs(dir.Y) >= 1e-4f)
+                {
+                    float tPlane = (_playerFollower.Position.Y - near.Y) / dir.Y;
+                    if (tPlane >= 0f && TryClickPickupAt(near + dir * tPlane)) return;
+                }
             }
         }
         hit = hit with { Y = _navMesh.SampleYOnTriangle(tri, hit) };
@@ -29231,10 +29716,8 @@ void main()
         // SC-NAV-PARTIAL-PATH — the whole-mesh fallback is for PLAYER orders
         // only (opt-in; ambient wanderers keep cheap fail-and-reroll).
         _playerFollower.PartialPathFallback = true;
-        // SC-DOORS-OPEN — clicking on/near a door opens it regardless of who
-        // is selected (retail: the first-selected character works doors; the
-        // ordered members walk to the click and pass through).
-        OpenDoorNear(hit);
+        // Doors are selected by the same visible-leaf ray as their hover hand
+        // (TryClickToUseDoor). A ground click near a hinge is only a move.
         // SC-FIRST-SELECTED (blindspot E3) — a member-only selection can
         // work levers/chests/usables too: the request latches queue the
         // same way, and their arrival checks test the ACTING character
@@ -29245,11 +29728,21 @@ void main()
             // SC-ELEVATOR — clicking ON a lever prop (ray hit) queues a
             // walk-up-and-pull; a click that misses every lever clears any
             // pending pull.
-            RequestLeverUseNear(near, dir, hit);
-            // ALPHA-2C — same walk-up pattern for chests.
-            RequestChestUseNear(hit);
-            // ALPHA-2E — and for locked usables (Star Device).
-            RequestLockedUseNear(hit);
+            if (leverWithoutFloor is not null)
+            {
+                // The control owns this click: no chest/usable near its stand point.
+                _pendingLeverUse = leverWithoutFloor;
+                _pendingChestUse = null;
+                _pendingLockedUse = null;
+            }
+            else
+            {
+                RequestLeverUseNear(near, dir, hit);
+                // ALPHA-2C — same walk-up pattern for chests.
+                RequestChestUseNear(hit);
+                // ALPHA-2E — and for locked usables (Star Device).
+                RequestLockedUseNear(hit);
+            }
             if (heroSelected)
             {
                 _playerFollower.SetTarget(hit);
@@ -29353,108 +29846,38 @@ void main()
     // Returns true if the click consumed by opening dialogue; caller then
     // skips the attack path. Hostile-aligned actors (alignment_evil) never
     // open dialogue even if a template author left a stub conversation block.
-    private const float ClickTalkRadius = 3f;
+    /// <summary>SC-SCREEN-PICK — the friendly body under the cursor; shared by
+    /// the talk click and the talk hover cursor so they agree.</summary>
+    private ActorRenderState? PickFriendlyActorAtCursor(Vector2 cursorPx) =>
+        PickActorAtCursor(cursorPx, s =>
+            !s.IsDead && !s.IsPlayer && !s.IsPartyMember && !s.IsEvilAligned && s.IsSelectable
+            && !s.Actor.Template.Name.Equals("norick", StringComparison.OrdinalIgnoreCase));
+
     private bool TryClickToTalk(Vector2 cursorPx)
     {
         if (_nisPhase != NisPhase.Off) return false; // SC-NIS input lockout
         if (_player is null || _window is null || _actors.Count == 0) return false;
         if (_player.IsDead) return false;
         if (_conversations is null || _conversations.Count == 0) return false;
-        var size = _window.FramebufferSize;
-        if (size.X <= 0 || size.Y <= 0) return false;
 
-        float ndcX = (cursorPx.X / size.X) * 2f - 1f;
-        float ndcY = 1f - (cursorPx.Y / size.Y) * 2f;
-        float aspect = (float)size.X / size.Y;
-        if (!Matrix4x4.Invert(_camera.GetViewProjection(aspect), out var invVp)) return false;
+        // SC-SCREEN-PICK — only the talkable body under the cursor. The old
+        // planar radius around NPC feet also opened talk from open ground
+        // next to them, which the hover cursor (same pick) no longer shows.
+        var screenPick = PickFriendlyActorAtCursor(cursorPx);
+        return screenPick is not null && TalkTo(screenPick);
+    }
 
-        var nearH = Vector4.Transform(new Vector4(ndcX, ndcY, -1f, 1f), invVp);
-        var farH  = Vector4.Transform(new Vector4(ndcX, ndcY,  1f, 1f), invVp);
-        if (MathF.Abs(nearH.W) < 1e-6f || MathF.Abs(farH.W) < 1e-6f) return false;
-        var near = new Vector3(nearH.X / nearH.W, nearH.Y / nearH.W, nearH.Z / nearH.W);
-        var far_ = new Vector3(farH.X  / farH.W,  farH.Y  / farH.W,  farH.Z  / farH.W);
-        var dir  = far_ - near;
-        if (dir.LengthSquared() < 1e-8f || MathF.Abs(dir.Y) < 1e-4f) return false;
-
-        float planeY = _player.CurrentTransform.Translation.Y;
-        float t = (planeY - near.Y) / dir.Y;
-        if (t < 0f) return false;
-        var groundHit = near + dir * t;
-
-        ActorRenderState? best = null;
-        SiegeFX.Core.Assets.ConversationDef? bestConv = null;
-        SiegeFX.Core.Actors.VendorDefinition? bestVendor = null;
-        // SC-SCREEN-PICK — the talkable body under the cursor wins before
-        // the planar radius scan (an NPC on a porch or slope was nearly
-        // unclickable through the plane-at-player-Y projection).
-        var screenPick = PickActorAtCursor(cursorPx, s =>
-            !s.IsDead && !s.IsPlayer && !s.IsPartyMember && !s.IsEvilAligned && s.IsSelectable
-            && !s.Actor.Template.Name.Equals("norick", StringComparison.OrdinalIgnoreCase));
-        if (screenPick is not null)
-        {
-            var keysSp = SiegeFX.Core.Assets.ConversationStore.KeysFromInstance(screenPick.Actor.Instance.Node);
-            var vdefSp = ResolveVendor(screenPick.Actor.Template);
-            bool hireSp = vdefSp is null && ResolveHireable(screenPick.Actor.Template) is not null;
-            var convSp = PickConversation(keysSp, preferJoinOffer: hireSp);
-            if (convSp is not null || vdefSp is not null)
-            { best = screenPick; bestConv = convSp; bestVendor = vdefSp; }
-        }
-        float bestDist = ClickTalkRadius;
-        foreach (var s in _actors)
-        {
-            if (best is not null) break;
-            if (s.IsDead) continue;
-            if (s.IsPlayer) continue;
-            if (s.IsPartyMember) continue;   // Phase 26b — already recruited
-            // SC-ALIGN-SWITCH — a switched (or plain hostile) actor is an
-            // attack target, never a talk target; the header comment always
-            // promised this but no gate existed, so post-speech Gom kept
-            // re-offering his monologue instead of fighting.
-            if (s.IsEvilAligned) continue;
-            // SC-NIS — Norick is the intro's dying storyteller: his monologue
-            // plays as narration during the bridge NIS (OnTalkBeginMessage),
-            // never a click-to-talk panel. DS1 never let the player interact
-            // with him; a test scaffold had him clickable + quest-giving. The
-            // quest still auto-grants from the narration (and on Esc-skip), so
-            // excluding him from the RMB path removes the scaffold cleanly.
-            if (s.Actor.Template.Name.Equals("norick", StringComparison.OrdinalIgnoreCase)) continue;
-            // Intro gizmos (the invisible narrator; the spent sleeping dog) are never
-            // clickable — they don't draw, so they can't be a talk target either.
-            if (s.Hidden) continue;
-            // SC-PICK-FADED + SC-PICK-YBAND — an NPC on a faded-out layer OR
-            // a floor above/below (the ground-floor NPC over the stairwell)
-            // must not swallow clicks as a talk target.
-            if (!PickableFromPlayerFloor(s)) continue;
-            // SC-SELECTABLE — authored is_selectable=false is the general
-            // form of the same rule (the narrator authors it explicitly).
-            if (!s.IsSelectable) continue;
-            // The "has a [conversation] block in the placement" check is a
-            // stronger talkable signal than Stats.IsCombatant: DS1's narrator
-            // template inherits combat stats but is meant to be a static
-            // talker outside NIS scenes, and would otherwise be filtered out.
-            var keys = SiegeFX.Core.Assets.ConversationStore.KeysFromInstance(s.Actor.Instance.Node);
-
-            // Phase 25b — vendors resolve from their template chain
-            // ([store] + store_pcontent). Shops with an empty
-            // [conversation] open trade directly; ones with dialogue get
-            // the trade panel after the conversation closes.
-            var vdef = ResolveVendor(s.Actor.Template);
-            // Phase 26 — a hireable companion ([store] can_sell_self) that
-            // is not yet in the party should greet with its `_join` offer
-            // (the `choice = potential_member` node), not whatever key the
-            // instance happens to list first. Everyone else takes the first
-            // non-empty conversation.
-            bool isHireable = vdef is null && ResolveHireable(s.Actor.Template) is not null;
-            var conv = PickConversation(keys, preferJoinOffer: isHireable);
-            if (conv is null && vdef is null) continue;
-
-            var pos = s.CurrentTransform.Translation;
-            float dx = pos.X - groundHit.X;
-            float dz = pos.Z - groundHit.Z;
-            float d  = MathF.Sqrt(dx * dx + dz * dz);
-            if (d < bestDist) { bestDist = d; best = s; bestConv = conv; bestVendor = vdef; }
-        }
-        if (best is null) return false;
+    /// <summary>Open a conversation (or a vendor) with <paramref name="best"/>:
+    /// region-local conversation pick, job_talk_mp variants, and the visit the
+    /// NPC is on. Shared by the talk click and the "Directions" button.</summary>
+    private bool TalkTo(ActorRenderState best)
+    {
+        var keys = SiegeFX.Core.Assets.ConversationStore.KeysFromInstance(best.Actor.Instance.Node);
+        var bestVendor = ResolveVendor(best.Actor.Template);
+        bool hire = bestVendor is null && ResolveHireable(best.Actor.Template) is not null;
+        var bestConv = PickConversation(keys, preferJoinOffer: hire, best.Actor.Instance.RegionPath);
+        if (bestConv is null && bestVendor is null) return false;
+        if (bestConv is not null && !hire) bestConv = SelectTalkVariant(best, bestConv);
         // No dialogue tree but the actor is a vendor — open trade directly.
         if (bestConv is null && bestVendor is not null)
         {
@@ -29466,16 +29889,7 @@ void main()
         }
         if (bestConv is null) return false;
 
-        var screenName = _templateStore?.GetAttribute(best.Actor.Template, "common", "screen_name");
-        if (!string.IsNullOrWhiteSpace(screenName))
-        {
-            // common.screen_name comes through quoted in the gas; strip the
-            // wrapping pair if present so the title bar doesn't read "Edward".
-            screenName = screenName.Trim();
-            if (screenName.Length >= 2 && screenName[0] == '"' && screenName[^1] == '"')
-                screenName = screenName[1..^1];
-        }
-        if (string.IsNullOrWhiteSpace(screenName)) screenName = best.Actor.Template.Name;
+        var screenName = ActorScreenName(best);
         _lastTalkedTemplate = best.Actor.Template.Name;
         _lastTalkedActor = best;
         // SC-HIRE-STATS — retail shows the candidate's sheet before you pay:
@@ -29485,10 +29899,40 @@ void main()
             && ResolveHireable(best.Actor.Template) is not null
             && bestConv.Nodes.Any(n => n.IsRecruitOffer))
             bestConv = WithHireStats(bestConv, best);
-        _dialogue.Open(screenName, bestConv);
+        _conversationVisits.TryGetValue(VisitKey(best, bestConv.Key), out int played);
+        // A conversation owns the screen: close any open trade (its auto-opened
+        // inventory follows), so the shop can't sit under the dialog and take
+        // its clicks. A shopkeeper's trade reopens when the visit ends.
+        if (_vendor.IsOpen) _vendor.Close();
+        // Any of the NPC's own conversations, so the directions speech (no Shop
+        // button of its own) doesn't fall back to auto-opening Zabar's trade.
+        _lastTalkAuthorsShop = keys.Any(k =>
+            TryGetConversation(best.Actor.Instance.RegionPath, k, out var c)
+            && c.Nodes.Any(n => n.Choice == "shop"));
+        _dialogue.Open(screenName, bestConv, played);
         Console.WriteLine(
-            $"talk: opened '{bestConv.Key}' with {screenName} ({bestConv.Nodes.Count} node(s))");
+            $"talk: opened '{bestConv.Key}' with {screenName} ({bestConv.Nodes.Count} node(s), " +
+            $"{played} numbered step(s) played before)");
         return true;
+    }
+
+    /// <summary>After a visit closes: remember how far through the numbered steps
+    /// this NPC got, and act on a button value ("Directions" requests the region's
+    /// zconversation_directions, which plays immediately).</summary>
+    private void OnDialogueVisitClosed()
+    {
+        var npc = _lastTalkedActor;
+        if (_dialogue.ConsumeLastVisit() is { } visit && npc is not null)
+            _conversationVisits[VisitKey(npc, visit.Key)] = visit.NumberedStepsPlayed;
+        var value = _dialogue.ConsumePendingButtonValue();
+        if (value is null || !value.StartsWith("d_0x", StringComparison.OrdinalIgnoreCase)) return;
+        if (!uint.TryParse(value.AsSpan(4), System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out var scid)) return;
+        var speaker = _actors.FirstOrDefault(a => a.Actor.Instance.Scid == scid && !a.IsDead);
+        if (speaker is null) return;
+        _directionsRequested.Add(scid);
+        Console.WriteLine($"talk: directions requested from 0x{scid:X8}");
+        TalkTo(speaker);
     }
 
     /// <summary>SC-HIRE-STATS — clone the conversation with the candidate's
@@ -29522,6 +29966,7 @@ void main()
                 IsQuestDialog = n.IsQuestDialog,
                 IsNonInteractive = n.IsNonInteractive,
                 ButtonText = n.ButtonText,
+                ButtonValue = n.ButtonValue,
                 ScrollRate = n.ScrollRate,
             });
         return new SiegeFX.Core.Assets.ConversationDef { Key = conv.Key, Nodes = nodes };
@@ -29535,8 +29980,54 @@ void main()
     /// "...can I come along?" greeting. DS1 drives this with a per-actor
     /// job_talk skrit; without running it we approximate the first-meeting
     /// state, which is correct until a companion can leave and rejoin.</summary>
+    /// <summary>Region-local first (DS1 conversations live per region), then the
+    /// merged pool for actors without a region or cross-region references.</summary>
+    private bool TryGetConversation(string? regionPath, string key,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out SiegeFX.Core.Assets.ConversationDef? conv)
+    {
+        if (!string.IsNullOrEmpty(regionPath)
+            && _conversationsByRegion.TryGetValue(regionPath.TrimEnd('/'), out var local)
+            && local.TryGetValue(key, out conv))
+            return true;
+        conv = null;
+        return _conversations is not null && _conversations.TryGetValue(key, out conv);
+    }
+
+    /// <summary>job_talk_mp.skrit's choice on top of the selected conversation:
+    /// a pending "Directions" request plays the region's zconversation_directions;
+    /// an NPC with an authored [check_level] component switches to its
+    /// <c>_low</c>/<c>_high</c> variant by the player's overall (uber) level.
+    /// ("turn_world_red" isn't modelled yet.)</summary>
+    private SiegeFX.Core.Assets.ConversationDef SelectTalkVariant(
+        ActorRenderState npc, SiegeFX.Core.Assets.ConversationDef selected)
+    {
+        var region = npc.Actor.Instance.RegionPath;
+        if (_directionsRequested.Remove(npc.Actor.Instance.Scid)
+            && TryGetConversation(region, "zconversation_directions", out var directions)
+            && directions.Nodes.Count > 0)
+            return directions;
+        string? Comp(string attr) =>
+            SiegeFX.Core.Assets.TemplateStore.GetNodeAttribute(npc.Actor.Instance.Node, "check_level", attr)
+            ?? _templateStore?.GetAttribute(npc.Actor.Template, "check_level", attr);
+        if (_progression is not null
+            && string.Equals(Comp("check_level")?.Trim(), "true", StringComparison.OrdinalIgnoreCase))
+        {
+            static float F(string? s) => float.TryParse(s?.Trim().TrimEnd('f', 'F'),
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : 1f;
+            float level = _progression.Level, low = F(Comp("low_level")), high = F(Comp("high_level"));
+            string? variant = level < low ? selected.Key + "_low" : level > high ? selected.Key + "_high" : null;
+            if (variant is not null && TryGetConversation(region, variant, out var v) && v.Nodes.Count > 0)
+                return v;
+        }
+        return selected;
+    }
+
+    private static string VisitKey(ActorRenderState npc, string conversationKey) =>
+        $"{npc.Actor.Instance.Scid:X8}:{conversationKey}";
+
     private SiegeFX.Core.Assets.ConversationDef? PickConversation(
-        IReadOnlyList<string> keys, bool preferJoinOffer)
+        IReadOnlyList<string> keys, bool preferJoinOffer, string? regionPath = null)
     {
         if (_conversations is null) return null;
         if (preferJoinOffer)
@@ -29544,7 +30035,7 @@ void main()
             SiegeFX.Core.Assets.ConversationDef? joinHit = null, offerHit = null;
             foreach (var k in keys)
             {
-                if (!_conversations.TryGetValue(k, out var d) || d.Nodes.Count == 0) continue;
+                if (!TryGetConversation(regionPath, k, out var d) || d.Nodes.Count == 0) continue;
                 bool hasOffer = false;
                 foreach (var n in d.Nodes) if (n.IsRecruitOffer) { hasOffer = true; break; }
                 if (!hasOffer) continue;
@@ -29565,9 +30056,9 @@ void main()
             foreach (var k in keys)
             {
                 if (!k.EndsWith("_quest_complete", StringComparison.OrdinalIgnoreCase)) continue;
-                if (!_conversations.TryGetValue(k, out var qc) || qc.Nodes.Count == 0) continue;
+                if (!TryGetConversation(regionPath, k, out var qc) || qc.Nodes.Count == 0) continue;
                 var baseKey = k[..^"_quest_complete".Length];
-                if (!_conversations.TryGetValue(baseKey, out var baseConv)) continue;
+                if (!TryGetConversation(regionPath, baseKey, out var baseConv)) continue;
                 foreach (var n in baseConv.Nodes)
                 {
                     if (!string.IsNullOrWhiteSpace(n.ActivateQuest)
@@ -29577,7 +30068,7 @@ void main()
             }
         }
         foreach (var k in keys)
-            if (_conversations.TryGetValue(k, out var hit) && hit.Nodes.Count > 0) return hit;
+            if (TryGetConversation(regionPath, k, out var hit) && hit.Nodes.Count > 0) return hit;
         return null;
     }
 
@@ -29608,6 +30099,12 @@ void main()
     {
         if (_dialogue.IsOpen) return;
         if (_vendor.IsOpen) return;
+        // DS1's dialogue box has a Shop button on choice = shop steps
+        // (dialogue_shop); trade opens when it's pressed, not after every talk.
+        // Shopkeepers whose conversations never author choice = shop keep the
+        // old open-after-talk so their trade stays reachable.
+        bool shopPressed = _dialogue.ConsumePendingShop();
+        if (_lastTalkAuthorsShop && !shopPressed) return;
         if (string.IsNullOrEmpty(_lastTalkedTemplate)) return;
         var def = _templateStore is not null
                   && _templateStore.TryGet(_lastTalkedTemplate, out var tpl) && tpl is not null
@@ -30042,7 +30539,7 @@ void main()
         }
         foreach (var prop in _staticProps)
         {
-            if (!prop.IsBreakable || prop.IsDestroyed) continue;
+            if (!prop.IsBreakable || prop.IsDestroyed || !PickableFromPlayerFloor(prop)) continue;
             var self = prop;
             Consider(prop.World.Translation + new Vector3(0f, 0.45f, 0f), 26f,
                 () => { bestEnemy = null; bestProp = self; bestPile = null; });
@@ -30050,6 +30547,7 @@ void main()
         foreach (var pile in _lootPiles)
         {
             if (pile.Throw is not null && pile.Throw.Elapsed < pile.Throw.Duration) continue;
+            if (!OnPlayerFloor(pile.Position)) continue;
             var self = pile;
             Consider(pile.Position + new Vector3(0f, 0.15f, 0f), 22f,
                 () => { bestEnemy = null; bestProp = null; bestPile = self; });
@@ -30136,6 +30634,23 @@ void main()
     /// <summary>Returns true when a combatant (or breakable prop) was under
     /// the click and an attack fired / a walk-up was queued — the LMB context
     /// dispatch uses that to decide between attack and move.</summary>
+    /// <summary>A body far across the map can still sit under the cursor on
+    /// screen. The per-tick chase gives such a target up at once
+    /// (<see cref="MeleeChaseGiveUp"/>), so when only the hero is selected the
+    /// click and the hover cursor treat it as ground: the click falls through
+    /// to move / use (doors, levers) instead of being spent on a dead order.</summary>
+    private bool IsBeyondHeroChase(ActorRenderState target, out SiegeFX.Core.Actors.ActorStats attackerStats,
+        out float reach, out Vector3 heroPos, out float distance)
+    {
+        attackerStats = GetPlayerAttackStats();
+        reach = PlayerEngageReach(attackerStats);
+        heroPos = _playerFollower?.Position ?? _player!.CurrentTransform.Translation;
+        var t = target.CurrentTransform.Translation;
+        distance = MathF.Sqrt((heroPos.X - t.X) * (heroPos.X - t.X) + (heroPos.Z - t.Z) * (heroPos.Z - t.Z));
+        return _selectedPartyIdx.Count == 1 && _selectedPartyIdx.Contains(0)
+            && !_player!.Actor.Combat.Downed && distance > MathF.Max(MeleeChaseGiveUp, reach);
+    }
+
     private bool TryClickToAttack(Vector2 cursorPx)
     {
         if (_nisPhase != NisPhase.Off) return false; // SC-NIS input lockout
@@ -30211,6 +30726,11 @@ void main()
         if (screenPick.Enemy is not null) best = screenPick.Enemy;
         else if (screenPick.Prop is not null) return TryClickToBreakProp(groundHit);
 
+        // A far body under the cursor is not an attack: fall through to move/use.
+        if (IsBeyondHeroChase(best, out var attackerStats, out float reach, out var pPos, out float playerDist))
+            return false;
+        var tPos = best.CurrentTransform.Translation;
+
         // SC-SELECT-MOVE — the enemy click is an attack order to the
         // SELECTION: selected members lock this target (force-attack); the
         // hero only engages when selected. Ordering members onto a foe
@@ -30230,13 +30750,6 @@ void main()
         // per-tick player block walks the follower up and fires the swing
         // when in range. SC-RANGED-PROJECTILE — a bow engages at its
         // authored attack_range so the archer stands off.
-        var attackerStats = GetPlayerAttackStats();
-        float reach = PlayerEngageReach(attackerStats);
-        var pPos = _playerFollower?.Position ?? _player.CurrentTransform.Translation;
-        var tPos = best.CurrentTransform.Translation;
-        float playerDist = MathF.Sqrt(
-            (pPos.X - tPos.X) * (pPos.X - tPos.X) +
-            (pPos.Z - tPos.Z) * (pPos.Z - tPos.Z));
         // SC-PATHING — melee "in reach" must also be UNOBSTRUCTED: an enemy
         // across a fence is close by XZ but the swing would pass through
         // blocked ground; walk up (the A* routes around) instead.
@@ -30506,7 +31019,7 @@ void main()
         float bestDist = ClickBreakableRadius;
         foreach (var prop in _staticProps)
         {
-            if (!prop.IsBreakable || prop.IsDestroyed) continue;
+            if (!prop.IsBreakable || prop.IsDestroyed || !PickableFromPlayerFloor(prop)) continue;
             var pos = prop.World.Translation;
             float dx = pos.X - groundHit.X;
             float dz = pos.Z - groundHit.Z;
@@ -31958,9 +32471,19 @@ void main()
         // party is addressed (level-up strip, hover readout, tooltips); the
         // template screen_name would read "Farm Boy".
         if (member.IsPlayer && !string.IsNullOrEmpty(_heroName)) return _heroName;
-        if (_templateStore is null) return member.Actor.Template.Name;
-        return _templateStore.GetAttribute(member.Actor.Template, "common", "screen_name")?.Trim().Trim('"')
-               ?? member.Actor.Template.Name;
+        return ActorScreenName(member);
+    }
+
+    /// <summary>An actor's display name: the placement's own [common] screen_name
+    /// first (Elddim's "Utraean Priestess Kelti" is authored on her instance of a
+    /// generic townsfolk template), then the template chain, then the template name.</summary>
+    private string ActorScreenName(ActorRenderState actor)
+    {
+        static string? Clean(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim().Trim('"');
+        return Clean(SiegeFX.Core.Assets.TemplateStore.GetNodeAttribute(actor.Actor.Instance.Node, "common", "screen_name"))
+               ?? (_templateStore is null ? null
+                   : Clean(_templateStore.GetAttribute(actor.Actor.Template, "common", "screen_name")))
+               ?? actor.Actor.Template.Name;
     }
 
     // Class title shown under the name on the sheet — the member template's
@@ -33326,6 +33849,8 @@ void main()
             CursorState.Attack     => "Left-click to attack",
             CursorState.CastAttack => "Left-click to attack",
             CursorState.Grab       => "Left-click to pick up item",
+            CursorState.UseDoor    => "Left-click to open door",
+            CursorState.UseLever   => "Left-click to use lever",
             CursorState.Smash      => "Left-click to break",
             CursorState.Talk       => "Right-click to talk",
             _ => null,
@@ -33651,7 +34176,7 @@ void main()
         // over wins, so a spell page inside a barrel cluster and the barrels
         // themselves are BOTH reachable — the player chooses by pointing.
         var pick = PickInteractiveAtCursor(_currentMousePos);
-        if (pick.Enemy is not null)
+        if (pick.Enemy is not null && (spellMode || !IsBeyondHeroChase(pick.Enemy, out _, out _, out _, out _)))
         {
             _cursorState = spellMode ? CursorState.CastAttack : CursorState.Attack;
             return;
@@ -33667,19 +34192,11 @@ void main()
         // 4) talkable NPC inside the wider talk radius → talk marker.
         if (_conversations is not null && _conversations.Count > 0)
         {
-            float t2 = ClickTalkRadius * ClickTalkRadius;
-            foreach (var s in _actors)
+            // Talk / no-talk marker for one friendly actor, or null when it
+            // shouldn't change the cursor.
+            CursorState? TalkCursorFor(ActorRenderState s)
             {
-                // Skip party members: a recruited companion keeps its conversation,
-                // so without this it still reads as a talkable NPC on hover (which
-                // looks like it "never joined") even though it's in the party.
-                if (s.IsDead || s.IsPlayer || s.IsPartyMember) continue;
-                // SC-SELECTABLE — is_selectable=false actors (the intro
-                // narrator) and hidden gizmos never flip the cursor at all.
-                if (!s.IsSelectable || s.Hidden) continue;
-                var pos = s.CurrentTransform.Translation;
-                float dx = pos.X - groundHit.X, dz = pos.Z - groundHit.Z;
-                if (dx * dx + dz * dz > t2) continue;
+                if (s.IsAmbient) return null;
                 var keys = SiegeFX.Core.Assets.ConversationStore.KeysFromInstance(s.Actor.Instance.Node);
                 bool talkable = false;
                 foreach (var k in keys)
@@ -33687,14 +34204,22 @@ void main()
                 if (!talkable && ResolveVendor(s.Actor.Template) is not null) talkable = true;
                 // Phase 26b — hireable companions read as interactable too.
                 if (!talkable && !s.IsPartyMember && ResolveHireable(s.Actor.Template) is not null) talkable = true;
-                if (talkable) { _cursorState = CursorState.Talk; return; }
+                if (talkable) return CursorState.Talk;
                 // SC-CURSORS — cursors.gas cursor_initiate: a friendly
                 // non-combatant with nothing to say gets the no-talk marker
                 // instead of silently reading as bare ground.
-                if (!s.Actor.Stats.IsCombatant)
-                { _cursorState = CursorState.NoTalk; return; }
+                return s.Actor.Stats.IsCombatant ? null : CursorState.NoTalk;
             }
+            // SC-SCREEN-PICK — only the body actually under the cursor, exactly
+            // like TryClickToTalk. (A ground radius around the NPC's feet lit
+            // the talk cursor over open grass several pixels away.)
+            if (PickFriendlyActorAtCursor(cursorPx) is { } friendly
+                && TalkCursorFor(friendly) is { } onBody)
+            { _cursorState = onBody; return; }
         }
+        // Closed door leaf under the cursor → use hand (TryClickToUseDoor's pick).
+        if (PickDoorAtCursor(cursorPx) is not null)
+        { _cursorState = CursorState.UseDoor; return; }
         // 5) Phase 23 — nothing interactive under the cursor: is the ground
         //    itself somewhere the player can be sent? Mirror TryClickToMove's
         //    resolution exactly (nav-mesh ray pick, then the plane fallback)
@@ -33704,17 +34229,30 @@ void main()
         //    lnodes the logical-flags gas closes to human players.
         if (_navMesh is not null)
         {
-            if (_navMesh.TryRaycast(near, dir, dir.Length(), out int navTri, out _))
+            if (_navMesh.TryRaycast(near, dir, dir.Length(), out int navTri, out var navHit))
             {
-                if (PlayerCannotStandOn(navTri)) _cursorState = CursorState.NoGo;
+                if (PickLeverOnRay(near, dir, navHit) is not null)
+                { _cursorState = CursorState.UseLever; return; }
+                if (PlayerCannotStandOn(navTri))
+                {
+                    if (PickLeverOnRay(near, dir, navHit, 0.55f, posedOnly: true) is { } control
+                        && TryLeverApproachPoint(control, out _, out _))
+                    { _cursorState = CursorState.UseLever; return; }
+                    _cursorState = CursorState.NoGo;
+                }
             }
-            else if (!_navMesh.TryFindTriangle(groundHit, out int planeTri))
+            else
             {
-                _cursorState = CursorState.NoGo;
-            }
-            else if (PlayerCannotStandOn(planeTri))
-            {
-                _cursorState = CursorState.NoGo;
+                if (PickLeverOnRay(near, dir, null) is { } floorlessLever
+                    && TryLeverApproachPoint(floorlessLever, out _, out _))
+                { _cursorState = CursorState.UseLever; return; }
+                // groundHit is the player-height plane hit computed above.
+                if (!_navMesh.TryFindTriangle(groundHit, out int planeTri))
+                    _cursorState = CursorState.NoGo;
+                else if (PickLeverOnRay(near, dir, groundHit) is not null)
+                { _cursorState = CursorState.UseLever; return; }
+                else if (PlayerCannotStandOn(planeTri))
+                    _cursorState = CursorState.NoGo;
             }
         }
     }
@@ -33761,7 +34299,7 @@ void main()
                 int frame = (int)(_terrainTime * 12.0) % _cursorSmash.Length;
                 return (_cursorSmash[frame], hsSmallX, hsSmallY, small);
             }
-            case CursorState.Grab when _cursorGrab is { Length: > 0 }:
+            case CursorState.Grab or CursorState.UseDoor or CursorState.UseLever when _cursorGrab is { Length: > 0 }:
             {
                 int frame = (int)(_terrainTime * 12.0) % _cursorGrab.Length;
                 return (_cursorGrab[frame], hsSmallX, hsSmallY, small);
@@ -36167,6 +36705,21 @@ void main()
     /// <c>/world/maps/map_&lt;map&gt;/regions/&lt;region&gt;</c>. Returns null
     /// when the path doesn't match — the launch path always does, but the
     /// helper guards a custom-mod scenario where regionPath is freelance.</summary>
+    /// <summary>The map's folder under <c>world/maps</c> for any authored world:
+    /// "map_world" (Ehb), "multiplayer_world" (Utraea). <see cref="DeriveMapName"/>
+    /// only recognises the <c>map_</c>-prefixed form.</summary>
+    static string? DeriveMapFolder(string? regionPath)
+    {
+        if (string.IsNullOrEmpty(regionPath)) return null;
+        var norm = regionPath.Replace('\\', '/').TrimEnd('/');
+        const string token = "/maps/";
+        int idx = norm.IndexOf(token, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return null;
+        int start = idx + token.Length;
+        int end = norm.IndexOf('/', start);
+        return end > start ? norm[start..end] : null;
+    }
+
     static string? DeriveMapName(string? regionPath)
     {
         if (string.IsNullOrEmpty(regionPath)) return null;
@@ -36228,13 +36781,13 @@ void main()
     /// we don't yet honor mood_change() trigger actions.</summary>
     private void ApplyAmbientForRegion(string? regionPath)
     {
-        if (_audio is null || _moodStore is null || _moodMapName is null) return;
+        if (_audio is null || _moodStore is null || _moodMapFolder is null) return;
         var regionName = DeriveRegionName(regionPath);
         if (regionName is null) return;
         if (string.Equals(regionName, _activeBedRegion, StringComparison.OrdinalIgnoreCase))
             return;
 
-        var mood = SiegeFX.Core.Assets.MoodStore.FindRegionDefault(_moodStore, _moodMapName, regionName);
+        var mood = SiegeFX.Core.Assets.MoodStore.FindRegionDefaultForMapFolder(_moodStore, _moodMapFolder, regionName);
         _activeBedRegion = regionName;
         if (mood is null)
         {
@@ -36783,7 +37336,7 @@ void main()
                 float bestPropDist = ClickAttackRadius;
                 foreach (var prop in _staticProps)
                 {
-                    if (!prop.IsBreakable || prop.IsDestroyed) continue;
+                    if (!prop.IsBreakable || prop.IsDestroyed || !PickableFromPlayerFloor(prop)) continue;
                     var pos = prop.World.Translation;
                     float dx = pos.X - groundHit.X;
                     float dz = pos.Z - groundHit.Z;
@@ -38231,7 +38784,7 @@ void main()
             for (int i = 0; i < _lootPiles.Count; i++)
             {
                 var pile = _lootPiles[i];
-                if (pile.Throw is not null) continue;
+                if (pile.Throw is not null || !OnPlayerFloor(pile.Position)) continue;
                 float dx = pile.Position.X - clickPos.X;
                 float dz = pile.Position.Z - clickPos.Z;
                 float d2 = dx * dx + dz * dz;
@@ -38754,7 +39307,7 @@ void main()
                 // a moving actor points at wherever it spawned (the player's
                 // spawn is on the surface → body culled with the surface
                 // while the separately-drawn boots + dagger kept walking).
-                if (!s.IsPlayer && IsPosInFadedSnode(s.CurrentTransform.Translation)) continue;
+                if (!s.IsPlayer && IsActorInFadedSnode(s)) continue;
                 // Intro NIS gizmos (narrator voice-over; spent sleeping dog) stay in
                 // _actors for scripting but never draw as visible NPCs.
                 if (s.IsPlayer && s.Hidden)
@@ -38897,7 +39450,7 @@ void main()
                     var appos = s.CurrentTransform.Translation;
                     float apdx = appos.X - apCam.X, apdz = appos.Z - apCam.Z;
                     if (apdx * apdx + apdz * apdz > 80f * 80f) continue;
-                    if (IsPosInFadedSnode(appos)) continue;
+                    if (IsActorInFadedSnode(s)) continue;
                     var apClips = s.Actor.Clips;
                     if (apClips.Length == 0) continue;
                     var apClip = apClips[Math.Min(s.Actor.CurrentClipIndex, apClips.Length - 1)];
@@ -39083,6 +39636,7 @@ void main()
                 // the on-hit code already kicked debris particles at the
                 // origin so the disappearance reads as a break, not a pop.
                 if (prop.IsDestroyed) continue;
+                if (prop.LeverPoseApplied && prop.LeverPose is not null) continue;
                 // SC-PROP-INVISIBLE — authored-invisible logic objects
                 // (shrines, blockers) never draw their dev-marker mesh.
                 if (prop.ForceNoRender) continue;
@@ -39145,6 +39699,8 @@ void main()
             _gl.Enable(GLEnum.CullFace);
         }
 
+        DrawLeverPoses(vp);
+
         // Phase 21-SC-BARREL-C — frag-debris pass. Same shader and uFlipV
         // convention as the static-prop layer (frag .asps are authored
         // bottom-up like every other DS1 prop), but the model matrix is
@@ -39195,7 +39751,7 @@ void main()
                 if (s.WeaponMesh is null && s.ShieldMesh is null) continue;
                 // SC-REGION-LAYER-HIDE-ACTORS (follow-up) — no region stamp on
                 // actors yet; gear hides with the faded-snode gate below.
-                if (IsPosInFadedSnode(s.CurrentTransform.Translation)) continue;
+                if (IsActorInFadedSnode(s)) continue;
                 var npcClips = s.Actor.Clips;
                 int npcBones = s.Actor.Mesh.BoneCount;
                 if (_boneWorldsScratch.Length < npcBones)
@@ -39223,7 +39779,7 @@ void main()
                 var actorModel = npcScale == 1f
                     ? s.CurrentTransform
                     : Matrix4x4.CreateScale(npcScale) * s.CurrentTransform;
-                void DrawGear(StaticMesh? gearMesh, GlTexture? gearTex, int boneIdx)
+                void DrawGear(StaticMesh? gearMesh, GlTexture? gearTex, int boneIdx, bool isShield = false)
                 {
                     if (gearMesh is null || boneIdx < 0 || boneIdx >= npcBones) return;
                     if (!npcGearShaderBound)
@@ -39235,7 +39791,19 @@ void main()
                         ApplyLightingUniforms(_meshShader);
                         npcGearShaderBound = true;
                     }
-                    _meshShader.SetMatrix4("uModel", _boneWorldsScratch[boneIdx] * actorModel);
+                    var gearModel = _boneWorldsScratch[boneIdx] * actorModel;
+                    // A shield needs the same chain as the player's attached
+                    // shield (bind inverse + shield tilt + SiegeMax grip
+                    // prerotation); bone-only left it hanging behind the arm.
+                    // Weapons keep the bone-only pose they were tuned with.
+                    if (isShield)
+                        gearModel = (_npcGearBindInv.TryGetValue(gearMesh, out var bindInv) ? bindInv : Matrix4x4.Identity)
+                            * Matrix4x4.CreateFromQuaternion(s_shieldExtraRot)
+                            * Matrix4x4.CreateTranslation(s_shieldExtraTrans)
+                            * Matrix4x4.CreateFromQuaternion(s_gripPreRot)
+                            * Matrix4x4.CreateTranslation(s_gripPreTrans)
+                            * gearModel;
+                    _meshShader.SetMatrix4("uModel", gearModel);
                     if (gearTex is not null)
                     {
                         gearTex.Bind(TextureUnit.Texture0);
@@ -39245,7 +39813,7 @@ void main()
                     gearMesh.Draw();
                 }
                 if (!s.WeaponDroppedOnDeath) DrawGear(s.WeaponMesh, s.WeaponTexture, s.WeaponBoneIdx);
-                DrawGear(s.ShieldMesh, s.ShieldTexture, s.ShieldBoneIdx);
+                DrawGear(s.ShieldMesh, s.ShieldTexture, s.ShieldBoneIdx, isShield: s.ShieldIsShield);
                 // SC-TORCH-FLAME — a held torch burns: sparse small flame
                 // motes at the torch head (weapon bone + up). Built — needs
                 // eyes for size/height tuning.
@@ -39930,11 +40498,19 @@ void main()
                 if (partyOnly && !(a.IsPlayer || a.IsPartyMember)) continue;
                 var feet = a.CurrentTransform.Translation;
                 if (Vector3.DistanceSquared(feet, shadowEye) > 90f * 90f) continue;
-                // Actor scale rides the world matrix's X basis length.
+                // Actor scale rides the world matrix's X basis length; the
+                // authored scale_base/multiplier (Stats.RenderScale) is applied
+                // at draw time, so it multiplies in separately.
                 float sx = new Vector3(a.CurrentTransform.M11,
                                        a.CurrentTransform.M12,
                                        a.CurrentTransform.M13).Length();
-                _blobShadows.Add(feet, 0.55f * Math.Clamp(sx, 0.4f, 3f));
+                // Size the blob to the creature: its larger bind-pose dimension
+                // of height (Y) and length (Z), relative to a 1.78u human (the
+                // old fixed size). Width is skipped: biped T-pose arms inflate it.
+                // A rat no longer casts a man-sized shadow.
+                var ext = a.GlMesh.Max - a.GlMesh.Min;
+                float body = MathF.Max(ext.Y, ext.Z) / 1.78f;
+                _blobShadows.Add(feet, Math.Clamp(0.55f * sx * a.Actor.Stats.RenderScale * body, 0.1f, 3f));
             }
             _blobShadows.Draw(vp);
         }
@@ -41688,6 +42264,7 @@ void main()
             gear.Tex?.Dispose();
         }
         _npcGearCache.Clear();
+        _npcGearBindInv.Clear();
         _actorIdentityBones.Clear();
         _actors.Clear();
         _roamAuditLastPos.Clear();   // SC-MOB-ROAM-AUDIT — indices are per-load
@@ -41706,7 +42283,10 @@ void main()
         _propGlMeshCache.Clear();
         _propAspCache.Clear();
         _staticProps.Clear();
+        _movingPropsByNode.Clear();
         _doorProps.Clear();
+        _pendingDoorUse = null;
+        _pendingDoorActor = null;
         _flameSources.Clear();
         // SC-ELEVATOR — elevators + levers are per-region-load state.
         _leverProps.Clear();
@@ -41885,6 +42465,40 @@ void main()
         return _regionPath ?? "";
     }
 
+    /// <summary>Persist an actor's live horizontal heading. Missing headings
+    /// in older saves retain the existing pose instead of resetting to +Z.</summary>
+    internal static SiegeFX.Core.Save.Vec3? CaptureActorFacing(Matrix4x4 pose)
+    {
+        var forward = Vector3.TransformNormal(Vector3.UnitZ, pose);
+        var flat = new Vector3(forward.X, 0f, forward.Z);
+        if (!float.IsFinite(flat.X) || !float.IsFinite(flat.Z) || flat.LengthSquared() < 1e-8f)
+            return null;
+        return SiegeFX.Core.Save.Vec3.From(Vector3.Normalize(flat));
+    }
+
+    internal static Matrix4x4 RestoreActorTransform(Matrix4x4 spawned, Vector3 position,
+        SiegeFX.Core.Save.Vec3? savedFacing)
+    {
+        if (savedFacing is { } saved)
+        {
+            var facing = saved.ToVector3();
+            if (float.IsFinite(facing.X) && float.IsFinite(facing.Z) &&
+                facing.X * facing.X + facing.Z * facing.Z > 1e-8f)
+                spawned = Matrix4x4.CreateRotationY(MathF.Atan2(facing.X, facing.Z));
+        }
+        spawned.Translation = position;
+        return spawned;
+    }
+
+    /// <summary>Place a restored actor and point its brain the same way, so
+    /// the next wander step doesn't snap it back to its old heading.</summary>
+    private static void ApplyRestoredPose(ActorRenderState s, Matrix4x4 spawned, Vector3 position,
+        SiegeFX.Core.Save.Vec3? savedFacing)
+    {
+        s.CurrentTransform = RestoreActorTransform(spawned, position, savedFacing);
+        s.Brain?.Wander.SetFacing(Vector3.TransformNormal(Vector3.UnitZ, s.CurrentTransform));
+    }
+
     internal SiegeFX.Core.Save.SaveFile CaptureSave()
     {
         var profile = _activeWorld ?? throw new InvalidOperationException("This world has no save profile.");
@@ -41934,7 +42548,13 @@ void main()
         foreach (var b in _blockingGizmos) if (!b.Active) world.ClearedBlockers.Add(b.Scid);
         // SC-DOOR-PERSIST — open door leaves, so loads restore the save's
         // doors instead of leaking the live session's.
-        foreach (var d in _doorProps) if (d.DoorTargetOpen) world.OpenDoors.Add(d.Scid);
+        foreach (var d in _doorProps) if (d.DoorTargetOpen)
+        {
+            world.OpenDoors.Add(d.Scid);
+            world.DoorSwingSigns[d.Scid] = d.DoorSwingSign;
+        }
+        // Conversation visits are world-global (keyed by NPC scid).
+        foreach (var kv in _conversationVisits) world.ConversationVisits[kv.Key] = kv.Value;
         // SC-GEN-PERSIST — every streamed generator's activation + remaining
         // wave; un-streamed rows merge from the loaded save below.
         foreach (var g in _generators)
@@ -41987,6 +42607,9 @@ void main()
             MergeProps(world.UnlockedUsables, kept.UnlockedUsables, sc => _lockedUsables.Any(lu => lu.Prop.Scid == sc));
             MergeProps(world.LeversOn, kept.LeversOn, sc => _leverProps.Any(lv => lv.Scid == sc));
             MergeProps(world.OpenDoors, kept.OpenDoors, sc => _doorProps.Any(d => d.Scid == sc));
+            foreach (var (scid, sign) in kept.DoorSwingSigns)
+                if (!_doorProps.Any(d => d.Scid == scid) && world.OpenDoors.Contains(scid))
+                    world.DoorSwingSigns[scid] = sign;
             // SC-GEN-PERSIST — generator rows for regions never streamed
             // this session carry forward from the loaded save.
             foreach (var gk in kept.Generators)
@@ -42019,6 +42642,7 @@ void main()
                 Scid         = s.Actor.Instance.Scid,
                 TemplateName = s.Actor.Template.Name,
                 Position     = SiegeFX.Core.Save.Vec3.From(pos),
+                Facing       = CaptureActorFacing(s.CurrentTransform),
                 CurrentLife  = s.Actor.Combat.CurrentLife,
                 CurrentMana  = s.Actor.Combat.CurrentMana,
                 IsDead       = s.IsDead || s.Actor.Combat.IsDead,
@@ -42222,6 +42846,7 @@ void main()
                 TemplateName = m.Actor.Template.Name,
                 PartyIndex   = m.PartyIndex,
                 Position     = SiegeFX.Core.Save.Vec3.From(m.CurrentTransform.Translation),
+                Facing       = CaptureActorFacing(m.CurrentTransform),
                 CurrentLife  = m.Actor.Combat.CurrentLife,
                 CurrentMana  = m.Actor.Combat.CurrentMana,
                 Downed       = m.Actor.Combat.Downed,   // SC-DOWNED
@@ -42556,7 +43181,8 @@ void main()
                     OnPlayerRegionChanged(trueRegion!);
                 }
             }
-            s.CurrentTransform = Matrix4x4.CreateTranslation(pos);
+            var fallbackPose = s.IsPlayer ? s.CurrentTransform : s.Actor.WorldTransform;
+            ApplyRestoredPose(s, fallbackPose, pos, snap.Facing);
             patched++;
         }
 
@@ -42594,6 +43220,8 @@ void main()
         _rangedShots.Clear();
         _pendingAttackTarget = null;
         _pendingCastTarget = null;
+        _pendingDoorUse = null;
+        _pendingDoorActor = null;
         _lootPiles.Clear();
         // SC-WORLD-INVENTORY-PLACED — _inventoryGasLoaded gates LoadWorldInventory
         // from re-spawning piles in an already-streamed region. Save serializer
@@ -42694,14 +43322,15 @@ void main()
             // Same rule for lifts: capture only writes rows for lifts away
             // from stop 1, so an unlisted LIVE lift must return there or a
             // post-save ride survives the load (player restores at the top,
-            // car stays at the bottom).
+            // car stays at the bottom). Drop an interrupted ride's queued fades
+            // first; ApplyElevatorSnapshot settles the restored view itself.
+            _elevatorDelayedFades.Clear();
             foreach (var el in _elevators)
             {
                 if (ws.Elevators.Any(r => r.Scid == el.Def.Scid)) continue;
                 if (el.AtStop != 1 || el.Moving)
                 { structural |= ApplyElevatorSnapshot(new SiegeFX.Core.Save.ElevatorStopSnapshot { Scid = el.Def.Scid, AtStop = 1 }); }
             }
-            _elevatorDelayedFades.Clear();
             foreach (var es in ws.Elevators)
             {
                 if (!_elevatorsByScid.ContainsKey(es.Scid)) { _pendingElevatorSnaps.Add(es); continue; }
@@ -42766,7 +43395,13 @@ void main()
             if (structural)
             {
                 var nav = RebuildNavMesh();
-                if (nav is not null) { _navMesh = nav; MarkAllObstacles(); RehomeAllFollowers(nav); }
+                if (nav is not null)
+                {
+                    _navMesh = nav;
+                    MarkAllObstacles();
+                    RehomeAllFollowers(nav);
+                    _playerFollower?.Rehome(nav);
+                }
             }
             Console.WriteLine($"  load: world state — {ws.Bools.Count} bool(s), {ws.Accumulators.Count} accum, " +
                               $"{ws.OpenedChests.Count} chest(s), {ws.UnlockedUsables.Count} unlock(s), " +
@@ -42787,12 +43422,29 @@ void main()
         foreach (var snap in save.Actors)
             if (snap.IsDead && snap.Scid < 0xFD000000) _persistedDeadScids.Add(snap.Scid);
         _persistedWorldState = save.World;
+        // Conversation visits follow the save (older saves: everyone from visit 1).
+        _conversationVisits.Clear();
+        _directionsRequested.Clear();
+        if (save.World is { } wsVisits)
+            foreach (var kv in wsVisits.ConversationVisits) _conversationVisits[kv.Key] = kv.Value;
 
         /// <summary>SC-SAVE-AUDIT — one elevator row applied to a live lift.</summary>
         bool ApplyElevatorSnapshot(SiegeFX.Core.Save.ElevatorStopSnapshot es)
         {
             if (!_elevatorsByScid.TryGetValue(es.Scid, out var el)) return false;
-            if (el.AtStop == es.AtStop) return false;
+            bool wasMoving = el.Moving;
+            if (el.AtStop == es.AtStop && !wasMoving) return false;
+            // Save rows record parked stops, not an in-flight rider/car pose.
+            // Cancel transient carry even when the saved stop equals the
+            // departure stop, then rebuild the masked navigation floor.
+            bool playerRode = wasMoving && _player is not null && el.Riders.Contains(_player);
+            if (wasMoving) SetElevatorRiderMovementSuspended(el, false);
+            el.Riders.Clear();
+            // The departure applied the rider's in-flight fades. Settle the view
+            // as if the leg ending at the restored stop had completed.
+            if (playerRode)
+                ApplyElevatorActionInfo(es.AtStop == 2 ? el.Def.Moving1ActionInfo : el.Def.Moving2ActionInfo,
+                    immediate: true);
             el.AtStop = es.AtStop;
             el.Moving = false;
             el.T = 0f;
@@ -43217,7 +43869,7 @@ void main()
             ApplyMemberCombatMode(npc.PartyIndex);
             var cpos = cs.Position.ToVector3();
             if (npc.Brain is not null) npc.Brain.Teleport(cpos);
-            npc.CurrentTransform = Matrix4x4.CreateTranslation(cpos);
+            ApplyRestoredPose(npc, npc.Actor.WorldTransform, cpos, cs.Facing);
             npc.PartyRenderInit = false;
             // SC-COMPANION-DEAD-RESTORE — a member saved at 0 HP restores
             // as a DEAD, resurrectable corpse (retail semantics). The
@@ -43329,7 +43981,14 @@ void main()
                 foreach (var r in save.Actors)
                     if (r.Scid == pss.SummonScid) { srow = r; break; }
                 if (srow is not null && !srow.IsDead && srow.TemplateName.Length > 0)
-                    smn = TrySpawnCompanionActor(srow.TemplateName, srow.Scid, srow.Position.ToVector3());
+                {
+                    var summonPos = srow.Position.ToVector3();
+                    smn = TrySpawnCompanionActor(srow.TemplateName, srow.Scid, summonPos);
+                    if (smn is not null)
+                    {
+                        ApplyRestoredPose(smn, smn.Actor.WorldTransform, summonPos, srow.Facing);
+                    }
+                }
             }
             if (smn is not null && !smn.IsDead)
             {

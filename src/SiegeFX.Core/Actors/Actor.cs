@@ -77,13 +77,23 @@ public sealed class Actor
     /// stance rebinds), which must stay visible.</summary>
     public int IdleClipIndex { get; set; }
 
-    /// <summary>Current blender-selected clip. Clamped to the legal range so the caller
-    /// can index <see cref="Clips"/> blindly; defaults to <see cref="IdleClipIndex"/>
-    /// before the first dispatch resolves.</summary>
+    /// <summary>Current blender-selected clip, clamped to the legal range so the
+    /// caller can index <see cref="Clips"/> blindly. Slot 0 is chore_default,
+    /// often a one-frame stance pose; when the blender sits there with no timed
+    /// override running, the actor shows its <see cref="IdleClipIndex"/> instead
+    /// (the original fidget job re-requests chore_fidget whenever idle).</summary>
     public int CurrentClipIndex =>
-        Host.CurrentAnimIndex < 0 || Host.CurrentAnimIndex >= Clips.Length
-            ? (IdleClipIndex >= 0 && IdleClipIndex < Clips.Length ? IdleClipIndex : 0)
-            : Host.CurrentAnimIndex;
+        SelectClip(Host.CurrentAnimIndex, Host.IsOverrideActive, IdleClipIndex, Clips.Length);
+
+    /// <summary>The rule behind <see cref="CurrentClipIndex"/>: the blender's
+    /// selection, except an unset or out-of-range one, or slot 0 with no timed
+    /// override running, shows the idle clip.</summary>
+    public static int SelectClip(int selected, bool overrideActive, int idleClip, int clipCount)
+    {
+        int idle = idleClip >= 0 && idleClip < clipCount ? idleClip : 0;
+        if (selected < 0 || selected >= clipCount) return idle;
+        return selected == 0 && !overrideActive ? idle : selected;
+    }
 
     internal Actor(
         ActorInstance instance,

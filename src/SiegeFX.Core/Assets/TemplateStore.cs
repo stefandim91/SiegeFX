@@ -215,30 +215,41 @@ public sealed class TemplateStore
         if (path.Length == 0) return null;
         for (var t = template; t is not null; t = t.Specializes)
         {
-            // Progressive walk: at every depth, try the remaining-path
-            // colon-joined as an attribute name in the current node BEFORE
-            // attempting to descend further. This covers every flavor of
-            // DS1 GAS inline-shorthand:
-            //   - `aspect:model = X;` at root (whole path as one attr)
-            //   - `[aspect] { voice:die: * = X; }` inside a block
-            //   - `[aspect:voice] { die: * = X; }` (rare but legal)
-            //   - native nested `[aspect] { [voice] { [die] { * = X } } }`
-            // Pre-fold the lookup only checked the fully-flat shape and
-            // the fully-nested shape, missing the mixed forms — which is
-            // how shipped barrels' break sounds were silently dropped.
-            var node = t.Node;
-            for (int i = 0; i < path.Length; i++)
-            {
-                var remainder = path.Length - i == 1
-                    ? path[i]
-                    : string.Join(':', path, i, path.Length - i);
-                var hit = FindAttr(node, remainder);
-                if (hit is not null) return hit;
-                if (i == path.Length - 1) break;
-                var next = FindChild(node, path[i]);
-                if (next is null) { node = null!; break; }
-                node = next;
-            }
+            var hit = GetNodeAttribute(t.Node, path);
+            if (hit is not null) return hit;
+        }
+        return null;
+    }
+
+    /// <summary>Read an attribute from one GAS node without following a template
+    /// inheritance chain. Placement instances use the same nested and colon-
+    /// shorthand syntax as templates, and their authored values take precedence.</summary>
+    public static string? GetNodeAttribute(GasNode root, params string[] path)
+    {
+        if (path.Length == 0) return null;
+        // Progressive walk: at every depth, try the remaining path
+        // colon-joined as an attribute name in the current node BEFORE
+        // descending further. This covers every flavor of DS1 GAS
+        // inline-shorthand:
+        //   - `aspect:model = X;` at root (whole path as one attr)
+        //   - `[aspect] { voice:die: * = X; }` inside a block
+        //   - `[aspect:voice] { die: * = X; }` (rare but legal)
+        //   - native nested `[aspect] { [voice] { [die] { * = X } } }`
+        // Checking only the fully-flat and fully-nested shapes missed the
+        // mixed forms, which is how shipped barrels' break sounds were
+        // silently dropped.
+        var node = root;
+        for (int i = 0; i < path.Length; i++)
+        {
+            var remainder = path.Length - i == 1
+                ? path[i]
+                : string.Join(':', path, i, path.Length - i);
+            var hit = FindAttr(node, remainder);
+            if (hit is not null) return hit;
+            if (i == path.Length - 1) break;
+            var next = FindChild(node, path[i]);
+            if (next is null) return null;
+            node = next;
         }
         return null;
     }

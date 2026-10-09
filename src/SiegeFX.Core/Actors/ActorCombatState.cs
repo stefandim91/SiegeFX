@@ -76,6 +76,10 @@ public sealed class ActorCombatState
     /// classify hit severity into glance / solid / critical buckets.</summary>
     public float LastDamageTaken { get; private set; }
 
+    /// <summary>Developer immortality (SC-DEVMODE god mode): <see cref="ApplyDamage"/>
+    /// removes no life, so no single burst can kill. Never set by game content.</summary>
+    public bool Invulnerable { get; set; }
+
     public ActorCombatState(ActorStats stats)
     {
         _stats = stats;
@@ -105,6 +109,13 @@ public sealed class ActorCombatState
         // absolutely have HP and absolutely take hits.
         if (!_stats.CanTakeDamage) return 0f;
         if (damage <= 0f) return 0f;
+        // Testing immortality: the hit still registers (sound, reaction), no life is lost.
+        if (Invulnerable)
+        {
+            JustHit = true;
+            LastDamageTaken = damage;
+            return 0f;
+        }
         float actual = MathF.Min(damage, CurrentLife);
         CurrentLife -= actual;
         if (actual > 0f)

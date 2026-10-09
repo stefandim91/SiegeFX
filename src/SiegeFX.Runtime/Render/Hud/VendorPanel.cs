@@ -196,6 +196,17 @@ public sealed class VendorPanel
             { _hoverStock = p.StockIndex; break; }
     }
 
+    /// <summary>True when the point is inside the store frame. A world click
+    /// outside it (and outside the co-open inventory) ends the trade so the
+    /// player can walk away, as in the original.</summary>
+    public bool IsPointInFrame(int px, int py, int viewportW, int viewportH)
+    {
+        if (!IsOpen || _vendor is null) return false;
+        Layout(viewportW, viewportH);
+        return px >= _framePx.x && px < _framePx.x + _framePx.w
+            && py >= _framePx.y && py < _framePx.y + _framePx.h;
+    }
+
     public bool OnMouseDown(int px, int py, int playerRowCount, int viewportW, int viewportH)
     {
         if (!IsOpen || _vendor is null) return false;

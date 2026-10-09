@@ -184,6 +184,9 @@ public sealed class CompanionSnapshot
     public string TemplateName  { get; set; } = "";
     public int    PartyIndex    { get; set; }
     public Vec3   Position      { get; set; }
+    /// <summary>Live heading for a member restored from a synthetic actor
+    /// when their home region is not loaded. Null in older saves.</summary>
+    public Vec3?  Facing        { get; set; }
     public float  CurrentLife   { get; set; }
     public float  CurrentMana   { get; set; }
     /// <summary>SC-DOWNED — true when the member was UNCONSCIOUS (0 HP but
@@ -258,6 +261,13 @@ public sealed class WorldStateSnapshot
     /// load kept the current session's door positions instead of the
     /// save's. Absent on older saves = every door restores closed.</summary>
     public List<uint> OpenDoors { get; set; } = new();
+    /// <summary>Opening direction of each open leaf. Missing on older saves;
+    /// those leaves choose a direction from the restored actor position.</summary>
+    public Dictionary<uint, float> DoorSwingSigns { get; set; } = new();
+    /// <summary>Numbered conversation steps each NPC has played, keyed
+    /// "SCID:conversation" (8 hex digits). Missing on older saves: every NPC
+    /// starts from its first visit again.</summary>
+    public Dictionary<string, int> ConversationVisits { get; set; } = new();
     /// <summary>SC-GEN-PERSIST — per-generator activation + remaining-wave
     /// state. Absent on older saves = generators re-arm from region data
     /// (the old behavior: cleared ambushes respawned on every load).</summary>
@@ -361,6 +371,10 @@ public sealed class ActorSnapshot
     public uint   Scid          { get; set; }
     public string TemplateName  { get; set; } = "";
     public Vec3   Position      { get; set; }
+    /// <summary>Horizontal world-facing direction at save time. Null in older
+    /// saves: retain the actor's existing orientation (authored on a fresh load).
+    /// Additive to v14 so existing Utraea autosaves remain loadable.</summary>
+    public Vec3?  Facing        { get; set; }
     public float  CurrentLife   { get; set; }
     public float  CurrentMana   { get; set; }
     public bool   IsDead        { get; set; }

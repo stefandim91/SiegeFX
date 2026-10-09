@@ -36,6 +36,11 @@ public sealed class DialogueNode
     /// button's label on this node (5 shipped nodes: ella, ordus, tarish,
     /// torg, overseer).</summary>
     public string ButtonText { get; init; } = "";
+    /// <summary>Authored <c>button_1_value</c>: what pressing that button does.
+    /// Utraea's "Directions" buttons author <c>d_0x&lt;speaker scid&gt;</c>, the
+    /// Game Auditor flag job_talk_mp.skrit reads to play the region's
+    /// <c>zconversation_directions</c>.</summary>
+    public string ButtonValue { get; init; } = "";
     /// <summary>Authored <c>scroll_rate</c> (text-box autoscroll px/s;
     /// 0 = none) — drives narration pacing.</summary>
     public float ScrollRate { get; init; }
@@ -65,6 +70,30 @@ public sealed class ConversationDef
 {
     public string Key { get; init; } = "";
     public IReadOnlyList<DialogueNode> Nodes { get; init; } = Array.Empty<DialogueNode>();
+
+    /// <summary>Numbered steps (<c>order</c> ≥ 0) lead <see cref="Nodes"/>. DS1 plays
+    /// them one visit at a time (Zabar: quest on visit 1, advice on visit 2); the
+    /// unnumbered steps after them are the repeat greeting for every later visit.</summary>
+    public int OrderedCount
+    {
+        get
+        {
+            int n = 0;
+            while (n < Nodes.Count && Nodes[n].Order >= 0) n++;
+            return n;
+        }
+    }
+
+    /// <summary>Where a visit starts, given how many numbered steps earlier visits
+    /// played: the next unplayed numbered step, else the first repeat step, else
+    /// the last numbered step again (conversations with no repeat line).</summary>
+    public int StartIndexForVisit(int numberedStepsPlayed)
+    {
+        int ordered = OrderedCount;
+        if (numberedStepsPlayed < ordered) return Math.Max(0, numberedStepsPlayed);
+        if (ordered < Nodes.Count) return ordered;
+        return Math.Max(0, Nodes.Count - 1);
+    }
 }
 
 /// <summary>
@@ -133,7 +162,7 @@ public static class ConversationStore
                 if (!child.Header.StartsWith("text", StringComparison.OrdinalIgnoreCase)) continue;
 
                 int order = -1;
-                string text = "", choice = "", buttonText = "";
+                string text = "", choice = "", buttonText = "", buttonValue = "";
                 string? sample = null, activateQuest = null;
                 string? completeQuest = null, deactivateQuest = null;
                 bool questDialog = false, nis = false;
@@ -169,6 +198,7 @@ public static class ConversationStore
                     else if (NameEq(name, "quest_dialog"))   questDialog = ParseBool(raw);
                     else if (NameEq(name, "nis"))            nis = ParseBool(raw);
                     else if (NameEq(name, "button_1_text"))  buttonText = StripQuotes(raw);
+                    else if (NameEq(name, "button_1_value")) buttonValue = StripQuotes(raw).Trim();
                     else if (NameEq(name, "scroll_rate"))
                         float.TryParse(raw.Trim().TrimEnd('f', 'F'), NumberStyles.Float,
                             CultureInfo.InvariantCulture, out scrollRate);
@@ -187,22 +217,19 @@ public static class ConversationStore
                     IsQuestDialog    = questDialog,
                     IsNonInteractive = nis,
                     ButtonText       = buttonText,
+                    ButtonValue      = buttonValue,
                     ScrollRate       = scrollRate,
                 });
             }
 
             // DS1 nodes with `order` come first, in numeric order; tail nodes
-            // without `order` follow. Stable sort preserves authoring order
-            // within each bucket so the no-order-tail story still reads as
-            // authored.
-            nodes.Sort((a, b) =>
-            {
-                int ao = a.Order < 0 ? int.MaxValue : a.Order;
-                int bo = b.Order < 0 ? int.MaxValue : b.Order;
-                return ao.CompareTo(bo);
-            });
+            // without `order` follow. OrderBy is stable (List.Sort is not), so
+            // authoring order survives within each bucket.
+            var ordered = nodes
+                .OrderBy(n => n.Order < 0 ? int.MaxValue : n.Order)
+                .ToList();
 
-            dict[key] = new ConversationDef { Key = key, Nodes = nodes };
+            dict[key] = new ConversationDef { Key = key, Nodes = ordered };
         }
     }
 

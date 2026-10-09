@@ -96,6 +96,28 @@ public sealed class NavMesh
 
     public bool IsBlocked(int tri) => Blocked is not null && tri >= 0 && tri < Blocked.Length && Blocked[tri];
 
+    /// <summary>A terrain node that has physically left its baked position (for
+    /// example an elevator car in motion). Unlike an obstacle, it cannot be
+    /// used even as a standing-position fallback.</summary>
+    public bool[]? Unavailable { get; private set; }
+    public bool HasUnavailable { get; private set; }
+    public bool IsUnavailable(int tri) => Unavailable is not null && tri >= 0 && tri < Unavailable.Length && Unavailable[tri];
+
+    public int SetUnavailableForSnode(uint snodeGuid, bool unavailable)
+    {
+        if (Unavailable is null && !unavailable) return 0;
+        Unavailable ??= new bool[TriangleCount];
+        int changed = 0;
+        for (int t = 0; t < TriangleCount; t++)
+        {
+            if (SourceSnodeGuid[t] != snodeGuid || Unavailable[t] == unavailable) continue;
+            Unavailable[t] = unavailable;
+            changed++;
+        }
+        if (changed > 0) HasUnavailable = unavailable || Array.IndexOf(Unavailable, true) >= 0;
+        return changed;
+    }
+
     /// <summary>SC-DOORS-BLOCK — reset every obstacle mark so the map can be
     /// re-stamped from live state (door opened, prop destroyed). Cheap:
     /// one Array.Clear; the caller re-marks everything that still blocks.</summary>
@@ -296,6 +318,54 @@ public sealed class NavMesh
     /// at 1.5 still sealed those corridor tiles; 0.6 splits the two
     /// populations cleanly.</summary>
     private const float EdgeSealMaxAreaXZ = 0.6f;
+
+    /// <summary>Blocks the triangles a thin wall segment actually crosses: those
+    /// the XZ segment <paramref name="a"/>–<paramref name="b"/> passes through or
+    /// comes within <paramref name="halfWidth"/> of, inside the same vertical band
+    /// as <see cref="MarkObstacle(float, float, float, float, float, string?)"/>.
+    /// Any walk across the segment has to pass through one of those triangles, so
+    /// the line seals; unlike a bounding disc it leaves the floor on either side
+    /// open (a closed door leaf no longer blocks the step in front of it).</summary>
+    public int MarkObstacleSegment(Vector3 a, Vector3 b, float halfWidth, float baseY, float topY, string? tag)
+    {
+        Blocked ??= new bool[TriangleCount];
+        BlockedTag ??= new string?[TriangleCount];
+        float loY = baseY - ObstacleBelowFloorTol;
+        float hiY = topY + ObstacleAboveTopTol;
+        float hw2 = halfWidth * halfWidth;
+        int marked = 0;
+        for (int t = 0; t < TriangleCount; t++)
+        {
+            if (Blocked[t]) continue;
+            float cy = Centroids[t].Y;
+            if (cy < loY || cy > hiY) continue;
+            var v0 = Vertices[Indices[3 * t + 0]];
+            var v1 = Vertices[Indices[3 * t + 1]];
+            var v2 = Vertices[Indices[3 * t + 2]];
+            bool hit = PointInTriangleXZ(a, v0, v1, v2) || PointInTriangleXZ(b, v0, v1, v2)
+                || SegmentsCrossXZ(a, b, v0, v1) || SegmentsCrossXZ(a, b, v1, v2) || SegmentsCrossXZ(a, b, v2, v0)
+                || EdgeWithinDiskXZ(v0, v1, a.X, a.Z, hw2) || EdgeWithinDiskXZ(v1, v2, a.X, a.Z, hw2)
+                || EdgeWithinDiskXZ(v2, v0, a.X, a.Z, hw2) || EdgeWithinDiskXZ(v0, v1, b.X, b.Z, hw2)
+                || EdgeWithinDiskXZ(v1, v2, b.X, b.Z, hw2) || EdgeWithinDiskXZ(v2, v0, b.X, b.Z, hw2)
+                || EdgeWithinDiskXZ(a, b, v0.X, v0.Z, hw2) || EdgeWithinDiskXZ(a, b, v1.X, v1.Z, hw2)
+                || EdgeWithinDiskXZ(a, b, v2.X, v2.Z, hw2);
+            if (!hit) continue;
+            Blocked[t] = true;
+            BlockedTag[t] = $"{tag}|segment w={halfWidth:F2}";
+            marked++;
+        }
+        return marked;
+    }
+
+    private static bool SegmentsCrossXZ(Vector3 p0, Vector3 p1, Vector3 q0, Vector3 q1)
+    {
+        static float Orient(Vector3 o, Vector3 u, Vector3 w) =>
+            (u.X - o.X) * (w.Z - o.Z) - (u.Z - o.Z) * (w.X - o.X);
+        float d1 = Orient(q0, q1, p0), d2 = Orient(q0, q1, p1);
+        float d3 = Orient(p0, p1, q0), d4 = Orient(p0, p1, q1);
+        return ((d1 > 0f && d2 < 0f) || (d1 < 0f && d2 > 0f))
+            && ((d3 > 0f && d4 < 0f) || (d3 < 0f && d4 > 0f));
+    }
 
     private static bool EdgeWithinDiskXZ(Vector3 e0, Vector3 e1, float cx, float cz, float r2)
     {
@@ -512,6 +582,74 @@ public sealed class NavMesh
 
         var indices = tris.ToArray();
         var triCount = indices.Length / 3;
+        var neighbors = BuildManifoldNeighbors(indices, out int nonManifoldEdges);
+
+        var vertsArr = verts.ToArray();
+        var kindsArr = kinds.ToArray();
+
+        // SC-NAV-CROSS-SNO-STITCH — wire nav adjacency across SNO seams
+        // using each snode's authored Door records. fh_r1's stair-bottom
+        // SNO and hc_r1's basement-floor SNO are placed touching in
+        // world space but their nav triangles don't share vertices at
+        // the seam, so the manifold pass left them on disconnected
+        // components — A* refused with "no corridor" when the player
+        // tried to walk from the stair bottom into the basement.
+        // Runs BEFORE land↔water stitching so this pass's newly-paired
+        // edges aren't counted as boundary candidates by the water pass.
+        var extraLinksBuild = new Dictionary<int, List<int>>();
+        int doorSeams = StitchSnoDoorSeams(graph, layout, resolveSno, sourceSnodeGuid.ToArray(), indices, neighbors, vertsArr, kindsArr, extraLinksBuild, out int doorSeamOverflow);
+        // Land↔water seam stitching: shoreline Floor and Water SNOs are authored in
+        // separate meshes whose vertices don't fall inside the WeldToleranceUnits bucket,
+        // so the manifold pass leaves them on disconnected components. Wire cross-kind
+        // adjacencies for boundary-edge pairs that share an XZ footprint and a wadeable Y.
+        int seamEdges = StitchLandWaterSeams(triCount, indices, neighbors, vertsArr, kindsArr);
+
+        var (centroids, originX, originZ, cellsX, cellsZ, grid) = BuildGrid(vertsArr, indices);
+
+        return new NavMesh(
+            vertsArr,
+            indices,
+            neighbors,
+            kindsArr,
+            centroids,
+            sourceNode.ToArray(),
+            sourceLnode.ToArray(),
+            sourceSnodeGuid.ToArray(),
+            sourceSnodes,
+            degenerate,
+            nonManifoldEdges,
+            seamEdges,
+            doorSeams,
+            extraLinksBuild.Count == 0
+                ? null
+                : extraLinksBuild.ToDictionary(kv => kv.Key, kv => kv.Value.ToArray()),
+            doorSeamOverflow,
+            originX,
+            originZ,
+            cellsX,
+            cellsZ,
+            grid);
+    }
+
+    /// <summary>Builds a mesh straight from a triangle list: the same manifold
+    /// adjacency and lookup grid as <see cref="BuildForRegion"/>, without SNO
+    /// welding or seam stitching. For tests and tools that need a small known mesh.
+    /// Vertices are used as given, so triangles share an edge only when they share
+    /// vertex indices.</summary>
+    public static NavMesh FromTriangles(Vector3[] vertices, int[] indices, SnoModel.FloorKind[]? kinds = null)
+    {
+        int triCount = indices.Length / 3;
+        kinds ??= Enumerable.Repeat(SnoModel.FloorKind.Floor, triCount).ToArray();
+        var neighbors = BuildManifoldNeighbors(indices, out int nonManifoldEdges);
+        var (centroids, originX, originZ, cellsX, cellsZ, grid) = BuildGrid(vertices, indices);
+        return new NavMesh(vertices, indices, neighbors, kinds, centroids,
+            new int[triCount], new int[triCount], new uint[triCount], 0, 0, nonManifoldEdges,
+            0, 0, null, 0, originX, originZ, cellsX, cellsZ, grid);
+    }
+
+    private static int[] BuildManifoldNeighbors(int[] indices, out int nonManifoldEdgeCount)
+    {
+        int triCount = indices.Length / 3;
         var neighbors = new int[indices.Length];
         for (int i = 0; i < neighbors.Length; i++) neighbors[i] = -1;
 
@@ -571,27 +709,14 @@ public sealed class NavMesh
             for (int ss = 0; ss < 3; ss++)
                 if (neighbors[3 * triB + ss] == triA) { neighbors[3 * triB + ss] = -1; break; }
         }
+        nonManifoldEdgeCount = nonManifoldEdges;
+        return neighbors;
+    }
 
-        var vertsArr = verts.ToArray();
-        var kindsArr = kinds.ToArray();
-
-        // SC-NAV-CROSS-SNO-STITCH — wire nav adjacency across SNO seams
-        // using each snode's authored Door records. fh_r1's stair-bottom
-        // SNO and hc_r1's basement-floor SNO are placed touching in
-        // world space but their nav triangles don't share vertices at
-        // the seam, so the manifold pass left them on disconnected
-        // components — A* refused with "no corridor" when the player
-        // tried to walk from the stair bottom into the basement.
-        // Runs BEFORE land↔water stitching so this pass's newly-paired
-        // edges aren't counted as boundary candidates by the water pass.
-        var extraLinksBuild = new Dictionary<int, List<int>>();
-        int doorSeams = StitchSnoDoorSeams(graph, layout, resolveSno, sourceSnodeGuid.ToArray(), indices, neighbors, vertsArr, extraLinksBuild, out int doorSeamOverflow);
-        // Land↔water seam stitching: shoreline Floor and Water SNOs are authored in
-        // separate meshes whose vertices don't fall inside the WeldToleranceUnits bucket,
-        // so the manifold pass leaves them on disconnected components. Wire cross-kind
-        // adjacencies for boundary-edge pairs that share an XZ footprint and a wadeable Y.
-        int seamEdges = StitchLandWaterSeams(triCount, indices, neighbors, vertsArr, kindsArr);
-
+    private static (Vector3[] Centroids, float OriginX, float OriginZ, int CellsX, int CellsZ, int[]?[] Grid)
+        BuildGrid(Vector3[] vertsArr, int[] indices)
+    {
+        int triCount = indices.Length / 3;
         var centroids = new Vector3[triCount];
         float gMinX = float.PositiveInfinity, gMinZ = float.PositiveInfinity;
         float gMaxX = float.NegativeInfinity, gMaxZ = float.NegativeInfinity;
@@ -658,30 +783,7 @@ public sealed class NavMesh
             for (int i = 0; i < buckets.Length; i++)
                 grid[i] = buckets[i]?.ToArray();
         }
-
-        return new NavMesh(
-            vertsArr,
-            indices,
-            neighbors,
-            kindsArr,
-            centroids,
-            sourceNode.ToArray(),
-            sourceLnode.ToArray(),
-            sourceSnodeGuid.ToArray(),
-            sourceSnodes,
-            degenerate,
-            nonManifoldEdges,
-            seamEdges,
-            doorSeams,
-            extraLinksBuild.Count == 0
-                ? null
-                : extraLinksBuild.ToDictionary(kv => kv.Key, kv => kv.Value.ToArray()),
-            doorSeamOverflow,
-            originX,
-            originZ,
-            cellsX,
-            cellsZ,
-            grid);
+        return (centroids, originX, originZ, cellsX, cellsZ, grid);
     }
 
     /// <summary>SC-NAV-CROSS-SNO-STITCH — door-anchored cross-SNO nav
@@ -698,6 +800,9 @@ public sealed class NavMesh
     /// each other. Returns the number of edges wired.</summary>
     private const float DoorSeamAnchorRadius = 4.0f;
     private const float DoorSeamEdgePairDistance = 1.5f;
+    // How far from a door anchor a wide overflow link looks for an existing
+    // floor route before it counts as redundant.
+    private const float DoorSeamLocalRouteRadius = 24f;
     // A legitimate door seam joins two FLOOR edges at nearly the same height —
     // the walker steps across, it never falls. Without a vertical gate, a stair
     // tread's side edge pairs with the floor edge running under the staircase
@@ -719,6 +824,7 @@ public sealed class NavMesh
         int[] indices,
         int[] neighbors,
         Vector3[] verts,
+        SnoModel.FloorKind[] kinds,
         Dictionary<int, List<int>> extraLinks,
         out int overflowLinks)
     {
@@ -767,6 +873,58 @@ public sealed class NavMesh
         }
         Vector3 TriCentroid(int t) =>
             (verts[indices[3 * t + 0]] + verts[indices[3 * t + 1]] + verts[indices[3 * t + 2]]) / 3f;
+        // Plan-view (XZ) distance between two triangles: 0 when they touch or
+        // overlap, small across a weld seam, large across a wall or ledge. The
+        // caller gates height separately. Two disjoint triangles are closest at
+        // a vertex of one against an edge of the other, so vertex-to-edge
+        // distances suffice once overlap and edge crossings are ruled out.
+        float TriangleGap(int a, int b)
+        {
+            Span<Vector2> pa = stackalloc Vector2[3];
+            Span<Vector2> pb = stackalloc Vector2[3];
+            for (int i = 0; i < 3; i++)
+            {
+                var va = verts[indices[3 * a + i]];
+                var vb = verts[indices[3 * b + i]];
+                pa[i] = new Vector2(va.X, va.Z);
+                pb[i] = new Vector2(vb.X, vb.Z);
+            }
+            float best = float.MaxValue;
+            for (int i = 0; i < 3; i++)
+            {
+                var a0 = pa[i]; var a1 = pa[(i + 1) % 3];
+                for (int j = 0; j < 3; j++)
+                {
+                    var b0 = pb[j]; var b1 = pb[(j + 1) % 3];
+                    if (SegmentsCross(a0, a1, b0, b1)) return 0f;
+                    best = MathF.Min(best, PointSegmentDistance(a0, b0, b1));
+                    best = MathF.Min(best, PointSegmentDistance(b0, a0, a1));
+                }
+            }
+            // No edges cross: either disjoint, or one triangle lies inside the other.
+            if (PointInTriangleXZ(new Vector3(pa[0].X, 0f, pa[0].Y),
+                    new Vector3(pb[0].X, 0f, pb[0].Y), new Vector3(pb[1].X, 0f, pb[1].Y), new Vector3(pb[2].X, 0f, pb[2].Y))
+                || PointInTriangleXZ(new Vector3(pb[0].X, 0f, pb[0].Y),
+                    new Vector3(pa[0].X, 0f, pa[0].Y), new Vector3(pa[1].X, 0f, pa[1].Y), new Vector3(pa[2].X, 0f, pa[2].Y)))
+                return 0f;
+            return best;
+        }
+        static float PointSegmentDistance(Vector2 p, Vector2 s0, Vector2 s1)
+        {
+            var d = s1 - s0;
+            float len2 = d.LengthSquared();
+            float t = len2 < 1e-9f ? 0f : Math.Clamp(Vector2.Dot(p - s0, d) / len2, 0f, 1f);
+            return Vector2.Distance(p, s0 + d * t);
+        }
+        static bool SegmentsCross(Vector2 p0, Vector2 p1, Vector2 q0, Vector2 q1)
+        {
+            static float Orient(Vector2 a, Vector2 b, Vector2 c) =>
+                (b.X - a.X) * (c.Y - a.Y) - (b.Y - a.Y) * (c.X - a.X);
+            float d1 = Orient(q0, q1, p0), d2 = Orient(q0, q1, p1);
+            float d3 = Orient(p0, p1, q0), d4 = Orient(p0, p1, q1);
+            return ((d1 > 0f && d2 < 0f) || (d1 < 0f && d2 > 0f))
+                && ((d3 > 0f && d4 < 0f) || (d3 < 0f && d4 > 0f));
+        }
         // Split a small tri set into its slot-connected local components.
         // Stepped pieces fragment internally: riser faces are degenerate in XZ
         // and dropped from the mesh, so each tread strip is its own island —
@@ -813,6 +971,33 @@ public sealed class NavMesh
                     foreach (var nb in ex)
                         if (bset.Contains(nb)) return true;
                 }
+            }
+            return false;
+        }
+        // Is there already a route between two tris near a door anchor over
+        // ground of the same kind (slot or overflow adjacency, staying within
+        // a local radius)?
+        bool LocallyConnected(int from, int to, Vector3 anchor)
+        {
+            var kind = kinds[from];
+            const float radius2 = DoorSeamLocalRouteRadius * DoorSeamLocalRouteRadius;
+            var visited = new HashSet<int> { from };
+            var queue = new Queue<int>();
+            queue.Enqueue(from);
+            while (queue.Count > 0)
+            {
+                int t = queue.Dequeue();
+                if (t == to) return true;
+                void Visit(int nb)
+                {
+                    if (nb < 0 || kinds[nb] != kind || visited.Contains(nb)) return;
+                    if (Vector3.DistanceSquared(TriCentroid(nb), anchor) > radius2) return;
+                    visited.Add(nb);
+                    queue.Enqueue(nb);
+                }
+                for (int s = 0; s < 3; s++) Visit(neighbors[3 * t + s]);
+                if (extraLinks.TryGetValue(t, out var ex))
+                    foreach (var nb in ex) Visit(nb);
             }
             return false;
         }
@@ -907,6 +1092,14 @@ public sealed class NavMesh
                 foreach (var compB in LocalComponents(bNear))
                 {
                     if (AnyLink(compA, compB)) continue;
+                    // Pair by the real plan-view gap between the two triangles,
+                    // not by centroid distance, and drop a wide link whose
+                    // pieces already join over floor nearby. This fallback also
+                    // runs at fully welded seams, where it only adds shortcuts:
+                    // Elddim's upper green got a ~5u link down to the slope
+                    // below, A* routed over it, and the walker, which can't
+                    // cross a gap, stuck at the ledge. Connectivity is
+                    // unchanged; only redundant links are dropped.
                     int bestA = -1, bestB = -1;
                     float bestScore = float.MaxValue;
                     foreach (var tA in compA)
@@ -917,12 +1110,13 @@ public sealed class NavMesh
                             var cb = TriCentroid(tB);
                             float dy = MathF.Abs(ca.Y - cb.Y);
                             if (dy > 1.0f) continue;
-                            float ddx = ca.X - cb.X, ddz = ca.Z - cb.Z;
-                            float score = MathF.Sqrt(ddx * ddx + ddz * ddz) + dy;
+                            float score = TriangleGap(tA, tB) + dy;
                             if (score < bestScore) { bestScore = score; bestA = tA; bestB = tB; }
                         }
                     }
                     if (bestA < 0) continue;
+                    if (bestScore > DoorSeamEdgePairDistance
+                        && LocallyConnected(bestA, bestB, doorAnchor)) continue;
                     if (!extraLinks.TryGetValue(bestA, out var la)) extraLinks[bestA] = la = new List<int>();
                     if (!la.Contains(bestB)) la.Add(bestB);
                     if (!extraLinks.TryGetValue(bestB, out var lb)) extraLinks[bestB] = lb = new List<int>();
@@ -1108,6 +1302,7 @@ public sealed class NavMesh
         for (int i = 0; i < bucket.Length; i++)
         {
             int t = bucket[i];
+            if (IsUnavailable(t)) continue;
             var a = Vertices[Indices[3 * t + 0]];
             var b = Vertices[Indices[3 * t + 1]];
             var c = Vertices[Indices[3 * t + 2]];
@@ -1210,6 +1405,7 @@ public sealed class NavMesh
         {
             int t = bucket[i];
             if (_componentIds![t] != refComp) continue;
+            if (IsUnavailable(t)) continue;
             var a = Vertices[Indices[3 * t + 0]];
             var b = Vertices[Indices[3 * t + 1]];
             var c = Vertices[Indices[3 * t + 2]];
@@ -1263,6 +1459,7 @@ public sealed class NavMesh
         for (int i = 0; i < bucket.Length; i++)
         {
             int t = bucket[i];
+            if (IsUnavailable(t)) continue;
             var a = Vertices[Indices[3 * t + 0]];
             var b = Vertices[Indices[3 * t + 1]];
             var c = Vertices[Indices[3 * t + 2]];
@@ -1324,6 +1521,7 @@ public sealed class NavMesh
             {
                 int t = bucket[i];
                 if (!traversal.CanEnter(Kinds[t])) continue;
+                if (IsUnavailable(t)) continue;
                 if (Blocked is not null && t < Blocked.Length && Blocked[t]) continue;
                 if (FadeHidden is not null && t < FadeHidden.Length && FadeHidden[t]) continue;
                 var a = Vertices[Indices[3 * t + 0]];
@@ -1389,6 +1587,7 @@ public sealed class NavMesh
             }
             var p = new Vector3(px, (a.Y + b.Y) * 0.5f, pz);
             if (!TryFindTriangle(p, out var tri, includeFadeHidden: true)) return true;
+            if (IsUnavailable(tri)) return true;
             if (IsBlocked(tri)) return true;
         }
         return false;
@@ -1440,6 +1639,7 @@ public sealed class NavMesh
             for (int i = 0; i < bucket.Length; i++)
             {
                 int t = bucket[i];
+                if (IsUnavailable(t)) continue;
                 if (!includeFadeHidden && FadeHidden is not null && t < FadeHidden.Length && FadeHidden[t]) continue;
                 var a = Vertices[Indices[3 * t + 0]];
                 var b = Vertices[Indices[3 * t + 1]];

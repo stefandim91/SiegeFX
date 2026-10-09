@@ -164,12 +164,14 @@ public static class NavPathfinder
             mesh.Flags.CanEnter(mesh.SourceSnodeGuid[tri],
                 (byte)mesh.SourceLnodeIndex[tri], traversal.Actor);
         if (!TriPasses(startTri)) { LastFailure = $"start tri {startTri} fails logical-flags gate"; return false; }
+        if (mesh.IsUnavailable(startTri)) { LastFailure = $"start tri {startTri} is physically unavailable"; return false; }
         // SC-NAV-OBSTACLE-AVOID — refuse pathing INTO an obstacle.
         // Start triangle can be blocked (actor wedged against a wall
         // at spawn / after a knockback / etc) but the goal must not
         // be blocked, and we'll filter blocked triangles out of A*
         // expansion below.
         if (mesh.IsBlocked(goalTri)) { LastFailure = $"goal tri {goalTri} obstacle-blocked"; return false; }
+        if (mesh.IsUnavailable(goalTri)) { LastFailure = $"goal tri {goalTri} is physically unavailable"; return false; }
         // SC-FADE-WALKABLE — fade-hidden triangles are deliberately NOT
         // rejected here. DS1 fades are camera-side: faded ground stays
         // physically walkable (the surface still exists while the party is
@@ -198,6 +200,7 @@ public static class NavPathfinder
         void Consider(int from, int nb)
         {
             if (nb < 0 || closed[nb]) return;
+            if (mesh.IsUnavailable(nb)) return;
             if (mesh.IsBlocked(nb)) return;
             float mul = traversal.GetMultiplier(mesh.Kinds[nb]);
             if (float.IsPositiveInfinity(mul)) return;
