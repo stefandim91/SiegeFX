@@ -20963,7 +20963,13 @@ void main()
         ActorRenderState? atk = null;
         foreach (var a in _actors)
             if (ReferenceEquals(a.Brain, brain)) { atk = a; break; }
-        if (atk is not null) PerformPropBreak(best, atk.Actor.Stats);
+        if (atk is null) return;
+        // The brain already plays the smasher's own chore_attack. Resolve the
+        // break directly: PerformPropBreak is the PLAYER's swing (it turns
+        // the hero and starts the hero's attack), so routing a monster's
+        // fidget through it made the hero swing at random while walking.
+        Console.WriteLine($"[fidget] {atk.Actor.Template.Name} smashes {best.Template}");
+        ResolveSwingHitOnProp(best, atk.Actor.Stats);
     }
 
     // ── SC-MOB-PARTIES (blindspot Phase B) ────────────────────────────────
