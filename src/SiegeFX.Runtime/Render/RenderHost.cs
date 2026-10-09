@@ -10773,6 +10773,18 @@ void main()
                 // Latches a Buy/Sell press on LMB-down; RMB is swallowed so a
                 // stray right-click behind the panel can't retarget the camera
                 // mid-trade.
+                // A click on the world (outside the store frame and the co-open
+                // inventory) ends the trade and carries on as a normal click, so
+                // the player walks away from the shop like in the original.
+                if (_vendor.IsOpen && (btn == MouseButton.Left || btn == MouseButton.Right)
+                    && !_vendor.IsPointInFrame((int)m.Position.X, (int)m.Position.Y, _window.Size.X, _window.Size.Y)
+                    && !(_inventoryOpen && _inventoryPanel.IsPointInPanel((int)m.Position.X, (int)m.Position.Y,
+                                                                          _window.Size.X, _window.Size.Y)))
+                {
+                    _vendor.Close();
+                    ReconcileTradeInventory();
+                    Console.WriteLine("trade: closed by a world click");
+                }
                 if (_vendor.IsOpen && (btn == MouseButton.Left || btn == MouseButton.Right))
                 {
                     if (btn == MouseButton.Left)
