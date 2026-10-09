@@ -2088,6 +2088,8 @@ T105() {
     if [ "$ERRORLEVEL" -ge 1 ]; then printf '%s\n' "*** ELEVATOR-INTERACTION SELFTEST FAILED ***"; else printf '%s\n' "elevator-interaction: PASS"; fi
     "$RUN" --selftest-lever-pose "${DS1}"; ERRORLEVEL=$?
     if [ "$ERRORLEVEL" -ge 1 ]; then printf '%s\n' "*** LEVER-POSE SELFTEST FAILED ***"; else printf '%s\n' "lever-pose: PASS"; fi
+    "$RUN" --selftest-door-interaction "${DS1}"; ERRORLEVEL=$?
+    if [ "$ERRORLEVEL" -ge 1 ]; then printf '%s\n' "*** DOOR-INTERACTION SELFTEST FAILED ***"; else printf '%s\n' "door-interaction: PASS"; fi
     printf '%s\n' "[Same basement house as the stair/cutaway tests - besides the stairs it"
     printf '%s\n' " has a METAL GRATE floor section that is a working lift now. Spawn ="
     printf '%s\n' " top of its shaft (world ~76,-4,-72; hc_r1 streams as fh_r1 neighbor)."

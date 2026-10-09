@@ -178,6 +178,11 @@ public sealed partial class RenderHost : IDisposable
         {
             bool shouldOpen = ws.OpenDoors.Contains(d.Scid);
             if (!authoritative && !shouldOpen) continue;
+            if (shouldOpen && (authoritative || !d.DoorTargetOpen)
+                && ws.DoorSwingSigns.TryGetValue(d.Scid, out float savedSign))
+                d.DoorSwingSign = savedSign < 0f ? -1f : 1f;
+            else if (shouldOpen && !d.DoorTargetOpen)
+                d.DoorSwingSign = d.DoorIsFlip ? ComputeFlipSwingSign(d) : ComputeDoorSwingSign(d);
             if (d.DoorTargetOpen == shouldOpen) continue;
             d.DoorTargetOpen = shouldOpen;
             d.DoorOpenFrac = shouldOpen ? 1f : 0f;
@@ -399,6 +404,10 @@ public sealed partial class RenderHost : IDisposable
     // LoadStaticProps; cleared when _staticProps clears on region
     // unload.
     private readonly List<StaticPropInstance> _doorProps = new();
+    private StaticPropInstance? _pendingDoorUse;
+    private ActorRenderState? _pendingDoorActor;
+    private Vector3 _pendingDoorPoint;
+    private bool _pendingDoorHasAuthoredPoint;
 
     // SC-TORCH-FLAME — one continuous fire plume per AP_light socket on placed
     // light props (torch_activate, candlestands). Each socket's world position
@@ -2846,7 +2855,9 @@ public sealed partial class RenderHost : IDisposable
                 {
                     float ogx = before.X - orderDest.X, ogz = before.Z - orderDest.Z;
                     float ogap2 = ogx * ogx + ogz * ogz;
-                    const float arriveR = 0.7f;
+                    float arriveR = ReferenceEquals(m, _pendingDoorActor)
+                        ? MathF.Min(0.2f, MathF.Max(0.1f, _pendingDoorUse?.DoorUseRange ?? 0.2f) * 0.5f)
+                        : 0.7f;
                     if (ogap2 <= arriveR * arriveR)
                     {
                         m.MoveOrder = null;   // arrived — hold this ground
@@ -4538,6 +4549,8 @@ public sealed partial class RenderHost : IDisposable
         public float DoorUseRange = 1.5f;
         public bool  DoorTargetOpen;
         public float DoorSwingSign = 1f;
+        public uint DoorSecondScid;
+        public uint[] DoorUsePointScids = Array.Empty<uint>();
         // SC-DOORS-HINGE-AXIS — bulkhead/storm doors (e.g. door_glb_stormdoor)
         // are a different mesh convention from wall doors: the leaf lies in the
         // local X-Y plane (thin along Z, tall along Y) and is placed tilted, so
@@ -4664,7 +4677,7 @@ public sealed partial class RenderHost : IDisposable
     // happen per render frame via a ground-plane raycast through the
     // mouse, mirroring TryClickToAttack / TryClickToBreakProp / TryClickToTalk
     // so cursor visual tracks 1:1 with what a click actually picks.
-    private enum CursorState { Pointer, Attack, CastAttack, Smash, Grab, UseLever, Talk, NoGo, NoTalk }
+    private enum CursorState { Pointer, Attack, CastAttack, Smash, Grab, UseDoor, UseLever, Talk, NoGo, NoTalk }
     private CursorState _cursorState = CursorState.Pointer;
     // Phase 22 — hover + walk-up pickup state. _hoverPile feeds the
     // bottom-center item readout; gold/spells also get the flat blue hover
@@ -10223,6 +10236,12 @@ void main()
                     // Authored [stop]: halt the SELECTION — the hero's walk +
                     // pendings when selected, and every selected member's
                     // explicit orders (SC-SELECT-MOVE).
+                    if (_pendingDoorActor is { } doorActor
+                        && _selectedPartyIdx.Contains(doorActor.PartyIndex))
+                    {
+                        _pendingDoorUse = null;
+                        _pendingDoorActor = null;
+                    }
                     if (_selectedPartyIdx.Contains(0))
                     {
                         _playerFollower?.SetTarget(_playerFollower.Position);
@@ -10231,6 +10250,8 @@ void main()
                         _pendingCastProp = null;
                         _pendingBreakProp = null;
                         _pendingPickupPile = null;
+                        _pendingDoorUse = null;
+                        _pendingDoorActor = null;
                     }
                     foreach (var sm in _party)
                     {
@@ -11643,7 +11664,10 @@ void main()
                     _lmbWorldDownPos = m.Position;
                     _lmbDownAtMs = Environment.TickCount64;
                     _marqueeActive = false;
-                    if (!TryClickToTalk(m.Position) && !DispatchAbilityClick(m.Position))
+                    _pendingDoorUse = null;
+                    _pendingDoorActor = null;
+                    if (!TryClickToTalk(m.Position) && !TryClickToUseDoor(m.Position)
+                        && !DispatchAbilityClick(m.Position))
                     {
                         TryClickToMove(m.Position);
                         // SC-HOLD-MOVE — keep steering while held.
@@ -15722,9 +15746,12 @@ void main()
                         }
                         if (isDoor)
                         {
-                            var ur = _templateStore.GetAttribute(template, "aspect", "use_range");
+                            var ur = SiegeFX.Core.Assets.TemplateStore.GetNodeAttribute(
+                                p.Node, "aspect", "use_range")
+                                ?? ts.GetAttribute(template, "aspect", "use_range");
                             if (ur is not null &&
-                                float.TryParse(ur, System.Globalization.NumberStyles.Float,
+                                float.TryParse(ur.Trim().TrimEnd('f', 'F'),
+                                               System.Globalization.NumberStyles.Float,
                                                System.Globalization.CultureInfo.InvariantCulture, out var urv))
                                 useRange = urv;
                         }
@@ -15737,22 +15764,23 @@ void main()
                     // lives in [messages][locked].
                     bool doorUseToggle = false, doorOneShot = false;
                     string doorLockedText = "";
-                    uint doorMsgOpening = 0;
+                    uint doorMsgOpening = 0, doorSecondScid = 0;
+                    uint[] doorUsePoints = Array.Empty<uint>();
                     if (isDoor)
                     {
                         static bool GasTrue(string? v) =>
                             v is not null && (v.Trim().Equals("true", StringComparison.OrdinalIgnoreCase) || v.Trim() == "1");
-                        doorUseToggle = GasTrue(ts.GetAttribute(template!, "door_basic", "use_toggle"));
-                        doorOneShot = GasTrue(ts.GetAttribute(template!, "door_basic", "oneshot"));
+                        string? DoorAttr(string name) =>
+                            SiegeFX.Core.Assets.TemplateStore.GetNodeAttribute(p.Node, "door_basic", name)
+                            ?? ts.GetAttribute(template!, "door_basic", name);
+                        doorUseToggle = GasTrue(DoorAttr("use_toggle"));
+                        doorOneShot = GasTrue(DoorAttr("oneshot"));
                         doorLockedText = (ts.GetAttribute(template!, "messages", "locked", "screen_text") ?? "").Trim().Trim('"');
-                        foreach (var c in p.Node.Children)
-                        {
-                            if (!string.Equals(c.Header, "door_basic", StringComparison.OrdinalIgnoreCase)) continue;
-                            foreach (var attr in c.Attributes)
-                                if (string.Equals(attr.Name, "msg_scid_opening", StringComparison.OrdinalIgnoreCase))
-                                    doorMsgOpening = ParseHexScid(attr.Value);
-                            break;
-                        }
+                        doorMsgOpening = ParseHexScid(DoorAttr("msg_scid_opening"));
+                        doorSecondScid = ParseHexScid(DoorAttr("second_door"));
+                        doorUsePoints = ParseScidList(
+                            SiegeFX.Core.Assets.TemplateStore.GetNodeAttribute(
+                                p.Node, "placement", "use_point_scids"));
                     }
 
                     // ALPHA-2C — chests open on use; never classify them as
@@ -15912,6 +15940,8 @@ void main()
                         IsDoor        = isDoor,
                         DoorIsFlip    = doorIsFlip,
                         DoorUseRange  = useRange,
+                        DoorSecondScid = doorSecondScid,
+                        DoorUsePointScids = doorUsePoints,
                         IsLever         = isLever,
                         LeverUseRange   = levUseRange,
                         LeverOnSends    = levOnSends.ToArray(),
@@ -20088,6 +20118,7 @@ void main()
     private void TickDoors(float dt)
     {
         if (dt <= 0f || _doorProps.Count == 0) return;
+        TryCompletePendingDoorUse();
         const float OpenRate  = 1f / 0.4f;   // 0 → 1 in 0.4s
         const float CloseRate = 1f / 0.5f;   // 1 → 0 in 0.5s
         // DS1 doors open on use (a click), not on proximity — so the frac
@@ -20124,6 +20155,13 @@ void main()
         if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) s = s[2..];
         return uint.TryParse(s, System.Globalization.NumberStyles.HexNumber,
             System.Globalization.CultureInfo.InvariantCulture, out var u) ? u : 0;
+    }
+
+    private static uint[] ParseScidList(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return Array.Empty<uint>();
+        return value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(ParseHexScid).Where(scid => scid != 0).ToArray();
     }
 
     /// <summary>Layout used for nav-mesh builds: the unified region layout
@@ -22288,70 +22326,145 @@ void main()
             Console.WriteLine($"  auto-traps: {added} armed ({_autoTraps.Count} total)");
     }
 
-    // SC-DOORS-OPEN — a left-click that lands on/near a door opens it (DS1
-    // doors are click-to-use, not proximity). The click ray is resolved
-    // against the navmesh, so a tall door's base sits at ~hit; the door's
-    // World.Translation is its hinge (the asp origin), and the leaf reaches
-    // ~1.6u from there, so a ~2u radius covers a click anywhere on the leaf.
-    private void OpenDoorNear(Vector3 worldPoint)
+    /// <summary>Hit the visible closed leaf, not a broad circle on the floor.
+    /// Hover and activation call this same ray/mesh-bounds test.</summary>
+    private StaticPropInstance? PickDoorAtCursor(Vector2 cursorPx)
     {
-        if (_doorProps.Count == 0) return;
+        if (_doorProps.Count == 0 || _window is null) return null;
+        var size = _window.FramebufferSize;
+        if (size.X <= 0 || size.Y <= 0) return null;
+        float ndcX = cursorPx.X / size.X * 2f - 1f;
+        float ndcY = 1f - cursorPx.Y / size.Y * 2f;
+        if (!Matrix4x4.Invert(_camera.GetViewProjection((float)size.X / size.Y), out var invVp))
+            return null;
+        var nearH = Vector4.Transform(new Vector4(ndcX, ndcY, -1f, 1f), invVp);
+        var farH = Vector4.Transform(new Vector4(ndcX, ndcY, 1f, 1f), invVp);
+        if (MathF.Abs(nearH.W) < 1e-6f || MathF.Abs(farH.W) < 1e-6f) return null;
+        var near = new Vector3(nearH.X / nearH.W, nearH.Y / nearH.W, nearH.Z / nearH.W);
+        var far = new Vector3(farH.X / farH.W, farH.Y / farH.W, farH.Z / farH.W);
         StaticPropInstance? best = null;
-        float bestD2 = 2.0f * 2.0f;
-        foreach (var d in _doorProps)
+        float bestT = float.MaxValue;
+        foreach (var door in _doorProps)
         {
-            if (d.IsDestroyed || d.DoorTargetOpen) continue;
-            var dp = d.World.Translation;
-            float dx = dp.X - worldPoint.X, dz = dp.Z - worldPoint.Z;
-            float dd = dx * dx + dz * dz;
-            if (dd < bestD2) { bestD2 = dd; best = d; }
+            if (door.IsDestroyed || door.DoorTargetOpen || door.ForceNoRender
+                || IsAbovePlayer(door.RegionPath)
+                || (door.NodeGuid != 0 && _fadedSnodeCounts.ContainsKey(door.NodeGuid))) continue;
+            if (!DoorInteractionGeometry.TryPick(near, far, door.World,
+                    door.Mesh.Min, door.Mesh.Max, out float t) || t >= bestT) continue;
+            best = door;
+            bestT = t;
         }
-        if (best is null) return;
+        return best;
+    }
 
-        // ALPHA-2E — use_toggle doors are scripted gates: clicking shows the
-        // authored stuck/locked line; only a quest message opens them.
-        if (best.DoorUseToggle)
+    private bool TryClickToUseDoor(Vector2 cursorPx)
+    {
+        if (_nisPhase != NisPhase.Off || _player is null || _player.IsDead) return false;
+        // Keep the click result consistent with the hover priority: an item,
+        // enemy, or breakable visibly under the cursor owns that pixel.
+        var other = PickInteractiveAtCursor(cursorPx);
+        if (other.Enemy is not null || other.Prop is not null || other.Pile is not null)
+            return false;
+        var door = PickDoorAtCursor(cursorPx);
+        if (door is null) return false;
+        var actor = ActingCharacter();
+        if (actor is null || actor.IsDead) return false;
+        _pendingDoorUse = door;
+        _pendingDoorActor = actor;
+        _pendingAttackTarget = null;
+        _pendingCastTarget = null;
+        _pendingCastProp = null;
+        _pendingBreakProp = null;
+        _pendingPickupPile = null;
+        _pendingLeverUse = null;
+        _pendingChestUse = null;
+        _pendingLockedUse = null;
+        _forceAttackArmed = false;
+        _forceCastArmed = false;
+        var target = DoorUseTarget(door, actor.CurrentTransform.Translation,
+            out _pendingDoorHasAuthoredPoint);
+        _pendingDoorPoint = target;
+        bool heroSelected = ReferenceEquals(actor, _player);
+        if (heroSelected) _playerFollower?.SetTarget(target);
+        IssueSelectedMemberMoveOrders(target, heroSelected);
+        // The interacting companion must reach the authored stand point;
+        // formation offsets can sit outside the narrow use range.
+        if (!heroSelected && actor.Brain is not null)
+            actor.MoveOrder = SnapToNavmesh(target, target);
+        TryCompletePendingDoorUse();
+        return true;
+    }
+
+    private Vector3 DoorUseTarget(StaticPropInstance door, Vector3 actorPos, out bool authoredPoint)
+    {
+        if (TryNearestUsePoint(door.DoorUsePointScids, actorPos, out var point))
+        { authoredPoint = true; return point; }
+        authoredPoint = false;
+        return Vector3.Transform((door.Mesh.Min + door.Mesh.Max) * 0.5f, door.World);
+    }
+
+    private void TryCompletePendingDoorUse()
+    {
+        var door = _pendingDoorUse;
+        if (door is null) return;
+        if (door.IsDestroyed || door.DoorTargetOpen || !_doorProps.Contains(door))
+        { _pendingDoorUse = null; _pendingDoorActor = null; return; }
+        var actor = _pendingDoorActor;
+        if (actor is null || actor.IsDead || !ReferenceEquals(actor, ActingCharacter()))
+        { _pendingDoorUse = null; _pendingDoorActor = null; return; }
+        var pos = actor.CurrentTransform.Translation;
+        var point = _pendingDoorPoint;
+        float dx = pos.X - point.X, dz = pos.Z - point.Z;
+        float range = _pendingDoorHasAuthoredPoint ? MathF.Max(0.1f, door.DoorUseRange)
+                                    : MathF.Max(0.8f, door.DoorUseRange);
+        if (dx * dx + dz * dz > range * range || MathF.Abs(pos.Y - point.Y) > 2.5f)
+            return;
+        _pendingDoorUse = null;
+        _pendingDoorActor = null;
+        OpenDoorByUse(door);
+    }
+
+    private StaticPropInstance? LinkedDoor(StaticPropInstance door)
+        => door.DoorSecondScid != 0 && _doorsByScid.TryGetValue(door.DoorSecondScid, out var other)
+            && other.IsDoor && !other.IsDestroyed ? other : null;
+
+    private void SetDoorOpen(StaticPropInstance door, bool open)
+    {
+        door.DoorTargetOpen = open;
+        if (!open) return;
+        door.DoorSwingSign = door.DoorIsFlip ? ComputeFlipSwingSign(door) : ComputeDoorSwingSign(door);
+        LogDoorDiag(door);
+    }
+
+    private void OpenDoorByUse(StaticPropInstance door)
+    {
+        var partner = LinkedDoor(door);
+        var locked = door.DoorUseToggle ? door : partner is { DoorUseToggle: true } ? partner : null;
+        if (locked is not null)
         {
-            var line = best.DoorLockedText.Length > 0 ? best.DoorLockedText : "It won't budge.";
-            AddFloatingText(line, best.World.Translation + new Vector3(0f, 2.0f, 0f),
-                            new Vector4(0.95f, 0.92f, 0.75f, 1f));
-            Console.WriteLine($"[door] 0x{best.Scid:X8} use_toggle refused click: \"{line}\"");
+            var line = locked.DoorLockedText.Length > 0 ? locked.DoorLockedText : "It won't budge.";
+            AddFloatingText(line, door.World.Translation + new Vector3(0f, 2f, 0f),
+                new Vector4(0.95f, 0.92f, 0.75f, 1f));
             return;
         }
-
-        if (best.DoorIsFlip)
+        SetDoorOpen(door, true);
+        if (partner is not null && !ReferenceEquals(partner, door)) SetDoorOpen(partner, true);
+        else if (door.DoorIsFlip)
         {
-            // Bulkhead/storm doors come as a pair that opens together — open
-            // every flip door near the click, not just the nearest leaf. Each
-            // leaf swings around its local-Y seam hinge with a geometry-based
-            // sign that lifts its outer edge up.
-            var seed = best.World.Translation;
-            foreach (var d in _doorProps)
+            // Old bulkhead content has nearby paired leaves without an
+            // explicit second_door SCID. Preserve its geometric pairing.
+            foreach (var other in _doorProps)
             {
-                if (d.IsDestroyed || d.DoorTargetOpen || !d.DoorIsFlip) continue;
-                var dp = d.World.Translation;
-                float ex = dp.X - seed.X, ez = dp.Z - seed.Z;
-                if (ex * ex + ez * ez > 3.0f * 3.0f) continue;
-                d.DoorTargetOpen = true;
-                d.DoorSwingSign = ComputeFlipSwingSign(d);
-                LogDoorDiag(d);
+                if (ReferenceEquals(other, door) || other.IsDestroyed || other.DoorTargetOpen
+                    || !other.DoorIsFlip) continue;
+                var delta = other.World.Translation - door.World.Translation;
+                if (delta.X * delta.X + delta.Z * delta.Z <= 9f)
+                    SetDoorOpen(other, true);
             }
-            // SC-MATERIAL-MATRIX — the door's authored material picks its
-            // open sound (21 authored rows); the creak stays the fallback.
-            if (!PlayMaterialEvent(MaterialOfRef(best.Template), "generic", "door_open", seed))
-                _audio?.PlayAt(SfxDoorOpen, seed);
-            // SC-DOORS-BLOCK — opened doors free their doorway triangles.
-            MarkAllObstacles();
-            return;
         }
-
-        best.DoorTargetOpen = true;
-        best.DoorSwingSign = ComputeDoorSwingSign(best);
-        if (!PlayMaterialEvent(MaterialOfRef(best.Template), "generic", "door_open", best.World.Translation))
-            _audio?.PlayAt(SfxDoorOpen, best.World.Translation);
-        NotifyDoorOpened(best);
-        LogDoorDiag(best);
-        // SC-DOORS-BLOCK — opened doors free their doorway triangles.
+        if (!PlayMaterialEvent(MaterialOfRef(door.Template), "generic", "door_open", door.World.Translation))
+            _audio?.PlayAt(SfxDoorOpen, door.World.Translation);
+        NotifyDoorOpened(door);
         MarkAllObstacles();
     }
 
@@ -22370,10 +22483,12 @@ void main()
         if (door.IsDestroyed) return;
         bool opening = !door.DoorTargetOpen;
         if (!opening && door.DoorOneShot) return; // oneshot gates stay open
-        door.DoorTargetOpen = opening;
+        SetDoorOpen(door, opening);
+        var partner = LinkedDoor(door);
+        if (partner is not null && !ReferenceEquals(partner, door)
+            && (opening || !partner.DoorOneShot)) SetDoorOpen(partner, opening);
         if (opening)
         {
-            door.DoorSwingSign = door.DoorIsFlip ? ComputeFlipSwingSign(door) : ComputeDoorSwingSign(door);
             _audio?.PlayAt(SfxDoorOpen, door.World.Translation);
             NotifyDoorOpened(door);
         }
@@ -22522,17 +22637,15 @@ void main()
         return xCenter >= 0f ? -1f : 1f;
     }
 
-    // Swing the leaf AWAY from the player: transform the player into the
-    // door's local (raw Z-up) frame — where Y is the thin thickness axis —
-    // and pick the sign so the free edge sweeps to the opposite side.
-    // CreateRotationZ(+) sends the -X free edge toward -Y, so a player on
-    // the +Y side wants +sign (door opens to -Y, away from them).
+    // Swing the free edge away from the player. Paired leaves extend in
+    // opposite local X directions, so the leaf geometry matters as well as
+    // which side of the doorway the player stands on.
     private float ComputeDoorSwingSign(StaticPropInstance door)
     {
-        if (_player is null) return 1f;
-        if (!Matrix4x4.Invert(door.World, out var inv)) return 1f;
-        var pLocal = Vector3.Transform(_player.CurrentTransform.Translation, inv);
-        return pLocal.Y >= 0f ? 1f : -1f;
+        var actor = ActingCharacter() ?? _player;
+        if (actor is null) return 1f;
+        return DoorInteractionGeometry.SwingSign(door.World, door.Mesh.Min,
+            door.Mesh.Max, actor.CurrentTransform.Translation);
     }
 
     /// <summary>Phase 21c-1 barrel investigation: one-shot per-template dump of the
@@ -29470,12 +29583,8 @@ void main()
         // SC-NAV-PARTIAL-PATH — the whole-mesh fallback is for PLAYER orders
         // only (opt-in; ambient wanderers keep cheap fail-and-reroll).
         _playerFollower.PartialPathFallback = true;
-        // SC-DOORS-OPEN — clicking on/near a door opens it regardless of who
-        // is selected (retail: the first-selected character works doors; the
-        // ordered members walk to the click and pass through). A click that
-        // picked a wall/floor control has hit = its stand point, not a point
-        // the player aimed at, so it must not also work doors near that spot.
-        if (leverWithoutFloor is null) OpenDoorNear(hit);
+        // Doors are selected by the same visible-leaf ray as their hover hand
+        // (TryClickToUseDoor). A ground click near a hinge is only a move.
         // SC-FIRST-SELECTED (blindspot E3) — a member-only selection can
         // work levers/chests/usables too: the request latches queue the
         // same way, and their arrival checks test the ACTING character
@@ -33592,6 +33701,7 @@ void main()
             CursorState.Attack     => "Left-click to attack",
             CursorState.CastAttack => "Left-click to attack",
             CursorState.Grab       => "Left-click to pick up item",
+            CursorState.UseDoor    => "Left-click to open door",
             CursorState.UseLever   => "Left-click to use lever",
             CursorState.Smash      => "Left-click to break",
             CursorState.Talk       => "Right-click to talk",
@@ -33962,6 +34072,9 @@ void main()
                 { _cursorState = CursorState.NoTalk; return; }
             }
         }
+        // Closed door leaf under the cursor → use hand (TryClickToUseDoor's pick).
+        if (PickDoorAtCursor(cursorPx) is not null)
+        { _cursorState = CursorState.UseDoor; return; }
         // 5) Phase 23 — nothing interactive under the cursor: is the ground
         //    itself somewhere the player can be sent? Mirror TryClickToMove's
         //    resolution exactly (nav-mesh ray pick, then the plane fallback)
@@ -34041,7 +34154,7 @@ void main()
                 int frame = (int)(_terrainTime * 12.0) % _cursorSmash.Length;
                 return (_cursorSmash[frame], hsSmallX, hsSmallY, small);
             }
-            case CursorState.Grab or CursorState.UseLever when _cursorGrab is { Length: > 0 }:
+            case CursorState.Grab or CursorState.UseDoor or CursorState.UseLever when _cursorGrab is { Length: > 0 }:
             {
                 int frame = (int)(_terrainTime * 12.0) % _cursorGrab.Length;
                 return (_cursorGrab[frame], hsSmallX, hsSmallY, small);
@@ -41991,6 +42104,8 @@ void main()
         _staticProps.Clear();
         _movingPropsByNode.Clear();
         _doorProps.Clear();
+        _pendingDoorUse = null;
+        _pendingDoorActor = null;
         _flameSources.Clear();
         // SC-ELEVATOR — elevators + levers are per-region-load state.
         _leverProps.Clear();
@@ -42252,7 +42367,11 @@ void main()
         foreach (var b in _blockingGizmos) if (!b.Active) world.ClearedBlockers.Add(b.Scid);
         // SC-DOOR-PERSIST — open door leaves, so loads restore the save's
         // doors instead of leaking the live session's.
-        foreach (var d in _doorProps) if (d.DoorTargetOpen) world.OpenDoors.Add(d.Scid);
+        foreach (var d in _doorProps) if (d.DoorTargetOpen)
+        {
+            world.OpenDoors.Add(d.Scid);
+            world.DoorSwingSigns[d.Scid] = d.DoorSwingSign;
+        }
         // SC-GEN-PERSIST — every streamed generator's activation + remaining
         // wave; un-streamed rows merge from the loaded save below.
         foreach (var g in _generators)
@@ -42305,6 +42424,9 @@ void main()
             MergeProps(world.UnlockedUsables, kept.UnlockedUsables, sc => _lockedUsables.Any(lu => lu.Prop.Scid == sc));
             MergeProps(world.LeversOn, kept.LeversOn, sc => _leverProps.Any(lv => lv.Scid == sc));
             MergeProps(world.OpenDoors, kept.OpenDoors, sc => _doorProps.Any(d => d.Scid == sc));
+            foreach (var (scid, sign) in kept.DoorSwingSigns)
+                if (!_doorProps.Any(d => d.Scid == scid) && world.OpenDoors.Contains(scid))
+                    world.DoorSwingSigns[scid] = sign;
             // SC-GEN-PERSIST — generator rows for regions never streamed
             // this session carry forward from the loaded save.
             foreach (var gk in kept.Generators)
@@ -42915,6 +43037,8 @@ void main()
         _rangedShots.Clear();
         _pendingAttackTarget = null;
         _pendingCastTarget = null;
+        _pendingDoorUse = null;
+        _pendingDoorActor = null;
         _lootPiles.Clear();
         // SC-WORLD-INVENTORY-PLACED — _inventoryGasLoaded gates LoadWorldInventory
         // from re-spawning piles in an already-streamed region. Save serializer

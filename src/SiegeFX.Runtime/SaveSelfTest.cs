@@ -112,6 +112,15 @@ internal static class SaveSelfTest
                     },
                 },
             },
+            World = new WorldStateSnapshot
+            {
+                OpenDoors = new List<uint> { 0x03200BF8, 0x03200BF9 },
+                DoorSwingSigns = new Dictionary<uint, float>
+                {
+                    [0x03200BF8] = 1f,
+                    [0x03200BF9] = -1f,
+                },
+            },
         };
 
         // Write twice to exercise the temp+replace branch (path already exists
@@ -131,6 +140,14 @@ internal static class SaveSelfTest
         Check(failures, "SavedAt",       original.SavedAt,       loaded.SavedAt);
         Check(failures, "RegionPath",    original.RegionPath,    loaded.RegionPath);
         Check(failures, "PlayerRegion",  original.PlayerRegion,  loaded.PlayerRegion);
+        if (loaded.World is null) failures.Add("World block was null after round-trip");
+        else
+        {
+            Check(failures, "World.OpenDoors.Count", 2, loaded.World.OpenDoors.Count);
+            foreach (var (scid, sign) in original.World!.DoorSwingSigns)
+                if (!loaded.World.DoorSwingSigns.TryGetValue(scid, out var got) || got != sign)
+                    failures.Add($"World.DoorSwingSigns[0x{scid:X8}] did not survive the save");
+        }
         if (loaded.Player is null) failures.Add("Player block was null after round-trip");
         else
         {

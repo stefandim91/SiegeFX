@@ -2455,6 +2455,8 @@ dotnet "%RUN%" --selftest-elevator-interaction
 if errorlevel 1 (echo *** ELEVATOR-INTERACTION SELFTEST FAILED ***) else (echo elevator-interaction: PASS)
 dotnet "%RUN%" --selftest-lever-pose "%DS1%"
 if errorlevel 1 (echo *** LEVER-POSE SELFTEST FAILED ***) else (echo lever-pose: PASS)
+dotnet "%RUN%" --selftest-door-interaction "%DS1%"
+if errorlevel 1 (echo *** DOOR-INTERACTION SELFTEST FAILED ***) else (echo door-interaction: PASS)
 echo [Same basement house as the stair/cutaway tests - besides the stairs it
 echo  has a METAL GRATE floor section that is a working lift now. Spawn =
 echo  top of its shaft (world ~76,-4,-72; hc_r1 streams as fh_r1 neighbor).

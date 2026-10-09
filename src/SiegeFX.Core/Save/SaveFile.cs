@@ -261,6 +261,9 @@ public sealed class WorldStateSnapshot
     /// load kept the current session's door positions instead of the
     /// save's. Absent on older saves = every door restores closed.</summary>
     public List<uint> OpenDoors { get; set; } = new();
+    /// <summary>Opening direction of each open leaf. Missing on older saves;
+    /// those leaves choose a direction from the restored actor position.</summary>
+    public Dictionary<uint, float> DoorSwingSigns { get; set; } = new();
     /// <summary>SC-GEN-PERSIST — per-generator activation + remaining-wave
     /// state. Absent on older saves = generators re-arm from region data
     /// (the old behavior: cleared ambushes respawned on every load).</summary>

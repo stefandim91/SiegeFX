@@ -290,6 +290,10 @@ else if (args.Length >= 1 && args[0] == "--selftest-elevator-interaction")
 {
     return SiegeFX.Runtime.ElevatorInteractionSelfTest.Run() ? 0 : 1;
 }
+else if (args.Length >= 1 && args[0] == "--selftest-door-interaction")
+{
+    return SiegeFX.Runtime.DoorInteractionSelfTest.Run(args.Length > 1 ? args[1] : null) ? 0 : 1;
+}
 else if (args.Length >= 1 && args[0] == "--selftest-lever-pose")
 {
     return SiegeFX.Runtime.LeverPoseSelfTest.Run(args.Length > 1 ? args[1] : null) ? 0 : 1;
