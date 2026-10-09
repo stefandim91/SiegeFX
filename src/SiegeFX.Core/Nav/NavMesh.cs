@@ -607,7 +607,7 @@ public sealed class NavMesh
         // Runs BEFORE land↔water stitching so this pass's newly-paired
         // edges aren't counted as boundary candidates by the water pass.
         var extraLinksBuild = new Dictionary<int, List<int>>();
-        int doorSeams = StitchSnoDoorSeams(graph, layout, resolveSno, sourceSnodeGuid.ToArray(), indices, neighbors, vertsArr, extraLinksBuild, out int doorSeamOverflow);
+        int doorSeams = StitchSnoDoorSeams(graph, layout, resolveSno, sourceSnodeGuid.ToArray(), indices, neighbors, vertsArr, kindsArr, extraLinksBuild, out int doorSeamOverflow);
         // Land↔water seam stitching: shoreline Floor and Water SNOs are authored in
         // separate meshes whose vertices don't fall inside the WeldToleranceUnits bucket,
         // so the manifold pass leaves them on disconnected components. Wire cross-kind
@@ -720,6 +720,9 @@ public sealed class NavMesh
     /// each other. Returns the number of edges wired.</summary>
     private const float DoorSeamAnchorRadius = 4.0f;
     private const float DoorSeamEdgePairDistance = 1.5f;
+    // How far from a door anchor a wide overflow link looks for an existing
+    // floor route before it counts as redundant.
+    private const float DoorSeamLocalRouteRadius = 24f;
     // A legitimate door seam joins two FLOOR edges at nearly the same height —
     // the walker steps across, it never falls. Without a vertical gate, a stair
     // tread's side edge pairs with the floor edge running under the staircase
@@ -741,6 +744,7 @@ public sealed class NavMesh
         int[] indices,
         int[] neighbors,
         Vector3[] verts,
+        SnoModel.FloorKind[] kinds,
         Dictionary<int, List<int>> extraLinks,
         out int overflowLinks)
     {
@@ -789,6 +793,58 @@ public sealed class NavMesh
         }
         Vector3 TriCentroid(int t) =>
             (verts[indices[3 * t + 0]] + verts[indices[3 * t + 1]] + verts[indices[3 * t + 2]]) / 3f;
+        // Plan-view (XZ) distance between two triangles: 0 when they touch or
+        // overlap, small across a weld seam, large across a wall or ledge. The
+        // caller gates height separately. Two disjoint triangles are closest at
+        // a vertex of one against an edge of the other, so vertex-to-edge
+        // distances suffice once overlap and edge crossings are ruled out.
+        float TriangleGap(int a, int b)
+        {
+            Span<Vector2> pa = stackalloc Vector2[3];
+            Span<Vector2> pb = stackalloc Vector2[3];
+            for (int i = 0; i < 3; i++)
+            {
+                var va = verts[indices[3 * a + i]];
+                var vb = verts[indices[3 * b + i]];
+                pa[i] = new Vector2(va.X, va.Z);
+                pb[i] = new Vector2(vb.X, vb.Z);
+            }
+            float best = float.MaxValue;
+            for (int i = 0; i < 3; i++)
+            {
+                var a0 = pa[i]; var a1 = pa[(i + 1) % 3];
+                for (int j = 0; j < 3; j++)
+                {
+                    var b0 = pb[j]; var b1 = pb[(j + 1) % 3];
+                    if (SegmentsCross(a0, a1, b0, b1)) return 0f;
+                    best = MathF.Min(best, PointSegmentDistance(a0, b0, b1));
+                    best = MathF.Min(best, PointSegmentDistance(b0, a0, a1));
+                }
+            }
+            // No edges cross: either disjoint, or one triangle lies inside the other.
+            if (PointInTriangleXZ(new Vector3(pa[0].X, 0f, pa[0].Y),
+                    new Vector3(pb[0].X, 0f, pb[0].Y), new Vector3(pb[1].X, 0f, pb[1].Y), new Vector3(pb[2].X, 0f, pb[2].Y))
+                || PointInTriangleXZ(new Vector3(pb[0].X, 0f, pb[0].Y),
+                    new Vector3(pa[0].X, 0f, pa[0].Y), new Vector3(pa[1].X, 0f, pa[1].Y), new Vector3(pa[2].X, 0f, pa[2].Y)))
+                return 0f;
+            return best;
+        }
+        static float PointSegmentDistance(Vector2 p, Vector2 s0, Vector2 s1)
+        {
+            var d = s1 - s0;
+            float len2 = d.LengthSquared();
+            float t = len2 < 1e-9f ? 0f : Math.Clamp(Vector2.Dot(p - s0, d) / len2, 0f, 1f);
+            return Vector2.Distance(p, s0 + d * t);
+        }
+        static bool SegmentsCross(Vector2 p0, Vector2 p1, Vector2 q0, Vector2 q1)
+        {
+            static float Orient(Vector2 a, Vector2 b, Vector2 c) =>
+                (b.X - a.X) * (c.Y - a.Y) - (b.Y - a.Y) * (c.X - a.X);
+            float d1 = Orient(q0, q1, p0), d2 = Orient(q0, q1, p1);
+            float d3 = Orient(p0, p1, q0), d4 = Orient(p0, p1, q1);
+            return ((d1 > 0f && d2 < 0f) || (d1 < 0f && d2 > 0f))
+                && ((d3 > 0f && d4 < 0f) || (d3 < 0f && d4 > 0f));
+        }
         // Split a small tri set into its slot-connected local components.
         // Stepped pieces fragment internally: riser faces are degenerate in XZ
         // and dropped from the mesh, so each tread strip is its own island —
@@ -835,6 +891,33 @@ public sealed class NavMesh
                     foreach (var nb in ex)
                         if (bset.Contains(nb)) return true;
                 }
+            }
+            return false;
+        }
+        // Is there already a route between two tris near a door anchor over
+        // ground of the same kind (slot or overflow adjacency, staying within
+        // a local radius)?
+        bool LocallyConnected(int from, int to, Vector3 anchor)
+        {
+            var kind = kinds[from];
+            const float radius2 = DoorSeamLocalRouteRadius * DoorSeamLocalRouteRadius;
+            var visited = new HashSet<int> { from };
+            var queue = new Queue<int>();
+            queue.Enqueue(from);
+            while (queue.Count > 0)
+            {
+                int t = queue.Dequeue();
+                if (t == to) return true;
+                void Visit(int nb)
+                {
+                    if (nb < 0 || kinds[nb] != kind || visited.Contains(nb)) return;
+                    if (Vector3.DistanceSquared(TriCentroid(nb), anchor) > radius2) return;
+                    visited.Add(nb);
+                    queue.Enqueue(nb);
+                }
+                for (int s = 0; s < 3; s++) Visit(neighbors[3 * t + s]);
+                if (extraLinks.TryGetValue(t, out var ex))
+                    foreach (var nb in ex) Visit(nb);
             }
             return false;
         }
@@ -929,6 +1012,14 @@ public sealed class NavMesh
                 foreach (var compB in LocalComponents(bNear))
                 {
                     if (AnyLink(compA, compB)) continue;
+                    // Pair by the real plan-view gap between the two triangles,
+                    // not by centroid distance, and drop a wide link whose
+                    // pieces already join over floor nearby. This fallback also
+                    // runs at fully welded seams, where it only adds shortcuts:
+                    // Elddim's upper green got a ~5u link down to the slope
+                    // below, A* routed over it, and the walker, which can't
+                    // cross a gap, stuck at the ledge. Connectivity is
+                    // unchanged; only redundant links are dropped.
                     int bestA = -1, bestB = -1;
                     float bestScore = float.MaxValue;
                     foreach (var tA in compA)
@@ -939,12 +1030,13 @@ public sealed class NavMesh
                             var cb = TriCentroid(tB);
                             float dy = MathF.Abs(ca.Y - cb.Y);
                             if (dy > 1.0f) continue;
-                            float ddx = ca.X - cb.X, ddz = ca.Z - cb.Z;
-                            float score = MathF.Sqrt(ddx * ddx + ddz * ddz) + dy;
+                            float score = TriangleGap(tA, tB) + dy;
                             if (score < bestScore) { bestScore = score; bestA = tA; bestB = tB; }
                         }
                     }
                     if (bestA < 0) continue;
+                    if (bestScore > DoorSeamEdgePairDistance
+                        && LocallyConnected(bestA, bestB, doorAnchor)) continue;
                     if (!extraLinks.TryGetValue(bestA, out var la)) extraLinks[bestA] = la = new List<int>();
                     if (!la.Contains(bestB)) la.Add(bestB);
                     if (!extraLinks.TryGetValue(bestB, out var lb)) extraLinks[bestB] = lb = new List<int>();
