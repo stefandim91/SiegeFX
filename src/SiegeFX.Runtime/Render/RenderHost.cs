@@ -1953,6 +1953,8 @@ public sealed partial class RenderHost : IDisposable
         // player attack target. DS1 never lets you attack good/neutral
         // NPCs (Norick, guards, kings) — no attack cursor, no swing.
         public bool IsEvilAligned;
+        // actor_ambient chain (rats, birds): no talk or no-talk cursor.
+        public bool IsAmbient;
         // SC-ALIGN-SWITCH — [alignment_switcher] (Gom): the actor spawns
         // friendly/talkable and flips hostile when the authored trigger
         // fires (speech ending / taking damage).
@@ -29371,8 +29373,13 @@ void main()
     {
         if (_templateStore is null) return;
         for (var t = s.Actor.Template; t is not null; t = t.Specializes)
+        {
             if (t.Name.Equals("actor_evil", StringComparison.OrdinalIgnoreCase))
             { s.IsEvilAligned = true; break; }
+            // Ambient life (rats, birds) is scenery: never a talk partner.
+            if (t.Name.Equals("actor_ambient", StringComparison.OrdinalIgnoreCase))
+            { s.IsAmbient = true; break; }
+        }
         var sel = _templateStore.GetAttribute(s.Actor.Template, "common", "is_selectable");
         if (!string.IsNullOrEmpty(sel)
             && sel.Trim().Trim('"').Equals("false", StringComparison.OrdinalIgnoreCase))
@@ -34023,6 +34030,7 @@ void main()
             // shouldn't change the cursor.
             CursorState? TalkCursorFor(ActorRenderState s)
             {
+                if (s.IsAmbient) return null;
                 var keys = SiegeFX.Core.Assets.ConversationStore.KeysFromInstance(s.Actor.Instance.Node);
                 bool talkable = false;
                 foreach (var k in keys)
