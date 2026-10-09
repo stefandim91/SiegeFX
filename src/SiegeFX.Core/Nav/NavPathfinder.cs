@@ -31,6 +31,13 @@ public static class NavPathfinder
         internal (float f, int tri)[] OpenHeap = Array.Empty<(float, int)>();
         internal int OpenCount;
 
+        // Generation stamps: a triangle's CameFrom/GScore/FScore/Closed are
+        // valid only while Stamp[t] == Gen; anything else reads as unvisited.
+        // Starting a search is then O(1) instead of clearing every array (a
+        // per-search 187k-entry sweep on a 7-region mesh, even for a 2-step path).
+        internal int[] Stamp = Array.Empty<int>();
+        internal int Gen;
+
         internal void Prepare(int triCount)
         {
             if (CameFrom.Length < triCount)
@@ -39,24 +46,24 @@ public static class NavPathfinder
                 GScore = new float[triCount];
                 FScore = new float[triCount];
                 Closed = new bool[triCount];
+                Stamp = new int[triCount];
+                Gen = 0;
             }
-            else
-            {
-                Array.Clear(Closed, 0, triCount);
-            }
-            for (int i = 0; i < triCount; i++)
-            {
-                CameFrom[i] = -1;
-                GScore[i] = float.PositiveInfinity;
-                FScore[i] = float.PositiveInfinity;
-            }
-            // Heap capacity grows with the mesh; we never shrink — workspaces are
-            // long-lived and the upper bound on simultaneously-open nodes is bounded
-            // by triCount (one entry per node, plus stale duplicates). 4× headroom is
-            // empirically enough for the worst probe across all 81 World regions.
-            int needed = triCount * 4;
-            if (OpenHeap.Length < needed) OpenHeap = new (float, int)[needed];
+            if (++Gen == int.MaxValue) { Array.Clear(Stamp); Gen = 1; }
+            // The heap starts small and grows on demand (HeapPush doubles it).
+            if (OpenHeap.Length < 1024) OpenHeap = new (float, int)[1024];
             OpenCount = 0;
+        }
+
+        /// <summary>First touch of a triangle in this search: reset its entries.</summary>
+        internal void Touch(int tri)
+        {
+            if (Stamp[tri] == Gen) return;
+            Stamp[tri] = Gen;
+            CameFrom[tri] = -1;
+            GScore[tri] = float.PositiveInfinity;
+            FScore[tri] = float.PositiveInfinity;
+            Closed[tri] = false;
         }
 
         internal void HeapPush(float f, int tri)
@@ -190,6 +197,7 @@ public static class NavPathfinder
         var fScore = ws.FScore;
         var closed = ws.Closed;
 
+        ws.Touch(startTri);
         gScore[startTri] = 0f;
         fScore[startTri] = Vector3.Distance(mesh.Centroids[startTri], mesh.Centroids[goalTri]);
         ws.HeapPush(fScore[startTri], startTri);
@@ -199,7 +207,9 @@ public static class NavPathfinder
         // triangle. (Fade-hidden tris DO expand — see SC-FADE-WALKABLE above.)
         void Consider(int from, int nb)
         {
-            if (nb < 0 || closed[nb]) return;
+            if (nb < 0) return;
+            ws.Touch(nb);
+            if (closed[nb]) return;
             if (mesh.IsUnavailable(nb)) return;
             if (mesh.IsBlocked(nb)) return;
             float mul = traversal.GetMultiplier(mesh.Kinds[nb]);

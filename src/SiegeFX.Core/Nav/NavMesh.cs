@@ -256,7 +256,7 @@ public sealed class NavMesh
         float loY = baseY - ObstacleBelowFloorTol;
         float hiY = topY + ObstacleAboveTopTol;
         int marked = 0;
-        for (int t = 0; t < TriangleCount; t++)
+        foreach (int t in TrianglesNearXZ(worldX - radius, worldZ - radius, worldX + radius, worldZ + radius))
         {
             if (Blocked[t]) continue;
             // Y-gate first — cheapest reject, and the whole point of this
@@ -326,6 +326,40 @@ public sealed class NavMesh
     /// Any walk across the segment has to pass through one of those triangles, so
     /// the line seals; unlike a bounding disc it leaves the floor on either side
     /// open (a closed door leaf no longer blocks the step in front of it).</summary>
+    // Triangles whose lookup-grid cells overlap an XZ rectangle, each once.
+    // Every triangle that can touch a shape inside the rectangle is among
+    // them, so obstacle marking tests these instead of the whole mesh (a full
+    // scan per prop cost ~250 ms per re-mark on a 7-region mesh). The list
+    // and stamps are reused; callers consume the result before the next call.
+    private readonly List<int> _nearTris = new();
+    private int[]? _nearStamp;
+    private int _nearStampId;
+
+    private List<int> TrianglesNearXZ(float minX, float minZ, float maxX, float maxZ)
+    {
+        _nearTris.Clear();
+        if (TriangleCount == 0) return _nearTris;
+        _nearStamp ??= new int[TriangleCount];
+        if (++_nearStampId == int.MaxValue) { Array.Clear(_nearStamp); _nearStampId = 1; }
+        int cx0 = Math.Clamp((int)MathF.Floor((minX - _gridMinX) / GridCellSize), 0, _gridCellsX - 1);
+        int cx1 = Math.Clamp((int)MathF.Floor((maxX - _gridMinX) / GridCellSize), 0, _gridCellsX - 1);
+        int cz0 = Math.Clamp((int)MathF.Floor((minZ - _gridMinZ) / GridCellSize), 0, _gridCellsZ - 1);
+        int cz1 = Math.Clamp((int)MathF.Floor((maxZ - _gridMinZ) / GridCellSize), 0, _gridCellsZ - 1);
+        for (int cz = cz0; cz <= cz1; cz++)
+        for (int cx = cx0; cx <= cx1; cx++)
+        {
+            var bucket = _grid[cz * _gridCellsX + cx];
+            if (bucket is null) continue;
+            foreach (int t in bucket)
+            {
+                if (_nearStamp[t] == _nearStampId) continue;
+                _nearStamp[t] = _nearStampId;
+                _nearTris.Add(t);
+            }
+        }
+        return _nearTris;
+    }
+
     public int MarkObstacleSegment(Vector3 a, Vector3 b, float halfWidth, float baseY, float topY, string? tag)
     {
         Blocked ??= new bool[TriangleCount];
@@ -334,7 +368,8 @@ public sealed class NavMesh
         float hiY = topY + ObstacleAboveTopTol;
         float hw2 = halfWidth * halfWidth;
         int marked = 0;
-        for (int t = 0; t < TriangleCount; t++)
+        foreach (int t in TrianglesNearXZ(MathF.Min(a.X, b.X) - halfWidth, MathF.Min(a.Z, b.Z) - halfWidth,
+                                          MathF.Max(a.X, b.X) + halfWidth, MathF.Max(a.Z, b.Z) + halfWidth))
         {
             if (Blocked[t]) continue;
             float cy = Centroids[t].Y;
@@ -871,8 +906,12 @@ public sealed class NavMesh
             }
             list.Add(t);
         }
-        Vector3 TriCentroid(int t) =>
-            (verts[indices[3 * t + 0]] + verts[indices[3 * t + 1]] + verts[indices[3 * t + 2]]) / 3f;
+        // Centroids computed once: the overflow fallback reads them millions of
+        // times across ~10k door links per region.
+        var triCentroids = new Vector3[triCount];
+        for (int t = 0; t < triCount; t++)
+            triCentroids[t] = (verts[indices[3 * t + 0]] + verts[indices[3 * t + 1]] + verts[indices[3 * t + 2]]) / 3f;
+        Vector3 TriCentroid(int t) => triCentroids[t];
         // Plan-view (XZ) distance between two triangles: 0 when they touch or
         // overlap, small across a weld seam, large across a wall or ledge. The
         // caller gates height separately. Two disjoint triangles are closest at
@@ -902,10 +941,13 @@ public sealed class NavMesh
                 }
             }
             // No edges cross: either disjoint, or one triangle lies inside the other.
-            if (PointInTriangleXZ(new Vector3(pa[0].X, 0f, pa[0].Y),
-                    new Vector3(pb[0].X, 0f, pb[0].Y), new Vector3(pb[1].X, 0f, pb[1].Y), new Vector3(pb[2].X, 0f, pb[2].Y))
-                || PointInTriangleXZ(new Vector3(pb[0].X, 0f, pb[0].Y),
-                    new Vector3(pa[0].X, 0f, pa[0].Y), new Vector3(pa[1].X, 0f, pa[1].Y), new Vector3(pa[2].X, 0f, pa[2].Y)))
+            // Only a triangle with area in plan view can contain anything: a
+            // stair riser (two corners stacked at one XZ) passes the sign test
+            // for every point, which scored risers 5u away as touching.
+            if ((HasPlanArea(pb) && PointInTriangleXZ(new Vector3(pa[0].X, 0f, pa[0].Y),
+                    new Vector3(pb[0].X, 0f, pb[0].Y), new Vector3(pb[1].X, 0f, pb[1].Y), new Vector3(pb[2].X, 0f, pb[2].Y)))
+                || (HasPlanArea(pa) && PointInTriangleXZ(new Vector3(pb[0].X, 0f, pb[0].Y),
+                    new Vector3(pa[0].X, 0f, pa[0].Y), new Vector3(pa[1].X, 0f, pa[1].Y), new Vector3(pa[2].X, 0f, pa[2].Y))))
                 return 0f;
             return best;
         }
@@ -916,6 +958,8 @@ public sealed class NavMesh
             float t = len2 < 1e-9f ? 0f : Math.Clamp(Vector2.Dot(p - s0, d) / len2, 0f, 1f);
             return Vector2.Distance(p, s0 + d * t);
         }
+        static bool HasPlanArea(ReadOnlySpan<Vector2> p)
+            => MathF.Abs((p[1].X - p[0].X) * (p[2].Y - p[0].Y) - (p[1].Y - p[0].Y) * (p[2].X - p[0].X)) > 1e-4f;
         static bool SegmentsCross(Vector2 p0, Vector2 p1, Vector2 q0, Vector2 q1)
         {
             static float Orient(Vector2 a, Vector2 b, Vector2 c) =>
@@ -931,27 +975,35 @@ public sealed class NavMesh
         // a fallback link must land on EVERY island, not just the nearest tri
         // (linking only the nearest wired a 4-tri step island and left the
         // piece's main floor disconnected).
+        // Membership and visited marks are per-call stamps in shared arrays
+        // (fresh sets per call dominated the stitch pass on large meshes).
+        var compInStamp = new int[triCount];
+        var compSeenStamp = new int[triCount];
+        int compStampId = 0;
+        var compStack = new Stack<int>();
         List<List<int>> LocalComponents(List<int> tris)
         {
             var comps = new List<List<int>>();
-            var inSet = new HashSet<int>(tris);
-            var visited = new HashSet<int>();
+            int id = ++compStampId;
+            foreach (var t in tris) compInStamp[t] = id;
             foreach (var seed in tris)
             {
-                if (!visited.Add(seed)) continue;
+                if (compSeenStamp[seed] == id) continue;
+                compSeenStamp[seed] = id;
                 var comp = new List<int> { seed };
-                var stack = new Stack<int>();
-                stack.Push(seed);
-                while (stack.Count > 0)
+                compStack.Clear();
+                compStack.Push(seed);
+                while (compStack.Count > 0)
                 {
-                    int t = stack.Pop();
+                    int t = compStack.Pop();
                     for (int s = 0; s < 3; s++)
                     {
                         int nb = neighbors[3 * t + s];
-                        if (nb < 0 || !inSet.Contains(nb)) continue;
-                        if (!visited.Add(nb)) continue;
+                        if (nb < 0 || compInStamp[nb] != id) continue;
+                        if (compSeenStamp[nb] == id) continue;
+                        compSeenStamp[nb] = id;
                         comp.Add(nb);
-                        stack.Push(nb);
+                        compStack.Push(nb);
                     }
                 }
                 comps.Add(comp);
@@ -959,9 +1011,8 @@ public sealed class NavMesh
             return comps;
         }
         // Any existing adjacency (slot or overflow) between two tri sets?
-        bool AnyLink(List<int> ca, List<int> cb)
+        bool AnyLink(List<int> ca, HashSet<int> bset)
         {
-            var bset = new HashSet<int>(cb);
             foreach (var t in ca)
             {
                 for (int s = 0; s < 3; s++)
@@ -977,29 +1028,54 @@ public sealed class NavMesh
         // Is there already a route between two tris near a door anchor over
         // ground of the same kind (slot or overflow adjacency, staying within
         // a local radius)?
+        // Visited stamps and the queue are shared across calls (a fresh set per
+        // call made this search a third of the whole stitch pass).
+        var routeStamp = new int[triCount];
+        int routeStampId = 0;
+        var routeQueue = new int[triCount];
         bool LocallyConnected(int from, int to, Vector3 anchor)
         {
             var kind = kinds[from];
             const float radius2 = DoorSeamLocalRouteRadius * DoorSeamLocalRouteRadius;
-            var visited = new HashSet<int> { from };
-            var queue = new Queue<int>();
-            queue.Enqueue(from);
-            while (queue.Count > 0)
+            int id = ++routeStampId;
+            int head = 0, tail = 0;
+            routeStamp[from] = id;
+            routeQueue[tail++] = from;
+            while (head < tail)
             {
-                int t = queue.Dequeue();
+                int t = routeQueue[head++];
                 if (t == to) return true;
-                void Visit(int nb)
-                {
-                    if (nb < 0 || kinds[nb] != kind || visited.Contains(nb)) return;
-                    if (Vector3.DistanceSquared(TriCentroid(nb), anchor) > radius2) return;
-                    visited.Add(nb);
-                    queue.Enqueue(nb);
-                }
                 for (int s = 0; s < 3; s++) Visit(neighbors[3 * t + s]);
                 if (extraLinks.TryGetValue(t, out var ex))
                     foreach (var nb in ex) Visit(nb);
             }
             return false;
+
+            void Visit(int nb)
+            {
+                if (nb < 0 || kinds[nb] != kind || routeStamp[nb] == id) return;
+                if (Vector3.DistanceSquared(TriCentroid(nb), anchor) > radius2) return;
+                routeStamp[nb] = id;
+                routeQueue[tail++] = nb;
+            }
+        }
+        // Largest plan-view distance from a triangle's centroid to its corners,
+        // for a cheap lower bound on TriangleGap (lazily filled, NaN = unset).
+        var triRadiusXZ = new float[triCount];
+        Array.Fill(triRadiusXZ, float.NaN);
+        float RadiusXZ(int t)
+        {
+            float r = triRadiusXZ[t];
+            if (!float.IsNaN(r)) return r;
+            var c = TriCentroid(t);
+            r = 0f;
+            for (int i = 0; i < 3; i++)
+            {
+                var v = verts[indices[3 * t + i]];
+                float dx = v.X - c.X, dz = v.Z - c.Z;
+                r = MathF.Max(r, MathF.Sqrt(dx * dx + dz * dz));
+            }
+            return triRadiusXZ[t] = r;
         }
         // Candidate pairs for one door link, scored by combined XZ+Y midpoint
         // distance and claimed best-first (the water stitcher's pattern) so a
@@ -1088,10 +1164,16 @@ public sealed class NavMesh
                 foreach (var t in farTris)
                     if (Vector3.DistanceSquared(TriCentroid(t), doorAnchor) <= 36f) bNear.Add(t);
                 if (aNear.Count == 0 || bNear.Count == 0) continue;
+                // Side B's pieces (and their lookup sets) once per door, not
+                // once per side-A piece: slot adjacency doesn't change here.
+                var compsB = LocalComponents(bNear);
+                var setsB = new List<HashSet<int>>(compsB.Count);
+                foreach (var cb in compsB) setsB.Add(new HashSet<int>(cb));
                 foreach (var compA in LocalComponents(aNear))
-                foreach (var compB in LocalComponents(bNear))
+                for (int bi = 0; bi < compsB.Count; bi++)
                 {
-                    if (AnyLink(compA, compB)) continue;
+                    var compB = compsB[bi];
+                    if (AnyLink(compA, setsB[bi])) continue;
                     // Pair by the real plan-view gap between the two triangles,
                     // not by centroid distance, and drop a wide link whose
                     // pieces already join over floor nearby. This fallback also
@@ -1110,6 +1192,13 @@ public sealed class NavMesh
                             var cb = TriCentroid(tB);
                             float dy = MathF.Abs(ca.Y - cb.Y);
                             if (dy > 1.0f) continue;
+                            // The gap is at least the centroid distance minus
+                            // both radii; skip the exact test when even that
+                            // can't beat the best pair (same pair chosen). The
+                            // 1 mm slack covers float rounding at shared corners.
+                            float cdx = ca.X - cb.X, cdz = ca.Z - cb.Z;
+                            float lowerGap = MathF.Sqrt(cdx * cdx + cdz * cdz) - RadiusXZ(tA) - RadiusXZ(tB) - 1e-3f;
+                            if (lowerGap + dy >= bestScore) continue;
                             float score = TriangleGap(tA, tB) + dy;
                             if (score < bestScore) { bestScore = score; bestA = tA; bestB = tB; }
                         }

@@ -5,6 +5,7 @@ using Silk.NET.OpenGL;
 using Silk.NET.Windowing;
 using SiegeFX.Core.Actors;
 using SiegeFX.Core.Assets;
+using SiegeFX.Core.Geometry;
 using SiegeFX.Core.Sfx;
 using SiegeFX.Core.Skrit;
 using SiegeFX.Core.Tank;
@@ -4540,11 +4541,33 @@ public sealed partial class RenderHost : IDisposable
 
     // Phase 21c — one placed prop (tree, barrel, fence, crop, candle, etc.).
     // Drawn via the static-mesh pipeline; no per-frame state besides the bake.
+    /// <summary>Radius around the prop's origin that holds its whole mesh, for
+    /// view culling. Taken about the origin (not the box centre) so it still
+    /// covers a door swinging on its hinge or a prop spinning in place.
+    /// Computed once; placement scale doesn't change after load.</summary>
+    private static float PropCullRadius(StaticPropInstance prop)
+    {
+        if (prop.CullRadius >= 0f) return prop.CullRadius;
+        var min = prop.Mesh.Min;
+        var max = prop.Mesh.Max;
+        var origin = prop.World.Translation;
+        float r2 = 0f;
+        for (int i = 0; i < 8; i++)
+        {
+            var corner = Vector3.Transform(new Vector3((i & 1) == 0 ? min.X : max.X,
+                                                       (i & 2) == 0 ? min.Y : max.Y,
+                                                       (i & 4) == 0 ? min.Z : max.Z), prop.World);
+            r2 = MathF.Max(r2, Vector3.DistanceSquared(corner, origin));
+        }
+        return prop.CullRadius = MathF.Sqrt(r2);
+    }
+
     private sealed class StaticPropInstance
     {
         public StaticMesh Mesh = null!;
         public GlTexture? Texture;
         public Matrix4x4 World;
+        public float CullRadius = -1f;
         public Matrix4x4 NodeLocalWorld;
         public string Template = "";
         // SC-PROP-INVISIBLE — DS1 authors logic objects (life/mana shrines,
@@ -5653,6 +5676,7 @@ public sealed partial class RenderHost : IDisposable
                         psi.ArgumentList.Add(asmPath);
                     else ok = false;
                 }
+                if (_diagMode) psi.ArgumentList.Add("--diag");
                 if (ok) System.Diagnostics.Process.Start(psi);
             }
         }
@@ -12669,6 +12693,9 @@ void main()
     /// is on, so non-diag runs pay nothing.</summary>
     private void DiagRecordFrame(double dt)
     {
+        _perfFrames++;
+        _perfStepFrames[Math.Min(_perfSimSteps, _perfStepFrames.Length - 1)]++;
+        _perfSimSteps = 0;
         _diagFrameMs[_diagFrameRingHead] = dt * 1000.0;
         _diagFrameRingHead = (_diagFrameRingHead + 1) % FrameRingSize;
         if (_diagFrameRingFill < FrameRingSize) _diagFrameRingFill++;
@@ -12693,6 +12720,128 @@ void main()
 
         Console.WriteLine($"diag: frame avg={avg:F2}ms p50={p50:F2} p99={p99:F2} max={max:F2}  ({fps:F0} fps, " +
                           $"actors={_actors.Count}, regions={_loadedRegions.Count})");
+        DiagReportStages();
+    }
+
+    // Per-stage frame timing for --diag. PerfMark(stage) charges the time since
+    // the previous mark to that stage; the marks sit at the boundaries of the
+    // big blocks in OnUpdate and OnRender, so one line per stage shows where a
+    // frame goes. "present and wait" is everything between the end of one
+    // OnRender and the start of the next OnUpdate: buffer swap, GPU wait,
+    // the frame limiter and any GC pause.
+    private readonly System.Diagnostics.Stopwatch _perfClock = System.Diagnostics.Stopwatch.StartNew();
+    private long _perfLastTicks;
+    private readonly Dictionary<string, (double Sum, double Max)> _perfStages = new();
+    private readonly List<string> _perfStageOrder = new();
+    private int _perfFrames;
+    private int _perfSimSteps;
+    private readonly int[] _perfStepFrames = new int[4];
+    private int _perfGc0, _perfGc1, _perfGc2;
+    private long _perfAllocated;
+
+    // SIEGEFX_DIAG_SYNC=1 (with --diag) waits for the GPU at every render mark,
+    // so each stage's time includes the GPU work it queued instead of that cost
+    // landing wherever the driver next blocks. Slows the frame; diagnosis only.
+    private readonly bool _perfGpuSync = Environment.GetEnvironmentVariable("SIEGEFX_DIAG_SYNC") == "1";
+
+    private void PerfMark(string stage)
+    {
+        if (!_diagMode) return;
+        if (_perfGpuSync && stage.StartsWith("render:", StringComparison.Ordinal)) _gl?.Finish();
+        long now = _perfClock.ElapsedTicks;
+        double ms = (now - _perfLastTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        _perfLastTicks = now;
+        if (!_perfStages.TryGetValue(stage, out var acc)) _perfStageOrder.Add(stage);
+        _perfStages[stage] = (acc.Sum + ms, Math.Max(acc.Max, ms));
+    }
+
+    // Region-change step timing for --diag: one line per step of
+    // OnPlayerRegionChanged, plus GC activity across the whole change.
+    private readonly System.Diagnostics.Stopwatch _regionStepClock = new();
+    private long _regionStepLast;
+    private int _regionGc0, _regionGc1, _regionGc2;
+    private long _regionAllocated;
+
+    private void RegionStepBegin()
+    {
+        if (!_diagMode) return;
+        _regionStepClock.Restart();
+        _regionStepLast = 0;
+        _regionGc0 = GC.CollectionCount(0);
+        _regionGc1 = GC.CollectionCount(1);
+        _regionGc2 = GC.CollectionCount(2);
+        _regionAllocated = GC.GetTotalAllocatedBytes();
+        _regionStepBytes = 0;
+        _subTimes.Clear();
+    }
+
+    private long _regionStepBytes;
+
+    private void RegionStep(string step)
+    {
+        if (!_diagMode || !_regionStepClock.IsRunning) return;
+        long now = _regionStepClock.ElapsedTicks;
+        double ms = (now - _regionStepLast) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        _regionStepLast = now;
+        long bytes = GC.GetTotalAllocatedBytes();
+        double mb = (bytes - (_regionStepBytes == 0 ? _regionAllocated : _regionStepBytes)) / (1024.0 * 1024.0);
+        _regionStepBytes = bytes;
+        Console.WriteLine($"  [region-time] {step,-38} {ms,8:F1} ms {mb,8:F0} MB");
+        foreach (var (label, (ticks, alloc, calls)) in _subTimes)
+            Console.WriteLine($"  [region-time]     {label,-34} {ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency,8:F1} ms " +
+                              $"{alloc / (1024.0 * 1024.0),8:F0} MB  ({calls} calls)");
+        _subTimes.Clear();
+    }
+
+    // Sub-step timing inside a region step: wrap a call with
+    // var t = SubBegin(); ...; SubEnd("label", t); it's charged to the
+    // next RegionStep line. No-op unless --diag.
+    private readonly Dictionary<string, (long Ticks, long Bytes, int Calls)> _subTimes = new();
+
+    private (long Ticks, long Bytes) SubBegin()
+        => _diagMode ? (System.Diagnostics.Stopwatch.GetTimestamp(), GC.GetTotalAllocatedBytes()) : default;
+
+    private void SubEnd(string label, (long Ticks, long Bytes) start)
+    {
+        if (!_diagMode) return;
+        _subTimes.TryGetValue(label, out var acc);
+        _subTimes[label] = (acc.Ticks + System.Diagnostics.Stopwatch.GetTimestamp() - start.Ticks,
+                            acc.Bytes + GC.GetTotalAllocatedBytes() - start.Bytes, acc.Calls + 1);
+    }
+
+    private void RegionStepEnd()
+    {
+        if (!_diagMode || !_regionStepClock.IsRunning) return;
+        _regionStepClock.Stop();
+        Console.WriteLine($"  [region-time] total {_regionStepClock.Elapsed.TotalMilliseconds:F1} ms; " +
+                          $"gc gen0={GC.CollectionCount(0) - _regionGc0} gen1={GC.CollectionCount(1) - _regionGc1} " +
+                          $"gen2={GC.CollectionCount(2) - _regionGc2}, allocated " +
+                          $"{(GC.GetTotalAllocatedBytes() - _regionAllocated) / (1024.0 * 1024.0):F0} MB");
+    }
+
+    private void DiagReportStages()
+    {
+        if (_perfFrames == 0) return;
+        int gc0 = GC.CollectionCount(0), gc1 = GC.CollectionCount(1), gc2 = GC.CollectionCount(2);
+        long allocated = GC.GetTotalAllocatedBytes();
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"diag: stages over {_perfFrames} frames (avg ms / max ms):");
+        foreach (var stage in _perfStageOrder)
+        {
+            var (sum, max) = _perfStages[stage];
+            sb.Append($"\n  {stage,-36} {sum / _perfFrames,6:F2} / {max,6:F2}");
+        }
+        sb.Append($"\n  sim steps per frame: 0={_perfStepFrames[0]} 1={_perfStepFrames[1]} " +
+                  $"2={_perfStepFrames[2]} 3+={_perfStepFrames[3]}");
+        sb.Append($"\n  gc: gen0={gc0 - _perfGc0} gen1={gc1 - _perfGc1} gen2={gc2 - _perfGc2}, " +
+                  $"allocated {(allocated - _perfAllocated) / (1024.0 * 1024.0):F1} MB");
+        Console.WriteLine(sb.ToString());
+        _perfGc0 = gc0; _perfGc1 = gc1; _perfGc2 = gc2;
+        _perfAllocated = allocated;
+        _perfStages.Clear();
+        _perfStageOrder.Clear();
+        _perfFrames = 0;
+        Array.Clear(_perfStepFrames);
     }
 
     /// <summary>Phase 9a entry: load a rigged ASP + a skrit + N PRS clips, then let the
@@ -14470,7 +14619,9 @@ void main()
                 var meshIdx = navMapTank is not null
                     ? SnoMeshIndex.Build(new TankReader(navMapTank), terrainReader)
                     : SnoMeshIndex.Build(terrainReader);
-                var navCache = new Dictionary<uint, SnoModel?>();
+                // Fill the cache RebuildNavMesh shares, so the first region
+                // change after load doesn't parse every loaded SNO again.
+                var navCache = _navSnoCache;
                 SnoModel? ResolveNav(uint meshGuid)
                 {
                     if (navCache.TryGetValue(meshGuid, out var hit)) return hit;
@@ -14885,7 +15036,9 @@ void main()
         else
             Console.WriteLine($"[region] expanding ring around '{newRegion}' (anchor stays '{prev}')");
 
+        RegionStepBegin();
         var newlyLoaded = PreloadAroundRegion(newRegion);
+        RegionStep("preload terrain");
         if (newlyLoaded.Count == 0)
         {
             // Player walked into an already-loaded region — no streaming work to
@@ -14945,7 +15098,9 @@ void main()
         // newlyLoaded: an elevator parsed earlier but deferred because its
         // connect node hadn't streamed yet retries now (placed ones skip via
         // _elevatorsByScid).
+        RegionStep("actor + conversation load");
         LoadElevators(_worldRegionGraphs.Select(t => t.Path));
+        RegionStep("elevators");
 
         // Rebuild the nav mesh against the full unified scope so newly-loaded
         // floor tris weld to the original ring. Every live follower is
@@ -14953,7 +15108,9 @@ void main()
         // against outdated obstacle marks and froze); the player follower
         // is reseated below so the PC can walk onto the new terrain.
         var newNav = RebuildNavMesh();
+        RegionStep("nav mesh rebuild");
         if (newNav is not null) { _navMesh = newNav; RehomeAllFollowers(newNav); }
+        RegionStep("rehome followers");
         // SC-NAV-OBSTACLE-AVOID audit fold — re-mark obstacles
         // against the freshly-built navmesh BEFORE LoadStaticProps
         // adds the new region's props. After LoadStaticProps runs
@@ -14961,6 +15118,7 @@ void main()
         // means a brief window where the player could click toward
         // an old region's wall on the new mesh is closed.
         MarkAllObstacles();
+        RegionStep("mark obstacles");
 
         // SC-PERSIST-STREAM — actors the save (or this session) already killed
         // don't respawn when their region streams in.
@@ -14974,11 +15132,18 @@ void main()
 
         // Spawn new actors and attach them to the render/tick lists with the
         // new nav mesh so their wander followers see the freshly-streamed floor.
+        var spawnT = SubBegin();
         var newActors = _actorSpawner.Spawn(newInstances);
+        SubEnd("actors: spawn", spawnT);
         // SC-ACTOR-TRIGGERS — streamed actors register their embedded
         // trigger matrices too (matrix-less placements skip inside).
+        spawnT = SubBegin();
         _actorSpawner.SpawnTriggers(newInstances);
+        SubEnd("actors: triggers", spawnT);
+        spawnT = SubBegin();
         var (onMesh, offMesh) = AttachActorsToScene(newActors, newNav);
+        SubEnd("actors: attach to scene", spawnT);
+        RegionStep("spawn + attach actors");
         // SC-PENDING-ACTORS — apply saved ALIVE state (life/position/
         // hidden/pinned pose) to actors whose region streamed after the
         // load; without this a wounded enemy two regions from the save
@@ -15035,7 +15200,9 @@ void main()
         // Phase 21c — densify the freshly-streamed regions with their static
         // props too. Existing props from previously-loaded regions stay in
         // _staticProps untouched (world coords are pinned).
+        RegionStep("actor save state");
         LoadStaticProps(newlyLoaded);
+        RegionStep("static props");
         LoadWorldInventory(newlyLoaded);
         LoadGenerators(newlyLoaded);
         // SC-GEN-PERSIST — the freshly streamed regions' generators pick up
@@ -15067,6 +15234,7 @@ void main()
         LoadBlockingGizmos(newlyLoaded);
         LoadPointLights(newlyLoaded);
         AssignPatrolRoutes();
+        RegionStep("inventory, generators, gizmos, lights");
 
         // SC-DECALS-STREAM — extend the drape sampler with the new regions'
         // nodes and register their decals (after LoadStaticProps so wall
@@ -15089,6 +15257,7 @@ void main()
             }
         }
 
+        RegionStep("decals");
         // SC-PERSIST-STREAM — the streamed regions' fresh props re-apply the
         // loaded save's world history (looted chests stay open, broken
         // barrels stay broken — closes the reload-and-refarm loop).
@@ -15134,6 +15303,8 @@ void main()
                 if (nav is not null) { _navMesh = nav; MarkAllObstacles(); RehomeAllFollowers(nav); }
             }
         }
+        RegionStep("save ledgers");
+        RegionStepEnd();
     }
 
     /// <summary>Phase 21c — resolve and cache the albedo texture for an actor or
@@ -15602,7 +15773,9 @@ void main()
         // neighbor ring, regionPaths holds the newly-loaded NEIGHBORS, and
         // keying off .First() lit the world with a region the player isn't in.
         var lightRegion = _currentPlayerRegion ?? regionPaths.FirstOrDefault();
+        var lightT = SubBegin();
         if (lightRegion is not null) LoadRegionLighting(lightRegion);
+        SubEnd("props: region lighting", lightT);
 
         var mapReader = new TankReader(_playMapTank);
         int considered = 0, spawned = 0, missingTemplate = 0, missingModel = 0,
@@ -15623,8 +15796,10 @@ void main()
         {
             foreach (var fileName in SiegeFX.Core.Assets.RegionObjects.StaticPropFiles)
             {
+                var placeT = SubBegin();
                 var (placements, diags) =
                     SiegeFX.Core.Assets.RegionObjects.LoadPlacements(mapReader, rp, fileName, multiplayerContent: MultiplayerContent);
+                SubEnd("props: parse placement files", placeT);
                 foreach (var d in diags) Console.WriteLine("  " + d);
 
                 foreach (var p in placements)
@@ -15655,7 +15830,9 @@ void main()
                         continue;
                     }
 
+                    var subT = SubBegin();
                     var asp = GetOrLoadPropAsp(modelName);
+                    SubEnd("props: load asp", subT);
                     if (asp is null)
                     {
                         missingMesh++;
@@ -15665,14 +15842,18 @@ void main()
                     }
 
                     StaticMesh glMesh;
+                    subT = SubBegin();
                     if (!_propGlMeshCache.TryGetValue(asp, out glMesh!))
                     {
                         try { glMesh = new StaticMesh(_gl, asp); }
                         catch { parseFail++; continue; }
                         _propGlMeshCache[asp] = glMesh;
                     }
+                    SubEnd("props: gl mesh", subT);
 
+                    subT = SubBegin();
                     var tex = ResolveAspTexture(asp);
+                    SubEnd("props: texture", subT);
                     var nodeLocalWorld = ComposePlacementLocal(asp, p.Placement);
                     var world = ComposePlacementWorld(asp, p.Placement);
 
@@ -16018,7 +16199,12 @@ void main()
                         CenterY       = world.Translation.Y,
                         Source        = p.Node,
                     };
-                    if (isLever) ConfigureLeverPose(inst, template!, p);
+                    if (isLever)
+                    {
+                        subT = SubBegin();
+                        ConfigureLeverPose(inst, template!, p);
+                        SubEnd("props: lever pose", subT);
+                    }
                     _staticProps.Add(inst);
                     if (_elevatorNodeOverrides.ContainsKey(inst.NodeGuid))
                     {
@@ -16100,7 +16286,9 @@ void main()
         // region's props, so rolling-region rebuilds at
         // OnPlayerRegionChanged dropped every previously-marked
         // obstacle silently.
+        var markT = SubBegin();
         MarkAllObstacles();
+        SubEnd("props: mark obstacles", markT);
         Console.WriteLine($"  static props: {spawned}/{considered} placed " +
                           $"({_propGlMeshCache.Count} unique mesh(es); " +
                           $"skipped {missingTemplate} no-template, {missingModel} no-model, " +
@@ -23852,19 +24040,27 @@ void main()
     private SiegeFX.Core.Nav.NavMesh? RebuildNavMesh()
     {
         if (_regionTerrainTankPath is null || _regionLayout is null) return null;
+        TankFile? terrainTank = null, navMapTank = null;
         try
         {
-            using var terrainTank = TankFile.Open(_regionTerrainTankPath);
-            var terrainReader = new TankReader(terrainTank);
-            // SS-CUSTOM — index the map tank too so bundled custom .sno tiles contribute walkable nav on rebuild.
-            using var navMapTank = _regionMapTankPath is not null ? TankFile.Open(_regionMapTankPath) : null;
-            var meshIdx = navMapTank is not null
-                ? SnoMeshIndex.Build(new TankReader(navMapTank), terrainReader)
-                : SnoMeshIndex.Build(terrainReader);
-            var navCache = new Dictionary<uint, SnoModel?>();
+            // Parsed SNOs are immutable, so they're kept across rebuilds; only a
+            // piece not seen before (normally just the newly streamed region's)
+            // opens the tanks and builds the mesh index, once per rebuild.
+            SnoMeshIndex? meshIdx = null;
+            var navCache = _navSnoCache;
             SnoModel? ResolveNav(uint meshGuid)
             {
                 if (navCache.TryGetValue(meshGuid, out var hit)) return hit;
+                if (meshIdx is null)
+                {
+                    terrainTank = TankFile.Open(_regionTerrainTankPath);
+                    var terrainReader = new TankReader(terrainTank);
+                    // SS-CUSTOM — index the map tank too so bundled custom .sno tiles contribute walkable nav on rebuild.
+                    navMapTank = _regionMapTankPath is not null ? TankFile.Open(_regionMapTankPath) : null;
+                    meshIdx = navMapTank is not null
+                        ? SnoMeshIndex.Build(new TankReader(navMapTank), terrainReader)
+                        : SnoMeshIndex.Build(terrainReader);
+                }
                 SnoModel? m = null;
                 var b = meshIdx.LoadSnoBytes(meshGuid);
                 if (b is not null)
@@ -23900,7 +24096,9 @@ void main()
             // SC-ELEVATOR — car nodes bake at their current stop (not the BFS
             // pose) and carry their current-stop door pairing for the stitcher.
             navGraph = InjectElevatorDoorLinks(navGraph);
+            var buildT = SubBegin();
             var nav = SiegeFX.Core.Nav.NavMesh.BuildForRegion(navGraph, EffectiveNavLayout(), ResolveNav);
+            SubEnd("nav: build mesh (incl. sno loads)", buildT);
             // A fresh mesh starts with every triangle visible; live fade state
             // (fade-group hides, single-node fades, camera_fade) must carry
             // over or the pathfinder briefly routes across hidden upper floors
@@ -23922,7 +24120,16 @@ void main()
             Console.Error.WriteLine($"  !! nav mesh rebuild failed: {ex.Message}");
             return null;
         }
+        finally
+        {
+            navMapTank?.Dispose();
+            terrainTank?.Dispose();
+        }
     }
+
+    // Parsed nav SNOs by mesh guid, shared by every RebuildNavMesh (null =
+    // missing or unparsable, cached too so it isn't retried each rebuild).
+    private readonly Dictionary<uint, SnoModel?> _navSnoCache = new();
 
     /// <summary>Phase 21a-3 — attach a freshly-spawned batch of actors to the
     /// render/tick lists. Mirrors the per-actor work LoadPlayActors does in its
@@ -24174,8 +24381,69 @@ void main()
         Console.WriteLine($"resolved {hits}/{unique.Count} SNO textures from tank '{tankPath}'");
     }
 
+    /// <summary>Places the chase camera on the hero. Runs after the actor
+    /// simulation and the hero's render interpolation, so it frames where the
+    /// body is drawn this frame; run before them, it trailed the body by one
+    /// frame and judders against it while turning or walking.</summary>
+    private void UpdateChaseCamera(double dt)
+    {
+        if (_cameraMode == CameraMode.Chase && _player is not null && _nisPhase == NisPhase.Off
+            && _camTracking)
+        {
+            // SC-MEGAMAP wire-up — the overview pose lived only in
+            // ComputeChasePose, which the LIVE camera never calls (only the
+            // NIS return path does); Tab toggled state that nothing read.
+            // Route the live pose through it while the map is up.
+            if (_megaMapActive && !_devFreeCamera)
+            {
+                ComputeChasePose(out var mmPos, out var mmYaw, out var mmPitch);
+                _camera.Position = mmPos;
+                _camera.Yaw = mmYaw;
+                _camera.Pitch = mmPitch;
+            }
+            else
+            {
+            float horiz, height, camDist;
+            Vector3 target;
+            if (_devFreeCamera)
+            {
+                // SC-DEVMODE — the pre-authentic camera, preserved verbatim
+                // as a testing option: legacy slope framing by default, RMB
+                // pitch drag when the user tilts, no bounds constraints.
+                target = _player.CurrentTransform.Translation + new Vector3(0, ChaseLookTargetY, 0);
+                if (_devCamUnclampedPitch)
+                {
+                    horiz = _chaseDistance * MathF.Cos(_chasePitch);
+                    height = _chaseDistance * MathF.Sin(_chasePitch);
+                }
+                else
+                {
+                    horiz = _chaseDistance;
+                    height = _chaseDistance * ChasePitchSlope;
+                }
+            }
+            else
+            {
+                // SC-CAMERA-GAS — authored framing: azimuth 14.2° at 8.38m,
+                // tracking the torso at +1.51m, with the bounds_camera
+                // avoid/tilt dynamics steering through interiors.
+                target = _player.CurrentTransform.Translation + new Vector3(0, _camTrackHeight, 0);
+                camDist = TickCameraBounds(target, _chasePitch, (float)dt, out float pitch);
+                horiz = camDist * MathF.Cos(pitch);
+                height = camDist * MathF.Sin(pitch);
+            }
+            var offset = new Vector3(MathF.Sin(_chaseYaw), 0f, MathF.Cos(_chaseYaw)) * horiz;
+            _camera.Position = target + offset + new Vector3(0, height, 0);
+            var dir = Vector3.Normalize(target - _camera.Position);
+            _camera.Yaw   = MathF.Atan2(dir.X, -dir.Z);
+            _camera.Pitch = MathF.Asin(Math.Clamp(dir.Y, -0.999f, 0.999f));
+            }
+        }
+    }
+
     private void OnUpdate(double dt)
     {
+        PerfMark("present and wait");
         // Re-apply the window/taskbar icon across the first frames of the live
         // loop. GLFW only pushes the icon to the Windows taskbar if events are
         // polled within ~500ms of SetWindowIcon (glfw#2753); OnLoad sets it
@@ -24531,58 +24799,7 @@ void main()
         // SC-COMMANDS — T's track/hold toggle: when holding, the chase snap
         // below is skipped entirely so the camera parks where it is while
         // the party walks away (DS1's [camera_track_toggle]).
-        if (_cameraMode == CameraMode.Chase && _player is not null && _nisPhase == NisPhase.Off
-            && _camTracking)
-        {
-            // SC-MEGAMAP wire-up — the overview pose lived only in
-            // ComputeChasePose, which the LIVE camera never calls (only the
-            // NIS return path does); Tab toggled state that nothing read.
-            // Route the live pose through it while the map is up.
-            if (_megaMapActive && !_devFreeCamera)
-            {
-                ComputeChasePose(out var mmPos, out var mmYaw, out var mmPitch);
-                _camera.Position = mmPos;
-                _camera.Yaw = mmYaw;
-                _camera.Pitch = mmPitch;
-            }
-            else
-            {
-            float horiz, height, camDist;
-            Vector3 target;
-            if (_devFreeCamera)
-            {
-                // SC-DEVMODE — the pre-authentic camera, preserved verbatim
-                // as a testing option: legacy slope framing by default, RMB
-                // pitch drag when the user tilts, no bounds constraints.
-                target = _player.CurrentTransform.Translation + new Vector3(0, ChaseLookTargetY, 0);
-                if (_devCamUnclampedPitch)
-                {
-                    horiz = _chaseDistance * MathF.Cos(_chasePitch);
-                    height = _chaseDistance * MathF.Sin(_chasePitch);
-                }
-                else
-                {
-                    horiz = _chaseDistance;
-                    height = _chaseDistance * ChasePitchSlope;
-                }
-            }
-            else
-            {
-                // SC-CAMERA-GAS — authored framing: azimuth 14.2° at 8.38m,
-                // tracking the torso at +1.51m, with the bounds_camera
-                // avoid/tilt dynamics steering through interiors.
-                target = _player.CurrentTransform.Translation + new Vector3(0, _camTrackHeight, 0);
-                camDist = TickCameraBounds(target, _chasePitch, (float)dt, out float pitch);
-                horiz = camDist * MathF.Cos(pitch);
-                height = camDist * MathF.Sin(pitch);
-            }
-            var offset = new Vector3(MathF.Sin(_chaseYaw), 0f, MathF.Cos(_chaseYaw)) * horiz;
-            _camera.Position = target + offset + new Vector3(0, height, 0);
-            var dir = Vector3.Normalize(target - _camera.Position);
-            _camera.Yaw   = MathF.Atan2(dir.X, -dir.Z);
-            _camera.Pitch = MathF.Asin(Math.Clamp(dir.Y, -0.999f, 0.999f));
-            }
-        }
+        PerfMark("update: input and small ticks");
 
         if (_anim is not null && _anim.AnimLength > 0f)
             _animTime += dt;
@@ -24623,6 +24840,7 @@ void main()
         // (broadcasts, targeted self-sends) see the updated state. Per-actor AnimTime is
         // advanced by real dt (not step*stepsDone) to keep the visible anim smooth between
         // logic ticks — the skrit state only updates at 20 Hz, but the clip plays at render rate.
+        PerfMark("update: skrit");
         if (_actorRuntime is not null && _actorBus is not null && _actors.Count > 0)
         {
             const double stepSec = 1.0 / SkritInstance.FramesPerSecond;
@@ -24661,6 +24879,7 @@ void main()
             while (_actorTickAccumulator >= stepSec)
             {
                 _actorTickAccumulator -= stepSec;
+                _perfSimSteps++;
                 _actorRuntime.Tick(stepSec);
                 _actorBus.Deliver();
                 if (_triggerRuntime is not null && _triggerCtx is not null)
@@ -25304,6 +25523,9 @@ void main()
             }
         }
 
+        PerfMark("update: actor sim and anim");
+        UpdateChaseCamera(dt);
+        PerfMark("update: camera");
         // Phase 21a-3 — periodic region-membership check. We scan only every
         // RegionCheckIntervalSec because the per-snode XZ scan is O(N) over
         // every loaded snode; firing it from every render frame would burn
@@ -25345,6 +25567,7 @@ void main()
                 }
             }
         }
+        PerfMark("update: region check");
     }
 
     // Phase 13a — spawn a single Farmboy PC at the NPC centroid (snapped to the
@@ -25888,6 +26111,7 @@ void main()
                 if (!string.IsNullOrEmpty(asmPath) && System.IO.File.Exists(asmPath))
                     psi.ArgumentList.Add(asmPath);
             }
+            if (_diagMode) psi.ArgumentList.Add("--diag");
             System.Diagnostics.Process.Start(psi);
             Console.WriteLine("[defeat] returning to main menu (relaunch)");
             _window.Close();
@@ -27037,6 +27261,7 @@ void main()
             psi.ArgumentList.Add(logic);
             psi.ArgumentList.Add(objects);
             psi.ArgumentList.Add(regionPath);
+            if (_diagMode) psi.ArgumentList.Add("--diag");
             psi.Environment["SIEGEFX_DIFFICULTY"] = _difficulty.ToString();
             psi.Environment["SIEGEFX_NOVIDEO"] = "1";
             psi.Environment["SIEGEFX_CREATOR"] = "0";
@@ -38895,6 +39120,7 @@ void main()
 
     private void OnRender(double dt)
     {
+        PerfMark("update-to-render gap");
         if (_gl is null) return;
         _frameStamp++; // ALPHA-PERF — gates once-per-frame uniform uploads
         if (_diagMode) DiagRecordFrame(dt);
@@ -39130,6 +39356,7 @@ void main()
         }
         // ALPHA-2 POINT LIGHTS — select this frame's nearest sources once;
         // every ApplyLightingUniforms call this frame uploads the same set.
+        PerfMark("render: world ticks");
         PickFramePointLights();
         // SC-WEATHER-D — with mood fog active, the void beyond loaded nodes
         // clears to the fog color (retail's linear fog fades the world edge
@@ -39180,6 +39407,28 @@ void main()
         }
         var aspect = size.Y == 0 ? 1f : (float)size.X / size.Y;
         var vp = _camera.GetViewProjection(aspect);
+        // Skip world geometry the camera can't see. Everything loaded used to
+        // be drawn every frame, ~20 ms of GPU/driver time in Elddim.
+        var frustum = new ViewFrustum(vp);
+        // Beyond the mood fog's far distance every fragment is pure fog color,
+        // the same color the void clears to, so whole objects past it are
+        // invisible. Same fog-on test as ApplyLightingUniforms; +1u margin.
+        bool fogCulls = _weather.FogActive && _weather.FogFar > _weather.FogNear
+                        && !_noFogKnob && !_megaMapActive;
+        float fogCullDist = fogCulls ? _weather.FogFar + 1f : float.PositiveInfinity;
+        var fogCullEye = _camera.Position;
+        bool BeyondFog(Vector3 center, float radius)
+            => fogCulls && Vector3.Distance(center, fogCullEye) - radius > fogCullDist;
+        // An actor's bind-pose diagonal at full scale around its feet: generous
+        // enough for raised arms, attack lunges and held weapons.
+        bool ActorInView(ActorRenderState a)
+        {
+            var ext = a.GlMesh.Max - a.GlMesh.Min;
+            var xf = a.CurrentTransform;
+            float sx = new Vector3(xf.M11, xf.M12, xf.M13).Length();
+            float r = ext.Length() * sx * a.Actor.Stats.RenderScale + 0.5f;
+            return frustum.IntersectsSphere(xf.Translation, r) && !BeyondFog(xf.Translation, r);
+        }
 
         // SC-TERRAIN-WHITE-GRID (audit fold — finding #3) — dev
         // fly-cam reference grid. Previously gated on
@@ -39258,6 +39507,7 @@ void main()
             _skinnedMesh.Draw();
         }
 
+        PerfMark("render: lights and clear");
         if (_skinShader is not null && _actors.Count > 0)
         {
             // One draw call per actor. The mesh cache keeps unique ASPs down (DS1 ships ~12
@@ -39313,6 +39563,8 @@ void main()
                 if (s.IsPlayer && s.Hidden)
                     BodyDiag("player-hidden", "player render state Hidden=TRUE — body draw SKIPPED");
                 if (s.Hidden) continue;
+                // Off-screen actors skip skinning and drawing.
+                if (!s.IsPlayer && !ActorInView(s)) continue;
                 if (s.IsPlayer)
                 {
                     var dp = s.CurrentTransform.Translation;
@@ -39450,6 +39702,11 @@ void main()
                     var appos = s.CurrentTransform.Translation;
                     float apdx = appos.X - apCam.X, apdz = appos.Z - apCam.Z;
                     if (apdx * apdx + apdz * apdz > 80f * 80f) continue;
+                    var apExt = s.GlMesh.Max - s.GlMesh.Min;
+                    var apXf = s.CurrentTransform;
+                    float apSx = new Vector3(apXf.M11, apXf.M12, apXf.M13).Length();
+                    float apR = apExt.Length() * apSx * s.Actor.Stats.RenderScale + 0.5f;
+                    if (!frustum.IntersectsSphere(appos, apR) || BeyondFog(appos, apR)) continue;
                     if (IsActorInFadedSnode(s)) continue;
                     var apClips = s.Actor.Clips;
                     if (apClips.Length == 0) continue;
@@ -39616,6 +39873,7 @@ void main()
         // alpha-cutout single-sided quads; backface culling makes half the leaves
         // disappear). The fragment shader handles the alpha discard; no blend
         // state needed for hard cutout.
+        PerfMark("render: actors and equipment");
         if (_meshShader is not null && _staticProps.Count > 0)
         {
             _gl!.Disable(GLEnum.CullFace);
@@ -39648,6 +39906,9 @@ void main()
                 // SC-FADE-GROUPS — hide with the anchor snode's fade state.
                 if (prop.NodeGuid != 0 && _fadedSnodeCounts.Count > 0
                     && _fadedSnodeCounts.ContainsKey(prop.NodeGuid)) continue;
+                float propR = PropCullRadius(prop);
+                if (!frustum.IntersectsSphere(prop.World.Translation, propR)
+                    || BeyondFog(prop.World.Translation, propR)) continue;
                 if (!ReferenceEquals(prop.Texture, lastTex))
                 {
                     if (prop.Texture is not null)
@@ -39742,6 +40003,7 @@ void main()
         // mirrors the skinned-body loop exactly so the club tracks the same
         // pose the body was skinned with; dead actors hold the die-clamp pose
         // with the weapon still in hand unless it dropped into the loot pile.
+        PerfMark("render: static props");
         if (_meshShader is not null)
         {
             bool npcGearShaderBound = false;
@@ -39749,6 +40011,7 @@ void main()
             {
                 if (s.IsPlayer || s.Hidden) continue;
                 if (s.WeaponMesh is null && s.ShieldMesh is null) continue;
+                if (!ActorInView(s)) continue;
                 // SC-REGION-LAYER-HIDE-ACTORS (follow-up) — no region stamp on
                 // actors yet; gear hides with the faded-snode gate below.
                 if (IsActorInFadedSnode(s)) continue;
@@ -40189,6 +40452,7 @@ void main()
         // the text-overlay pass can draw "Spiked Club" / "Healing Potion" /
         // etc. above each pile (gold, red on hover) without re-resolving.
         _frameLootLabels.Clear();
+        PerfMark("render: npc gear and held items");
         if (_meshShader is not null && _lootPiles.Count > 0)
         {
             _meshShader.Use();
@@ -40390,6 +40654,7 @@ void main()
             }
         }
 
+        PerfMark("render: loot and debris");
         if (_meshShader is not null && _regionInstances.Count > 0)
         {
             _meshShader.Use();
@@ -40443,6 +40708,10 @@ void main()
                     // the lower region — only flips back on region
                     // change.
                     if (IsAbovePlayer(inst.RegionPath)) continue;
+                    if (!frustum.IntersectsBox(inst.WorldAabbMin, inst.WorldAabbMax)) continue;
+                    if (fogCulls && Vector3.Distance(
+                            Vector3.Clamp(fogCullEye, inst.WorldAabbMin, inst.WorldAabbMax),
+                            fogCullEye) > fogCullDist) continue;
                     // SC-PROP-ANIM — nodal tex anim: gizmo-enabled V crawl
                     // on this node's textures (chains, belts). Wraps at 1.0
                     // so the float never loses precision over a long session.
@@ -40473,6 +40742,7 @@ void main()
             ResetAnimatedTextureBinding();
             _meshShader.SetInt("uUvOrient", 0);
         }
+        PerfMark("render: terrain");
 
         // SC-DECALS — projected decal layer (burnt-wood char on the farmhouse doors,
         // blood, ground scorch, drop shadows) over the finished world geometry, before
@@ -40481,6 +40751,7 @@ void main()
         // SC-DECAL-DIAG — F6 toggles the whole decal layer live (dev knob; strip
         // before v1.0). One keypress answers "is that floating thing a decal?".
         if (_decalsVisible) _decalRenderer?.Draw(vp);
+        PerfMark("render: decals");
 
         // ALPHA-2V — blob drop-shadows under actors (Options → Video →
         // Shadows: simple_party = party only, complex_party = everyone).
@@ -40516,8 +40787,10 @@ void main()
         }
 
         // SC-MOUSE-FX — selection rings + the fading destination marker,
+        PerfMark("render: blob shadows");
         // right above the shadows tier so actors still occlude them.
         DrawSelectionWorldFx(vp);
+        PerfMark("render: selection rings");
 
         // Phase 17-SC-E — billboard particles. Sit above the world scene
         // (depth-tested against actors + props) but below the HUD ortho
@@ -40545,9 +40818,11 @@ void main()
         // Cheap per-frame work (a few k-prop scans) and run before the HUD
         // pass so animated states get the same _terrainTime stride the
         // particle systems use.
+        PerfMark("render: particles");
         UpdateCursorState();
         EnsureOsCursorHidden();
 
+        PerfMark("render: cursor pick");
         if (_textRenderer is not null && _textRenderer.HasFont)
         {
             _textRenderer.BeginPass();
@@ -41429,6 +41704,7 @@ void main()
         // SC-SCREENSHOT — grab the completed back buffer as the very last
         // act of the frame, so the capture contains everything (HUD included)
         // exactly as presented.
+        PerfMark("render: hud");
         CaptureScreenshotIfPending();
 
         // SC-RECORD — recorder status lines are produced on encoder
