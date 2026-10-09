@@ -307,6 +307,34 @@ public sealed class ActorSpawner
         // attack-variant set + qffg pad + authored base duration for every
         // spawned combatant (clip cache makes the second pass cheap).
         RefreshMotionClips(actor, preferredStance ?? DeriveStanceFromEquipment(template));
+        // The stock job_fidget.skrit (jat_fidget) requests CHORE_FIDGET on
+        // entering idle and again each time it finishes. Without it, krugs and
+        // other actors with a one-frame chore_default stood frozen while their
+        // brains ticked. A placement's actor_auto_fidgets = false opts out;
+        // then a select_fidget initial chore (one-shot) plays once and the
+        // actor settles on its static default stance.
+        var autoFidgets = (TemplateStore.GetNodeAttribute(inst.Node, "mind", "actor_auto_fidgets")
+                        ?? _store.GetAttribute(template, "mind", "actor_auto_fidgets"))?.Trim();
+        bool fidgetsOff = string.Equals(autoFidgets, "false", StringComparison.OrdinalIgnoreCase);
+        var fidgetJob = TemplateStore.GetNodeAttribute(inst.Node, "mind", "jat_fidget")
+                     ?? _store.GetAttribute(template, "mind", "jat_fidget");
+        if (!fidgetsOff && !string.IsNullOrWhiteSpace(fidgetJob)
+            && clipIndexByName.TryGetValue("chore_fidget", out var fidgetIdx))
+        {
+            actor.IdleClipIndex = fidgetIdx;
+        }
+        else if (fidgetsOff && actor.IdleClipIndex > 0
+            && string.Equals(initialChore, "chore_fidget", StringComparison.OrdinalIgnoreCase))
+        {
+            var fidgetSection = dictionary is null ? null : TemplateStore.FindChild(dictionary, "chore_fidget");
+            var fidgetSkrit = fidgetSection is null ? null : TemplateStore.FindAttr(fidgetSection, "skrit");
+            if (string.Equals(fidgetSkrit?.Trim(), "select_fidget", StringComparison.OrdinalIgnoreCase))
+            {
+                int initialIdx = actor.IdleClipIndex;
+                actor.IdleClipIndex = 0;
+                actor.Host.OverrideAnimIndex(initialIdx, actor.Clips[initialIdx].AnimLength);
+            }
+        }
         return actor;
     }
 
