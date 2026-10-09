@@ -39285,6 +39285,25 @@ void main()
         // Skip world geometry the camera can't see. Everything loaded used to
         // be drawn every frame, ~20 ms of GPU/driver time in Elddim.
         var frustum = new ViewFrustum(vp);
+        // Beyond the mood fog's far distance every fragment is pure fog color,
+        // the same color the void clears to, so whole objects past it are
+        // invisible. Same fog-on test as ApplyLightingUniforms; +1u margin.
+        bool fogCulls = _weather.FogActive && _weather.FogFar > _weather.FogNear
+                        && !_noFogKnob && !_megaMapActive;
+        float fogCullDist = fogCulls ? _weather.FogFar + 1f : float.PositiveInfinity;
+        var fogCullEye = _camera.Position;
+        bool BeyondFog(Vector3 center, float radius)
+            => fogCulls && Vector3.Distance(center, fogCullEye) - radius > fogCullDist;
+        // An actor's bind-pose diagonal at full scale around its feet: generous
+        // enough for raised arms, attack lunges and held weapons.
+        bool ActorInView(ActorRenderState a)
+        {
+            var ext = a.GlMesh.Max - a.GlMesh.Min;
+            var xf = a.CurrentTransform;
+            float sx = new Vector3(xf.M11, xf.M12, xf.M13).Length();
+            float r = ext.Length() * sx * a.Actor.Stats.RenderScale + 0.5f;
+            return frustum.IntersectsSphere(xf.Translation, r) && !BeyondFog(xf.Translation, r);
+        }
 
         // SC-TERRAIN-WHITE-GRID (audit fold — finding #3) — dev
         // fly-cam reference grid. Previously gated on
@@ -39419,17 +39438,8 @@ void main()
                 if (s.IsPlayer && s.Hidden)
                     BodyDiag("player-hidden", "player render state Hidden=TRUE — body draw SKIPPED");
                 if (s.Hidden) continue;
-                // Off-screen actors skip skinning and drawing. The radius is the
-                // bind-pose diagonal at full scale around the feet, generous
-                // enough for raised arms and attack lunges.
-                if (!s.IsPlayer)
-                {
-                    var ext = s.GlMesh.Max - s.GlMesh.Min;
-                    var xf = s.CurrentTransform;
-                    float sx = new Vector3(xf.M11, xf.M12, xf.M13).Length();
-                    if (!frustum.IntersectsSphere(xf.Translation,
-                            ext.Length() * sx * s.Actor.Stats.RenderScale + 0.5f)) continue;
-                }
+                // Off-screen actors skip skinning and drawing.
+                if (!s.IsPlayer && !ActorInView(s)) continue;
                 if (s.IsPlayer)
                 {
                     var dp = s.CurrentTransform.Translation;
@@ -39570,8 +39580,8 @@ void main()
                     var apExt = s.GlMesh.Max - s.GlMesh.Min;
                     var apXf = s.CurrentTransform;
                     float apSx = new Vector3(apXf.M11, apXf.M12, apXf.M13).Length();
-                    if (!frustum.IntersectsSphere(appos,
-                            apExt.Length() * apSx * s.Actor.Stats.RenderScale + 0.5f)) continue;
+                    float apR = apExt.Length() * apSx * s.Actor.Stats.RenderScale + 0.5f;
+                    if (!frustum.IntersectsSphere(appos, apR) || BeyondFog(appos, apR)) continue;
                     if (IsActorInFadedSnode(s)) continue;
                     var apClips = s.Actor.Clips;
                     if (apClips.Length == 0) continue;
@@ -39771,7 +39781,9 @@ void main()
                 // SC-FADE-GROUPS — hide with the anchor snode's fade state.
                 if (prop.NodeGuid != 0 && _fadedSnodeCounts.Count > 0
                     && _fadedSnodeCounts.ContainsKey(prop.NodeGuid)) continue;
-                if (!frustum.IntersectsSphere(prop.World.Translation, PropCullRadius(prop))) continue;
+                float propR = PropCullRadius(prop);
+                if (!frustum.IntersectsSphere(prop.World.Translation, propR)
+                    || BeyondFog(prop.World.Translation, propR)) continue;
                 if (!ReferenceEquals(prop.Texture, lastTex))
                 {
                     if (prop.Texture is not null)
@@ -39874,6 +39886,7 @@ void main()
             {
                 if (s.IsPlayer || s.Hidden) continue;
                 if (s.WeaponMesh is null && s.ShieldMesh is null) continue;
+                if (!ActorInView(s)) continue;
                 // SC-REGION-LAYER-HIDE-ACTORS (follow-up) — no region stamp on
                 // actors yet; gear hides with the faded-snode gate below.
                 if (IsActorInFadedSnode(s)) continue;
@@ -40571,6 +40584,9 @@ void main()
                     // change.
                     if (IsAbovePlayer(inst.RegionPath)) continue;
                     if (!frustum.IntersectsBox(inst.WorldAabbMin, inst.WorldAabbMax)) continue;
+                    if (fogCulls && Vector3.Distance(
+                            Vector3.Clamp(fogCullEye, inst.WorldAabbMin, inst.WorldAabbMax),
+                            fogCullEye) > fogCullDist) continue;
                     // SC-PROP-ANIM — nodal tex anim: gizmo-enabled V crawl
                     // on this node's textures (chains, belts). Wraps at 1.0
                     // so the float never loses precision over a long session.
