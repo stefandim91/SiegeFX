@@ -582,6 +582,74 @@ public sealed class NavMesh
 
         var indices = tris.ToArray();
         var triCount = indices.Length / 3;
+        var neighbors = BuildManifoldNeighbors(indices, out int nonManifoldEdges);
+
+        var vertsArr = verts.ToArray();
+        var kindsArr = kinds.ToArray();
+
+        // SC-NAV-CROSS-SNO-STITCH — wire nav adjacency across SNO seams
+        // using each snode's authored Door records. fh_r1's stair-bottom
+        // SNO and hc_r1's basement-floor SNO are placed touching in
+        // world space but their nav triangles don't share vertices at
+        // the seam, so the manifold pass left them on disconnected
+        // components — A* refused with "no corridor" when the player
+        // tried to walk from the stair bottom into the basement.
+        // Runs BEFORE land↔water stitching so this pass's newly-paired
+        // edges aren't counted as boundary candidates by the water pass.
+        var extraLinksBuild = new Dictionary<int, List<int>>();
+        int doorSeams = StitchSnoDoorSeams(graph, layout, resolveSno, sourceSnodeGuid.ToArray(), indices, neighbors, vertsArr, kindsArr, extraLinksBuild, out int doorSeamOverflow);
+        // Land↔water seam stitching: shoreline Floor and Water SNOs are authored in
+        // separate meshes whose vertices don't fall inside the WeldToleranceUnits bucket,
+        // so the manifold pass leaves them on disconnected components. Wire cross-kind
+        // adjacencies for boundary-edge pairs that share an XZ footprint and a wadeable Y.
+        int seamEdges = StitchLandWaterSeams(triCount, indices, neighbors, vertsArr, kindsArr);
+
+        var (centroids, originX, originZ, cellsX, cellsZ, grid) = BuildGrid(vertsArr, indices);
+
+        return new NavMesh(
+            vertsArr,
+            indices,
+            neighbors,
+            kindsArr,
+            centroids,
+            sourceNode.ToArray(),
+            sourceLnode.ToArray(),
+            sourceSnodeGuid.ToArray(),
+            sourceSnodes,
+            degenerate,
+            nonManifoldEdges,
+            seamEdges,
+            doorSeams,
+            extraLinksBuild.Count == 0
+                ? null
+                : extraLinksBuild.ToDictionary(kv => kv.Key, kv => kv.Value.ToArray()),
+            doorSeamOverflow,
+            originX,
+            originZ,
+            cellsX,
+            cellsZ,
+            grid);
+    }
+
+    /// <summary>Builds a mesh straight from a triangle list: the same manifold
+    /// adjacency and lookup grid as <see cref="BuildForRegion"/>, without SNO
+    /// welding or seam stitching. For tests and tools that need a small known mesh.
+    /// Vertices are used as given, so triangles share an edge only when they share
+    /// vertex indices.</summary>
+    public static NavMesh FromTriangles(Vector3[] vertices, int[] indices, SnoModel.FloorKind[]? kinds = null)
+    {
+        int triCount = indices.Length / 3;
+        kinds ??= Enumerable.Repeat(SnoModel.FloorKind.Floor, triCount).ToArray();
+        var neighbors = BuildManifoldNeighbors(indices, out int nonManifoldEdges);
+        var (centroids, originX, originZ, cellsX, cellsZ, grid) = BuildGrid(vertices, indices);
+        return new NavMesh(vertices, indices, neighbors, kinds, centroids,
+            new int[triCount], new int[triCount], new uint[triCount], 0, 0, nonManifoldEdges,
+            0, 0, null, 0, originX, originZ, cellsX, cellsZ, grid);
+    }
+
+    private static int[] BuildManifoldNeighbors(int[] indices, out int nonManifoldEdgeCount)
+    {
+        int triCount = indices.Length / 3;
         var neighbors = new int[indices.Length];
         for (int i = 0; i < neighbors.Length; i++) neighbors[i] = -1;
 
@@ -641,27 +709,14 @@ public sealed class NavMesh
             for (int ss = 0; ss < 3; ss++)
                 if (neighbors[3 * triB + ss] == triA) { neighbors[3 * triB + ss] = -1; break; }
         }
+        nonManifoldEdgeCount = nonManifoldEdges;
+        return neighbors;
+    }
 
-        var vertsArr = verts.ToArray();
-        var kindsArr = kinds.ToArray();
-
-        // SC-NAV-CROSS-SNO-STITCH — wire nav adjacency across SNO seams
-        // using each snode's authored Door records. fh_r1's stair-bottom
-        // SNO and hc_r1's basement-floor SNO are placed touching in
-        // world space but their nav triangles don't share vertices at
-        // the seam, so the manifold pass left them on disconnected
-        // components — A* refused with "no corridor" when the player
-        // tried to walk from the stair bottom into the basement.
-        // Runs BEFORE land↔water stitching so this pass's newly-paired
-        // edges aren't counted as boundary candidates by the water pass.
-        var extraLinksBuild = new Dictionary<int, List<int>>();
-        int doorSeams = StitchSnoDoorSeams(graph, layout, resolveSno, sourceSnodeGuid.ToArray(), indices, neighbors, vertsArr, kindsArr, extraLinksBuild, out int doorSeamOverflow);
-        // Land↔water seam stitching: shoreline Floor and Water SNOs are authored in
-        // separate meshes whose vertices don't fall inside the WeldToleranceUnits bucket,
-        // so the manifold pass leaves them on disconnected components. Wire cross-kind
-        // adjacencies for boundary-edge pairs that share an XZ footprint and a wadeable Y.
-        int seamEdges = StitchLandWaterSeams(triCount, indices, neighbors, vertsArr, kindsArr);
-
+    private static (Vector3[] Centroids, float OriginX, float OriginZ, int CellsX, int CellsZ, int[]?[] Grid)
+        BuildGrid(Vector3[] vertsArr, int[] indices)
+    {
+        int triCount = indices.Length / 3;
         var centroids = new Vector3[triCount];
         float gMinX = float.PositiveInfinity, gMinZ = float.PositiveInfinity;
         float gMaxX = float.NegativeInfinity, gMaxZ = float.NegativeInfinity;
@@ -728,30 +783,7 @@ public sealed class NavMesh
             for (int i = 0; i < buckets.Length; i++)
                 grid[i] = buckets[i]?.ToArray();
         }
-
-        return new NavMesh(
-            vertsArr,
-            indices,
-            neighbors,
-            kindsArr,
-            centroids,
-            sourceNode.ToArray(),
-            sourceLnode.ToArray(),
-            sourceSnodeGuid.ToArray(),
-            sourceSnodes,
-            degenerate,
-            nonManifoldEdges,
-            seamEdges,
-            doorSeams,
-            extraLinksBuild.Count == 0
-                ? null
-                : extraLinksBuild.ToDictionary(kv => kv.Key, kv => kv.Value.ToArray()),
-            doorSeamOverflow,
-            originX,
-            originZ,
-            cellsX,
-            cellsZ,
-            grid);
+        return (centroids, originX, originZ, cellsX, cellsZ, grid);
     }
 
     /// <summary>SC-NAV-CROSS-SNO-STITCH — door-anchored cross-SNO nav

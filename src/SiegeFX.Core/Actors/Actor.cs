@@ -82,15 +82,17 @@ public sealed class Actor
     /// often a one-frame stance pose; when the blender sits there with no timed
     /// override running, the actor shows its <see cref="IdleClipIndex"/> instead
     /// (the original fidget job re-requests chore_fidget whenever idle).</summary>
-    public int CurrentClipIndex
+    public int CurrentClipIndex =>
+        SelectClip(Host.CurrentAnimIndex, Host.IsOverrideActive, IdleClipIndex, Clips.Length);
+
+    /// <summary>The rule behind <see cref="CurrentClipIndex"/>: the blender's
+    /// selection, except an unset or out-of-range one, or slot 0 with no timed
+    /// override running, shows the idle clip.</summary>
+    public static int SelectClip(int selected, bool overrideActive, int idleClip, int clipCount)
     {
-        get
-        {
-            int selected = Host.CurrentAnimIndex;
-            int idle = IdleClipIndex >= 0 && IdleClipIndex < Clips.Length ? IdleClipIndex : 0;
-            if (selected < 0 || selected >= Clips.Length) return idle;
-            return selected == 0 && !Host.IsOverrideActive ? idle : selected;
-        }
+        int idle = idleClip >= 0 && idleClip < clipCount ? idleClip : 0;
+        if (selected < 0 || selected >= clipCount) return idle;
+        return selected == 0 && !overrideActive ? idle : selected;
     }
 
     internal Actor(
