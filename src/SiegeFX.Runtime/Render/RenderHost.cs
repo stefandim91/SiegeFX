@@ -5,6 +5,7 @@ using Silk.NET.OpenGL;
 using Silk.NET.Windowing;
 using SiegeFX.Core.Actors;
 using SiegeFX.Core.Assets;
+using SiegeFX.Core.Geometry;
 using SiegeFX.Core.Sfx;
 using SiegeFX.Core.Skrit;
 using SiegeFX.Core.Tank;
@@ -4540,11 +4541,33 @@ public sealed partial class RenderHost : IDisposable
 
     // Phase 21c — one placed prop (tree, barrel, fence, crop, candle, etc.).
     // Drawn via the static-mesh pipeline; no per-frame state besides the bake.
+    /// <summary>Radius around the prop's origin that holds its whole mesh, for
+    /// view culling. Taken about the origin (not the box centre) so it still
+    /// covers a door swinging on its hinge or a prop spinning in place.
+    /// Computed once; placement scale doesn't change after load.</summary>
+    private static float PropCullRadius(StaticPropInstance prop)
+    {
+        if (prop.CullRadius >= 0f) return prop.CullRadius;
+        var min = prop.Mesh.Min;
+        var max = prop.Mesh.Max;
+        var origin = prop.World.Translation;
+        float r2 = 0f;
+        for (int i = 0; i < 8; i++)
+        {
+            var corner = Vector3.Transform(new Vector3((i & 1) == 0 ? min.X : max.X,
+                                                       (i & 2) == 0 ? min.Y : max.Y,
+                                                       (i & 4) == 0 ? min.Z : max.Z), prop.World);
+            r2 = MathF.Max(r2, Vector3.DistanceSquared(corner, origin));
+        }
+        return prop.CullRadius = MathF.Sqrt(r2);
+    }
+
     private sealed class StaticPropInstance
     {
         public StaticMesh Mesh = null!;
         public GlTexture? Texture;
         public Matrix4x4 World;
+        public float CullRadius = -1f;
         public Matrix4x4 NodeLocalWorld;
         public string Template = "";
         // SC-PROP-INVISIBLE — DS1 authors logic objects (life/mana shrines,
@@ -39250,6 +39273,9 @@ void main()
         }
         var aspect = size.Y == 0 ? 1f : (float)size.X / size.Y;
         var vp = _camera.GetViewProjection(aspect);
+        // Skip world geometry the camera can't see. Everything loaded used to
+        // be drawn every frame, ~20 ms of GPU/driver time in Elddim.
+        var frustum = new ViewFrustum(vp);
 
         // SC-TERRAIN-WHITE-GRID (audit fold — finding #3) — dev
         // fly-cam reference grid. Previously gated on
@@ -39384,6 +39410,17 @@ void main()
                 if (s.IsPlayer && s.Hidden)
                     BodyDiag("player-hidden", "player render state Hidden=TRUE — body draw SKIPPED");
                 if (s.Hidden) continue;
+                // Off-screen actors skip skinning and drawing. The radius is the
+                // bind-pose diagonal at full scale around the feet, generous
+                // enough for raised arms and attack lunges.
+                if (!s.IsPlayer)
+                {
+                    var ext = s.GlMesh.Max - s.GlMesh.Min;
+                    var xf = s.CurrentTransform;
+                    float sx = new Vector3(xf.M11, xf.M12, xf.M13).Length();
+                    if (!frustum.IntersectsSphere(xf.Translation,
+                            ext.Length() * sx * s.Actor.Stats.RenderScale + 0.5f)) continue;
+                }
                 if (s.IsPlayer)
                 {
                     var dp = s.CurrentTransform.Translation;
@@ -39521,6 +39558,11 @@ void main()
                     var appos = s.CurrentTransform.Translation;
                     float apdx = appos.X - apCam.X, apdz = appos.Z - apCam.Z;
                     if (apdx * apdx + apdz * apdz > 80f * 80f) continue;
+                    var apExt = s.GlMesh.Max - s.GlMesh.Min;
+                    var apXf = s.CurrentTransform;
+                    float apSx = new Vector3(apXf.M11, apXf.M12, apXf.M13).Length();
+                    if (!frustum.IntersectsSphere(appos,
+                            apExt.Length() * apSx * s.Actor.Stats.RenderScale + 0.5f)) continue;
                     if (IsActorInFadedSnode(s)) continue;
                     var apClips = s.Actor.Clips;
                     if (apClips.Length == 0) continue;
@@ -39720,6 +39762,7 @@ void main()
                 // SC-FADE-GROUPS — hide with the anchor snode's fade state.
                 if (prop.NodeGuid != 0 && _fadedSnodeCounts.Count > 0
                     && _fadedSnodeCounts.ContainsKey(prop.NodeGuid)) continue;
+                if (!frustum.IntersectsSphere(prop.World.Translation, PropCullRadius(prop))) continue;
                 if (!ReferenceEquals(prop.Texture, lastTex))
                 {
                     if (prop.Texture is not null)
@@ -40518,6 +40561,7 @@ void main()
                     // the lower region — only flips back on region
                     // change.
                     if (IsAbovePlayer(inst.RegionPath)) continue;
+                    if (!frustum.IntersectsBox(inst.WorldAabbMin, inst.WorldAabbMax)) continue;
                     // SC-PROP-ANIM — nodal tex anim: gizmo-enabled V crawl
                     // on this node's textures (chains, belts). Wraps at 1.0
                     // so the float never loses precision over a long session.
