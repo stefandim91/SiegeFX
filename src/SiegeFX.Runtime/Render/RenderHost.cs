@@ -14681,6 +14681,7 @@ void main()
                     // the player's regionPath dropped gating at world-
                     // streamed boundaries.
                     var lfStore = new SiegeFX.Core.Assets.LogicalFlagsStore();
+                    _navLogicalFlagRegions.Clear();
                     int regionsWithFlags = 0;
                     if (_worldRegionGraphs.Count > 1)
                     {
@@ -14688,13 +14689,19 @@ void main()
                         {
                             if (TryLoadLogicalFlags(mapReader, rp, lfStore))
                                 regionsWithFlags++;
+                            _navLogicalFlagRegions.Add(rp);
                         }
                     }
                     else
                     {
                         if (TryLoadLogicalFlags(mapReader, regionPath, lfStore))
                             regionsWithFlags++;
+                        _navLogicalFlagRegions.Add(regionPath);
                     }
+                    // Kept for the session: every RebuildNavMesh rebinds it
+                    // (extended with newly streamed regions) — see
+                    // BindNavLogicalFlags.
+                    _navLogicalFlags = lfStore;
                     navMesh.BindLogicalFlags(lfStore);
                     if (lfStore.HasData)
                         Console.WriteLine($"  logical_flags: {lfStore.EntryCount} entries across {regionsWithFlags} region(s) — player/NPC gating active");
@@ -24109,6 +24116,7 @@ void main()
             // baked floor before the arrival pose is committed.
             foreach (var moving in _elevators)
                 if (moving.Moving) nav.SetUnavailableForSnode(moving.Def.CarNodeGuid, true);
+            BindNavLogicalFlags(nav);
             Console.WriteLine($"  nav mesh rebuild: {nav.TriangleCount} tri(s), " +
                               $"{nav.Vertices.Length} welded vert(s), " +
                               $"{nav.SourceSnodeCount} snode(s), " +
@@ -24125,6 +24133,41 @@ void main()
             navMapTank?.Dispose();
             terrainTank?.Dispose();
         }
+    }
+
+    // Merged logical_flags.gas of every loaded region (player/NPC gating),
+    // and the regions already merged into it.
+    private SiegeFX.Core.Assets.LogicalFlagsStore? _navLogicalFlags;
+    private readonly HashSet<string> _navLogicalFlagRegions = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Binds the session's logical-flags store to a rebuilt nav mesh,
+    /// first merging any loaded region not yet in it. Only the initial build
+    /// used to bind flags, so the first region change, elevator ride or
+    /// blocker toggle silently dropped lf_human_player / lf_computer_player
+    /// gating for the rest of the session.</summary>
+    private void BindNavLogicalFlags(SiegeFX.Core.Nav.NavMesh nav)
+    {
+        _navLogicalFlags ??= new SiegeFX.Core.Assets.LogicalFlagsStore();
+        SiegeFX.Core.Tank.TankReader? reader = null;
+        int added = 0;
+        foreach (var (rp, _, _) in _worldRegionGraphs)
+        {
+            if (_navLogicalFlagRegions.Contains(rp)) continue;
+            if (_playMapTank is null) break;
+            reader ??= new SiegeFX.Core.Tank.TankReader(_playMapTank);
+            try
+            {
+                if (TryLoadLogicalFlags(reader, rp, _navLogicalFlags)) added++;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"  logical_flags load failed for {rp}: {ex.Message}");
+            }
+            _navLogicalFlagRegions.Add(rp);
+        }
+        if (added > 0)
+            Console.WriteLine($"  logical_flags: +{added} streamed region(s), {_navLogicalFlags.EntryCount} entries total");
+        nav.BindLogicalFlags(_navLogicalFlags);
     }
 
     // Parsed nav SNOs by mesh guid, shared by every RebuildNavMesh (null =
